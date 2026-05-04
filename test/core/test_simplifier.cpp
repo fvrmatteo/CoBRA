@@ -12,7 +12,13 @@
 
 using namespace cobra;
 
-TEST(SimplifierTest, ConstantMBA) {
+TEST(SimplifierTest, ConstantMBA_NoEvaluator) {
+    // No-AST + no-evaluator path: the constant fast-path matches the
+    // boolean signature but cannot prove correctness at full width
+    // (a Dirac-shaped sig would silently round-trip as Constant(0)
+    // with verified=true under the old behavior). The simplification
+    // is still emitted — it is correct on {0,1}^n by construction —
+    // but verified must be false because no full-width check ran.
     std::vector< uint64_t > sig     = { 42, 42, 42, 42 };
     std::vector< std::string > vars = { "x", "y" };
     Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
@@ -20,8 +26,56 @@ TEST(SimplifierTest, ConstantMBA) {
     auto result = Simplify(sig, vars, nullptr, opts);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(Render(*result.value().expr, result.value().real_vars), "42");
+    EXPECT_FALSE(result.value().verified);
+}
+
+TEST(SimplifierTest, ConstantMBA_WithEvaluator) {
+    // Same input but with an evaluator that confirms 42 at full width:
+    // the constant fast-path runs FullWidthCheckEval and marks the
+    // result verified.
+    std::vector< uint64_t > sig     = { 42, 42, 42, 42 };
+    std::vector< std::string > vars = { "x", "y" };
+    Options opts{
+        .bitwidth   = 64,
+        .max_vars   = 16,
+        .spot_check = true,
+        .evaluator  = [](const std::vector< uint64_t > &) -> uint64_t { return 42; },
+    };
+
+    auto result = Simplify(sig, vars, nullptr, opts);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(Render(*result.value().expr, result.value().real_vars), "42");
     EXPECT_TRUE(result.value().verified);
 }
+
+// Regression: orchestrator-core-5. A Dirac-shaped sig (zero on
+// {0,1}^n, nonzero at a single full-width point) used to round-trip
+// as Constant(0) with verified=true. With the fix, the constant
+// fast-path still emits Constant(0) (correct on the boolean domain)
+// but verified is false; an evaluator that reveals the Dirac point
+// rejects the candidate outright via FullWidthCheckEval.
+TEST(SimplifierTest, DiracSigNoEvaluatorIsNotMarkedVerified) {
+    // sig is zero on {0,1}^1 — boolean-equivalent to Constant(0).
+    std::vector< uint64_t > sig     = { 0, 0 };
+    std::vector< std::string > vars = { "x" };
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+
+    auto result = Simplify(sig, vars, nullptr, opts);
+    ASSERT_TRUE(result.has_value());
+    // The boolean answer is still emitted (correct on {0,1}).
+    EXPECT_EQ(Render(*result.value().expr, result.value().real_vars), "0");
+    // ...but no full-width verification was possible.
+    EXPECT_FALSE(result.value().verified);
+}
+
+// Note: a stronger test would prove that with a Dirac-revealing
+// evaluator (e.g. v[0]*(v[0]-1), which is zero on {0,1} but non-
+// zero at v[0]=2), Simplify never returns a verified Constant(0).
+// Such a test currently still fails because downstream pipeline
+// stages (outside SeedNoAst's constant fast-path) have analogous
+// silent-accept patterns that should be audited separately. This
+// fix addresses only the SeedNoAst gate documented in
+// orchestrator-core-5.
 
 TEST(SimplifierTest, XPlusY) {
     std::vector< uint64_t > sig     = { 0, 1, 1, 2 };
@@ -192,6 +246,9 @@ TEST(SimplifierTest, SpotCheckFalse) {
 
 // All-zero sig through full pipeline
 TEST(SimplifierTest, AllZeroSig) {
+    // Mirror of ConstantMBA_NoEvaluator for the zero-constant case:
+    // the boolean answer is correct but unverified at full width
+    // without an evaluator (see orchestrator-core-5).
     std::vector< uint64_t > sig     = { 0, 0, 0, 0 };
     std::vector< std::string > vars = { "x", "y" };
     Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
@@ -199,7 +256,7 @@ TEST(SimplifierTest, AllZeroSig) {
     auto result = Simplify(sig, vars, nullptr, opts);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(Render(*result.value().expr, result.value().real_vars), "0");
-    EXPECT_TRUE(result.value().verified);
+    EXPECT_FALSE(result.value().verified);
 }
 
 // Bitwidth=8 through full pipeline with wrapping
