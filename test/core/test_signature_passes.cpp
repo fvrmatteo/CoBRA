@@ -1180,6 +1180,152 @@ TEST(SignaturePass, OperandJoinResolveBothSides) {
     EXPECT_EQ(pr.next[0].rewrite_gen, 1u);
 }
 
+// Regression: orchestrator-core-cross-3. When both operand-rewrite
+// children resolve with no winner, the parent group's handle (pinned
+// by the join) must be released. Before the fix, ResolveOperandRewrite
+// returned without releasing, leaving the parent group wedged with
+// open_handles=1 forever — its continuation would never fire and any
+// downstream lineage starves.
+TEST(SignaturePass, OperandJoinResolveNoWinnerReleasesParentHandle) {
+    std::vector< std::string > vars = { "x0", "x1" };
+    Options opts;
+    opts.bitwidth   = 64;
+    auto ctx        = MakeCtx(opts, vars);
+    auto parent_gid = CreateGroup(ctx.competition_groups, ctx.next_group_id);
+    EXPECT_EQ(ctx.competition_groups.at(parent_gid).open_handles, 1u);
+
+    auto orig_mul = Expr::Mul(Expr::Variable(0), Expr::Variable(1));
+
+    OperandJoinState join;
+    join.full_ast        = CloneExpr(*orig_mul);
+    join.original_mul    = CloneExpr(*orig_mul);
+    join.target_hash     = std::hash< Expr >{}(*orig_mul);
+    join.baseline_cost   = ComputeCost(*orig_mul).cost;
+    join.vars            = vars;
+    join.parent_group_id = parent_gid;
+    join.bitwidth        = 64;
+    join.parent_depth    = 0;
+    join.rewrite_gen     = 0;
+
+    auto join_id = CreateJoin(ctx.join_states, ctx.next_join_id, JoinState{ std::move(join) });
+
+    // LHS child group resolves with NO submitted candidate (winner stays empty).
+    auto lhs_gid = CreateGroup(ctx.competition_groups, ctx.next_group_id);
+    ctx.competition_groups.at(lhs_gid).continuation = ContinuationData{
+        OperandRewriteCont{
+                           .join_id = join_id,
+                           .role    = OperandRewriteCont::OperandRole::kLhs,
+                           }
+    };
+    WorkItem lhs_resolved;
+    lhs_resolved.payload = CompetitionResolvedPayload{ .group_id = lhs_gid };
+    auto r1              = RunResolveCompetition(lhs_resolved, ctx);
+    ASSERT_TRUE(r1.has_value());
+    // Parent handle still pinned at this point (RHS hasn't resolved).
+    EXPECT_EQ(ctx.competition_groups.at(parent_gid).open_handles, 1u);
+
+    // RHS child group: same — resolves with no winner.
+    auto rhs_gid = CreateGroup(ctx.competition_groups, ctx.next_group_id);
+    ctx.competition_groups.at(rhs_gid).continuation = ContinuationData{
+        OperandRewriteCont{
+                           .join_id = join_id,
+                           .role    = OperandRewriteCont::OperandRole::kRhs,
+                           }
+    };
+    WorkItem rhs_resolved;
+    rhs_resolved.payload = CompetitionResolvedPayload{ .group_id = rhs_gid };
+    auto r2              = RunResolveCompetition(rhs_resolved, ctx);
+    ASSERT_TRUE(r2.has_value());
+
+    // Join is cleaned up.
+    EXPECT_EQ(ctx.join_states.count(join_id), 0u);
+
+    // Parent group's handle must be released (regression: cross-3).
+    // Before the fix, open_handles was still 1 — the leak.
+    // The group is still in the map until the orchestrator processes
+    // the CompetitionResolvedPayload via RunResolveCompetition.
+    ASSERT_EQ(ctx.competition_groups.count(parent_gid), 1u);
+    EXPECT_EQ(ctx.competition_groups.at(parent_gid).open_handles, 0u);
+
+    // The resolver must surface a CompetitionResolvedPayload for the
+    // parent so the orchestrator can fire its continuation.
+    bool found_parent_resolved = false;
+    for (const auto &n : r2->next) {
+        if (const auto *p = std::get_if< CompetitionResolvedPayload >(&n.payload)) {
+            if (p->group_id == parent_gid) { found_parent_resolved = true; }
+        }
+    }
+    EXPECT_TRUE(found_parent_resolved);
+}
+
+// Regression: orchestrator-core-cross-3 (ProductCollapse variant).
+// Same shape as above for ResolveProductCollapse: when both factors
+// resolve with no winner, parent handle must be released.
+TEST(SignaturePass, ProductJoinResolveNoWinnerReleasesParentHandle) {
+    std::vector< std::string > vars = { "x0", "x1" };
+    Options opts;
+    opts.bitwidth   = 64;
+    auto ctx        = MakeCtx(opts, vars);
+    auto parent_gid = CreateGroup(ctx.competition_groups, ctx.next_group_id);
+    EXPECT_EQ(ctx.competition_groups.at(parent_gid).open_handles, 1u);
+
+    auto orig = Expr::Add(
+        Expr::Mul(Expr::Variable(0), Expr::Variable(1)),
+        Expr::Mul(Expr::Variable(0), Expr::Variable(1))
+    );
+
+    ProductJoinState join;
+    join.original_expr   = CloneExpr(*orig);
+    join.baseline_cost   = ComputeCost(*orig).cost;
+    join.vars            = vars;
+    join.parent_group_id = parent_gid;
+    join.bitwidth        = 64;
+    join.parent_depth    = 0;
+    join.rewrite_gen     = 0;
+    join.full_ast        = CloneExpr(*orig);
+    join.target_hash     = std::hash< Expr >{}(*orig);
+
+    auto join_id = CreateJoin(ctx.join_states, ctx.next_join_id, JoinState{ std::move(join) });
+
+    auto x_gid = CreateGroup(ctx.competition_groups, ctx.next_group_id);
+    ctx.competition_groups.at(x_gid).continuation = ContinuationData{
+        ProductCollapseCont{
+                            .join_id = join_id,
+                            .role    = ProductCollapseCont::FactorRole::kX,
+                            }
+    };
+    WorkItem x_resolved;
+    x_resolved.payload = CompetitionResolvedPayload{ .group_id = x_gid };
+    auto r1            = RunResolveCompetition(x_resolved, ctx);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(ctx.competition_groups.at(parent_gid).open_handles, 1u);
+
+    auto y_gid = CreateGroup(ctx.competition_groups, ctx.next_group_id);
+    ctx.competition_groups.at(y_gid).continuation = ContinuationData{
+        ProductCollapseCont{
+                            .join_id = join_id,
+                            .role    = ProductCollapseCont::FactorRole::kY,
+                            }
+    };
+    WorkItem y_resolved;
+    y_resolved.payload = CompetitionResolvedPayload{ .group_id = y_gid };
+    auto r2            = RunResolveCompetition(y_resolved, ctx);
+    ASSERT_TRUE(r2.has_value());
+
+    EXPECT_EQ(ctx.join_states.count(join_id), 0u);
+    // Parent group's handle must be released (regression: cross-3).
+    ASSERT_EQ(ctx.competition_groups.count(parent_gid), 1u);
+    EXPECT_EQ(ctx.competition_groups.at(parent_gid).open_handles, 0u);
+
+    bool found_parent_resolved = false;
+    for (const auto &n : r2->next) {
+        if (const auto *p = std::get_if< CompetitionResolvedPayload >(&n.payload)) {
+            if (p->group_id == parent_gid) { found_parent_resolved = true; }
+        }
+    }
+    EXPECT_TRUE(found_parent_resolved);
+}
+
 // --- ProductCollapseCont resolution tests ---
 
 TEST(SignaturePass, ProductJoinResolveBothFactors) {

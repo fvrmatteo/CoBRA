@@ -446,9 +446,26 @@ namespace cobra {
                 );
             }
 
+            const auto parent_group_id = join->parent_group_id;
             if (best.has_value()) { EmitJoinRewrite(*join, item, std::move(best->expr), pr); }
 
             ctx.join_states.erase(join_it);
+
+            // No rewrite emitted: release the parent handle that the
+            // join was pinning. The success path transfers the handle
+            // to the rewritten item via EmitJoinRewrite (which sets
+            // rewritten.group_id = join.parent_group_id), so we only
+            // release here when no rewrite was pushed. Mirror the
+            // unconditional release in ResolveBitwiseCompose /
+            // ResolveHybridCompose; the difference is we have a join.
+            if (pr.next.empty() && parent_group_id.has_value()) {
+                auto parent_resolved =
+                    ReleaseHandle(ctx.competition_groups, *parent_group_id);
+                if (parent_resolved.has_value()) {
+                    pr.next.push_back(std::move(*parent_resolved));
+                }
+            }
+
             return pr;
         }
 
@@ -505,7 +522,23 @@ namespace cobra {
                 }
             }
 
+            const auto parent_group_id = join->parent_group_id;
             ctx.join_states.erase(join_it);
+
+            // No rewrite emitted: release the parent handle that the
+            // join was pinning. EmitJoinRewrite transfers the handle
+            // to the rewritten item by setting rewritten.group_id =
+            // join.parent_group_id, so we only release on the no-emit
+            // path. Mirror ResolveBitwiseCompose / ResolveHybridCompose,
+            // which always release because they have no join.
+            if (pr.next.empty() && parent_group_id.has_value()) {
+                auto parent_resolved =
+                    ReleaseHandle(ctx.competition_groups, *parent_group_id);
+                if (parent_resolved.has_value()) {
+                    pr.next.push_back(std::move(*parent_resolved));
+                }
+            }
+
             return pr;
         }
 
