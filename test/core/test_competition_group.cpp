@@ -189,6 +189,30 @@ TEST(CompetitionGroup, ReleaseMissingGroupReturnsNullopt) {
     EXPECT_FALSE(ReleaseHandle(groups, 42).has_value());
 }
 
+// Regression: orchestrator-core-7. A double release on a group whose
+// open_handles already reached zero must not wrap uint32 past zero
+// (which would wedge the group forever — count never returns to 0,
+// candidates pile up undelivered). Treat the second release as a
+// no-op instead.
+#ifdef NDEBUG
+TEST(CompetitionGroup, DoubleReleaseDoesNotWrapPastZero) {
+    absl::flat_hash_map< GroupId, CompetitionGroup > groups;
+    GroupId next_id = 0;
+    auto id         = CreateGroup(groups, next_id);
+
+    auto first = ReleaseHandle(groups, id);
+    ASSERT_TRUE(first.has_value());
+    // The group is conceptually resolved but still in the map until
+    // the orchestrator processes the resolved item; a stray second
+    // release must not corrupt open_handles.
+    EXPECT_EQ(groups.at(id).open_handles, 0);
+
+    auto second = ReleaseHandle(groups, id);
+    EXPECT_FALSE(second.has_value());
+    EXPECT_EQ(groups.at(id).open_handles, 0);
+}
+#endif
+
 // --- State model integration tests ---
 
 TEST(CompetitionGroup, GetStateKindForResolved) {

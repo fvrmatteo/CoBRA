@@ -70,7 +70,13 @@ namespace cobra {
         // resolved and been erased; treat the late release as a no-op.
         if (it == groups.end()) { return std::nullopt; }
         auto &group = it->second;
+        // Defensive: a buggy caller that double-releases would
+        // wrap open_handles past zero and wedge the group forever
+        // (it would never reach 0 again). Treat double-release as a
+        // no-op here so the bug is contained, and assert in debug
+        // builds so we still notice during development.
         assert(group.open_handles > 0);
+        if (group.open_handles == 0) { return std::nullopt; }
 
         --group.open_handles;
         if (group.open_handles > 0) { return std::nullopt; }

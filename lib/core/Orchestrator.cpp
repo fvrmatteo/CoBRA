@@ -1159,6 +1159,26 @@ namespace cobra {
                     item.depth = item.depth + 2;
                     worklist.Push(std::move(item));
                 }
+                // CONTRACT (handle transfer on kConsumeCurrent + advance):
+                // Passes that return kAdvance / kSolvedCandidate +
+                // kConsumeCurrent on an item with item.group_id MUST
+                // transfer the handle. Three patterns are valid:
+                //   1. A child in pr.next inherits item.group_id
+                //      (e.g., RunClassifyAst). The child's lifecycle
+                //      eventually releases.
+                //   2. The pass stores item.group_id in a JoinState
+                //      (e.g., RunOperandSimplify, RunProductIdentity-
+                //      Collapse) so the matching Resolve* releases it.
+                //   3. The pass acquires a fresh handle on item.group_id
+                //      and stores it in a continuation, with the matching
+                //      resolver releasing.
+                // The main loop deliberately does NOT release here
+                // because doing so would break (1)–(3). Any new pass
+                // emitting kConsumeCurrent on a grouped item without
+                // one of these patterns LEAKS the parent group's
+                // handle, wedging that group permanently. The
+                // kBlocked/kNoProgress branch below DOES release
+                // because it has no transfer mechanism.
             } else {
                 // kBlocked / kNoProgress
                 if (!pr.reason.top.message.empty()) { item.metadata.last_failure = pr.reason; }
