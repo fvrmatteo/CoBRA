@@ -702,16 +702,14 @@ namespace cobra {
                 }
                 if (fw_ok) {
                     ItemMetadata meta;
-                    meta.sig_vector = sig;
-                    meta.verification =
-                        fw_verified ? VerificationState::kVerified
-                                    : VerificationState::kUnverified;
+                    meta.sig_vector   = sig;
+                    meta.verification = fw_verified ? VerificationState::kVerified
+                                                    : VerificationState::kUnverified;
 
                     return Ok(
                         std::optional< OrchestratorResult >(OrchestratorResult{
-                            .outcome = PassOutcome::Success(
-                                std::move(*pm), {}, meta.verification
-                            ),
+                            .outcome =
+                                PassOutcome::Success(std::move(*pm), {}, meta.verification),
                             .metadata     = std::move(meta),
                             .run_metadata = ctx.run_metadata,
                         })

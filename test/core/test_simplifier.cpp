@@ -83,8 +83,9 @@ TEST(SimplifierTest, DiracSigWithEvaluatorRejectsConstantFastPath) {
         .bitwidth   = 64,
         .max_vars   = 16,
         .spot_check = true,
-        .evaluator =
-            [](const std::vector< uint64_t > &v) -> uint64_t { return v[0] * (v[0] - 1); },
+        .evaluator  = [](const std::vector< uint64_t > &v) -> uint64_t {
+            return v[0] * (v[0] - 1);
+        },
     };
 
     auto result = Simplify(sig, vars, nullptr, opts);
@@ -93,13 +94,8 @@ TEST(SimplifierTest, DiracSigWithEvaluatorRejectsConstantFastPath) {
     // It may legitimately fail to simplify (kUnchangedUnsupported) or
     // emit some non-zero candidate; what's forbidden is the lying
     // "verified Constant(0)" combination.
-    if (result->kind == SimplifyOutcome::Kind::kSimplified
-        && result->expr != nullptr)
-    {
-        EXPECT_FALSE(
-            result->verified
-            && Render(*result->expr, result->real_vars) == "0"
-        );
+    if (result->kind == SimplifyOutcome::Kind::kSimplified && result->expr != nullptr) {
+        EXPECT_FALSE(result->verified && Render(*result->expr, result->real_vars) == "0");
     }
 }
 
