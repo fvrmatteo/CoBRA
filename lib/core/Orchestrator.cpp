@@ -856,12 +856,43 @@ namespace cobra {
 
     } // namespace
 
+    // Upper bound on the number of input variables the orchestrator
+    // will accept before any signature work runs. The sig pipeline is
+    // O(2^vars.size()) in both time and space (kLen = 1 << num_vars
+    // in EvaluateBooleanSignature, plus follow-on passes that walk
+    // the sig), so an unbounded vars.size() is a DoS vector — a
+    // caller can request 2^40 entries and OOM the process before any
+    // max_vars policy check fires (those checks happen on the
+    // post-AuxVarEliminator real_vars count, which presupposes the
+    // sig has already been computed). 24 caps the sig at ~16M
+    // entries (~128 MiB) which is well above the 6-8 vars used by
+    // the existing test corpus, the 20-var kMaxPolyVars ceiling, and
+    // the 16-var default opts.max_vars policy.
+    inline constexpr uint32_t kMaxInputVars = 24;
+
     Result< SimplifyOutcome > Simplify(
         const std::vector< uint64_t > &sig, const std::vector< std::string > &vars,
         const Expr *input_expr, const Options &opts
     ) {
         COBRA_ZONE_N("Simplify");
         COBRA_ZONE_VALUE(static_cast< int64_t >(vars.size()));
+
+        // Reject pathological input-variable counts before any
+        // 2^vars.size() signature allocation runs. Without this gate
+        // the with-AST path computes EvaluateBooleanSignature in
+        // RunBuildSignatureState (and the dynamic-mask shortcut just
+        // below) before reaching the post-elimination max_vars check,
+        // turning any caller-supplied vars.size() into an unbounded
+        // memory request.
+        if (vars.size() > kMaxInputVars) {
+            return Err< SimplifyOutcome >(
+                CobraError::kTooManyVariables,
+                "Input variable count (" + std::to_string(vars.size())
+                    + ") exceeds kMaxInputVars (" + std::to_string(kMaxInputVars)
+                    + "); a 2^vars.size() signature would exceed memory bounds. "
+                      "Reduce vars or pre-eliminate aux variables before calling Simplify."
+            );
+        }
 
         // Dynamic masking: if the root is (2^m - 1) & g and g contains
         // no right shifts, try solving g under bitwidth=m. Modular

@@ -1802,3 +1802,37 @@ TEST(SimplifierTest, DynamicMask_4bit_Constant) {
     auto check = FullWidthCheckEval(eval, 1, *result->expr, 64);
     EXPECT_TRUE(check.passed);
 }
+
+// Regression: orchestrator-core-8. RunBuildSignatureState computed
+// the boolean signature (size 2^vars.size()) before checking the
+// max_vars policy, so a caller could request 2^40 entries and OOM
+// the process. The fix rejects pathological vars.size() up front
+// with kTooManyVariables, before any 2^N work runs.
+TEST(SimplifierTest, RejectsExcessiveInputVarCount) {
+    // 25 variables — one over kMaxInputVars=24. Signature would be
+    // 2^25 = 33M entries (~256 MiB). The pre-check must reject before
+    // any allocation.
+    std::vector< std::string > vars;
+    for (int i = 0; i < 25; ++i) { vars.push_back("x" + std::to_string(i)); }
+    std::vector< uint64_t > sig(2, 0);  // size doesn't matter; rejected first
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = false };
+
+    auto result = Simplify(sig, vars, nullptr, opts);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code, CobraError::kTooManyVariables);
+}
+
+TEST(SimplifierTest, AcceptsInputVarCountAtCeiling) {
+    // Exactly kMaxInputVars=24. The pre-check is `>` so this must
+    // pass through to the normal pipeline. Constant sig of correct
+    // length so AuxVarEliminator collapses to 0 real vars and the
+    // downstream max_vars policy is satisfied.
+    std::vector< std::string > vars;
+    for (int i = 0; i < 24; ++i) { vars.push_back("x" + std::to_string(i)); }
+    std::vector< uint64_t > sig(size_t{ 1 } << vars.size(), 7);
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = false };
+
+    auto result = Simplify(sig, vars, nullptr, opts);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(Render(*result.value().expr, result.value().real_vars), "7");
+}
