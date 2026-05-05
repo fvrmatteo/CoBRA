@@ -459,8 +459,7 @@ namespace cobra {
             // unconditional release in ResolveBitwiseCompose /
             // ResolveHybridCompose; the difference is we have a join.
             if (pr.next.empty() && parent_group_id.has_value()) {
-                auto parent_resolved =
-                    ReleaseHandle(ctx.competition_groups, *parent_group_id);
+                auto parent_resolved = ReleaseHandle(ctx.competition_groups, *parent_group_id);
                 if (parent_resolved.has_value()) {
                     pr.next.push_back(std::move(*parent_resolved));
                 }
@@ -532,8 +531,7 @@ namespace cobra {
             // path. Mirror ResolveBitwiseCompose / ResolveHybridCompose,
             // which always release because they have no join.
             if (pr.next.empty() && parent_group_id.has_value()) {
-                auto parent_resolved =
-                    ReleaseHandle(ctx.competition_groups, *parent_group_id);
+                auto parent_resolved = ReleaseHandle(ctx.competition_groups, *parent_group_id);
                 if (parent_resolved.has_value()) {
                     pr.next.push_back(std::move(*parent_resolved));
                 }
