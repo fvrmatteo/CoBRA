@@ -68,14 +68,40 @@ TEST(SimplifierTest, DiracSigNoEvaluatorIsNotMarkedVerified) {
     EXPECT_FALSE(result.value().verified);
 }
 
-// Note: a stronger test would prove that with a Dirac-revealing
-// evaluator (e.g. v[0]*(v[0]-1), which is zero on {0,1} but non-
-// zero at v[0]=2), Simplify never returns a verified Constant(0).
-// Such a test currently still fails because downstream pipeline
-// stages (outside SeedNoAst's constant fast-path) have analogous
-// silent-accept patterns that should be audited separately. This
-// fix addresses only the SeedNoAst gate documented in
-// orchestrator-core-5.
+// Regression: pipeline-wide silent-accept on Dirac sigs. The
+// SeedNoAst constant fast-path is corrected by the test above, but
+// downstream pipeline stages historically also produced
+// kVerified Constant(0) for a boolean-zero sig even when the
+// evaluator disagreed at full width. With the evaluator returning
+// v[0]*(v[0]-1) (zero on {0,1} but non-zero at v[0]=2), no
+// candidate emitted by Simplify may be both verified and
+// structurally Constant(0).
+TEST(SimplifierTest, DiracSigWithEvaluatorRejectsConstantFastPath) {
+    std::vector< uint64_t > sig     = { 0, 0 };
+    std::vector< std::string > vars = { "x" };
+    Options opts{
+        .bitwidth   = 64,
+        .max_vars   = 16,
+        .spot_check = true,
+        .evaluator =
+            [](const std::vector< uint64_t > &v) -> uint64_t { return v[0] * (v[0] - 1); },
+    };
+
+    auto result = Simplify(sig, vars, nullptr, opts);
+    ASSERT_TRUE(result.has_value());
+    // The pipeline must NOT silently emit a verified Constant(0).
+    // It may legitimately fail to simplify (kUnchangedUnsupported) or
+    // emit some non-zero candidate; what's forbidden is the lying
+    // "verified Constant(0)" combination.
+    if (result->kind == SimplifyOutcome::Kind::kSimplified
+        && result->expr != nullptr)
+    {
+        EXPECT_FALSE(
+            result->verified
+            && Render(*result->expr, result->real_vars) == "0"
+        );
+    }
+}
 
 TEST(SimplifierTest, XPlusY) {
     std::vector< uint64_t > sig     = { 0, 1, 1, 2 };

@@ -733,6 +733,20 @@ namespace cobra {
 
             auto original_indices = BuildVarSupport(vars, elim.real_vars);
 
+            // Mirror RunBuildSignatureState: when an evaluator is
+            // available, downstream candidates MUST be lifted back to
+            // the original variable space and re-checked there
+            // (VerifyInOriginalSpace). Hardcoding this flag to false
+            // bypassed verification entirely on the no-AST seed path:
+            // a Dirac signature (zero on {0,1}^n, nonzero at full
+            // width) would round-trip as a verified Constant(0)
+            // because the boolean-domain AuxVarEliminator collapses
+            // real_vars to empty, the remapped evaluator pins all
+            // dropped vars to 0 (where the Dirac function also
+            // evaluates to 0), and the orchestrator accepted the
+            // candidate without consulting the original evaluator.
+            bool needs_verification = ctx.evaluator.has_value();
+
             WorkItem sig_seed;
             sig_seed.payload = SignatureStatePayload{
                 .ctx = {
@@ -740,7 +754,7 @@ namespace cobra {
                     .real_vars                         = elim.real_vars,
                     .elimination                       = std::move(elim),
                     .original_indices                  = std::move(original_indices),
-                    .needs_original_space_verification = false,
+                    .needs_original_space_verification = needs_verification,
                 },
             };
             sig_seed.features.provenance = Provenance::kOriginal;
