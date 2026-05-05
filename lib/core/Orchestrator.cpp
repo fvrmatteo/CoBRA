@@ -680,24 +680,36 @@ namespace cobra {
             // at full width.  Dirac expressions (zero on {0,1} but
             // nonzero at a single full-width point) would otherwise
             // be emitted as constant 0 without any full-width check.
+            //
+            // Verification contract: the result is marked kVerified
+            // ONLY when an evaluator confirmed it at full width. With
+            // no evaluator (no-AST + opts.evaluator unset), we still
+            // accept the constant — it is correct on {0,1}^n by sig
+            // construction — but mark it kUnverified so the caller
+            // knows we never checked the full-width domain. Setting
+            // kVerified in the no-evaluator branch was the silent-
+            // accept bug: a Dirac sig would be emitted as Constant(0)
+            // with verified=true.
             auto pm = MatchPattern(sig, num_vars, ctx.bitwidth);
             if (pm && (*pm)->kind == Expr::Kind::kConstant) {
-                bool fw_ok = true;
+                bool fw_ok       = true;
+                bool fw_verified = false;
                 if (ctx.evaluator) {
                     auto check =
                         FullWidthCheckEval(*ctx.evaluator, num_vars, **pm, ctx.bitwidth);
-                    fw_ok = check.passed;
+                    fw_ok       = check.passed;
+                    fw_verified = check.passed;
                 }
                 if (fw_ok) {
                     ItemMetadata meta;
                     meta.sig_vector   = sig;
-                    meta.verification = VerificationState::kVerified;
+                    meta.verification = fw_verified ? VerificationState::kVerified
+                                                    : VerificationState::kUnverified;
 
                     return Ok(
                         std::optional< OrchestratorResult >(OrchestratorResult{
-                            .outcome = PassOutcome::Success(
-                                std::move(*pm), {}, VerificationState::kVerified
-                            ),
+                            .outcome =
+                                PassOutcome::Success(std::move(*pm), {}, meta.verification),
                             .metadata     = std::move(meta),
                             .run_metadata = ctx.run_metadata,
                         })
@@ -719,6 +731,20 @@ namespace cobra {
 
             auto original_indices = BuildVarSupport(vars, elim.real_vars);
 
+            // Mirror RunBuildSignatureState: when an evaluator is
+            // available, downstream candidates MUST be lifted back to
+            // the original variable space and re-checked there
+            // (VerifyInOriginalSpace). Hardcoding this flag to false
+            // bypassed verification entirely on the no-AST seed path:
+            // a Dirac signature (zero on {0,1}^n, nonzero at full
+            // width) would round-trip as a verified Constant(0)
+            // because the boolean-domain AuxVarEliminator collapses
+            // real_vars to empty, the remapped evaluator pins all
+            // dropped vars to 0 (where the Dirac function also
+            // evaluates to 0), and the orchestrator accepted the
+            // candidate without consulting the original evaluator.
+            bool needs_verification = ctx.evaluator.has_value();
+
             WorkItem sig_seed;
             sig_seed.payload = SignatureStatePayload{
                 .ctx = {
@@ -726,7 +752,7 @@ namespace cobra {
                     .real_vars                         = elim.real_vars,
                     .elimination                       = std::move(elim),
                     .original_indices                  = std::move(original_indices),
-                    .needs_original_space_verification = false,
+                    .needs_original_space_verification = needs_verification,
                 },
             };
             sig_seed.features.provenance = Provenance::kOriginal;
