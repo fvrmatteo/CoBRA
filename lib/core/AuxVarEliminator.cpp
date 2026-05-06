@@ -1,4 +1,5 @@
 #include "cobra/core/AuxVarEliminator.h"
+#include "cobra/core/BitWidth.h"
 #include "cobra/core/Profile.h"
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/core/Trace.h"
@@ -81,8 +82,8 @@ namespace cobra {
             // gate's strength so the spurious-classification depth is
             // uniform with downstream verification.
             constexpr uint32_t kNumSamples = kResidualGateProbeCount;
-            const uint64_t kMask = (bitwidth >= 64) ? UINT64_MAX : ((1ULL << bitwidth) - 1);
-            uint64_t rng_state   = (static_cast< uint64_t >(var_index) * 2654435761ULL)
+            const uint64_t kMask           = Bitmask(bitwidth);
+            uint64_t rng_state = (static_cast< uint64_t >(var_index) * 2654435761ULL)
                 + (static_cast< uint64_t >(num_vars) * 40503ULL) + 0xDEADBEEFULL;
 
             std::vector< uint64_t > inputs(num_vars);
