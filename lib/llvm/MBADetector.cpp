@@ -35,6 +35,7 @@ namespace cobra {
                 case llvm::Instruction::And:
                 case llvm::Instruction::Or:
                 case llvm::Instruction::Xor:
+                case llvm::Instruction::Shl:
                 case llvm::Instruction::LShr:
                 case llvm::Instruction::ZExt:
                 case llvm::Instruction::SExt:
@@ -181,6 +182,9 @@ namespace cobra {
                     case llvm::Instruction::LShr:
                         result = (lhs >> rhs) & mask;
                         break;
+                    case llvm::Instruction::Shl:
+                        result = (lhs << rhs) & mask;
+                        break;
                     default:
                         result = 0;
                         break;
@@ -304,6 +308,17 @@ namespace cobra {
                     BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
                 if (child == nullptr) { return nullptr; }
                 return Expr::LogicalShr(std::move(child), shift_amt->getZExtValue());
+            }
+
+            // Shl with constant shift amount
+            if (inst->getOpcode() == llvm::Instruction::Shl) {
+                auto *shift_amt = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
+                if (shift_amt == nullptr) { return nullptr; }
+                auto child =
+                    BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
+                if (child == nullptr) { return nullptr; }
+                uint64_t mul_val = 1ULL << shift_amt->getZExtValue();
+                return Expr::Mul(std::move(child), Expr::Constant(mul_val));
             }
 
             // Binary operations
@@ -545,3 +560,4 @@ namespace cobra {
     }
 
 } // namespace cobra
+
