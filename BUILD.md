@@ -43,8 +43,21 @@ Pass these to the `cmake -S .` step:
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `COBRA_BUILD_LLVM_LIBRARY` | OFF | Build the LLVM integration static library (requires LLVM 19-22) |
 | `COBRA_BUILD_LLVM_PASS` | OFF | Build the LLVM pass plugin (requires LLVM 19-22) |
 | `COBRA_BUILD_TESTS` | OFF | Build tests (requires GoogleTest in prefix) |
+
+## With LLVM Static Library
+
+Requires LLVM 19-22 installed or built from source via the superbuild.
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH=$(pwd)/build-deps/install \
+  -DCOBRA_BUILD_LLVM_LIBRARY=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
 
 ## With LLVM Pass Plugin
 
@@ -53,6 +66,7 @@ Requires LLVM 19-22 installed or built from source via the superbuild.
 ```bash
 cmake -S . -B build \
   -DCMAKE_PREFIX_PATH=$(pwd)/build-deps/install \
+  -DCOBRA_BUILD_LLVM_LIBRARY=ON \
   -DCOBRA_BUILD_LLVM_PASS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build

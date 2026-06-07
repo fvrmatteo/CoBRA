@@ -133,11 +133,22 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+### With LLVM Static Library
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH=$(pwd)/build-deps/install \
+  -DCOBRA_BUILD_LLVM_LIBRARY=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
 ### With LLVM Pass Plugin
 
 ```bash
 cmake -S . -B build \
   -DCMAKE_PREFIX_PATH=$(pwd)/build-deps/install \
+  -DCOBRA_BUILD_LLVM_LIBRARY=ON \
   -DCOBRA_BUILD_LLVM_PASS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build

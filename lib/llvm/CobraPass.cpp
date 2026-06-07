@@ -4,21 +4,12 @@
 #include "cobra/core/ExprCost.h"
 #include "cobra/core/Simplifier.h"
 
-#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Config/llvm-config.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Analysis.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PassManager.h"
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/Support/Compiler.h"
-#if LLVM_VERSION_MAJOR >= 22
-    #include "llvm/Plugins/PassPlugin.h"
-#else
-    #include "llvm/Passes/PassPlugin.h"
-#endif
-#include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Debug.h"
 
 #include <cstdint>
@@ -146,22 +137,3 @@ namespace cobra {
     }
 
 } // namespace cobra
-
-// NOLINTNEXTLINE(readability-identifier-naming)
-extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
-    return { .APIVersion                   = LLVM_PLUGIN_API_VERSION,
-             .PluginName                   = "CobraPass",
-             .PluginVersion                = LLVM_VERSION_STRING,
-             .RegisterPassBuilderCallbacks = [](llvm::PassBuilder &pb) {
-                 pb.registerPipelineParsingCallback(
-                     [](llvm::StringRef name, llvm::FunctionPassManager &fpm,
-                        llvm::ArrayRef< llvm::PassBuilder::PipelineElement >) {
-                         if (name == "cobra-simplify") {
-                             fpm.addPass(cobra::CobraPass());
-                             return true;
-                         }
-                         return false;
-                     }
-                 );
-             } };
-}

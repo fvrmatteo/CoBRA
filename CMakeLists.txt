@@ -55,13 +55,26 @@ add_link_options(
     $<${_cobra_msvc}:/guard:cf>
 )
 
-option(COBRA_BUILD_LLVM_PASS "Build the LLVM pass plugin (requires LLVM 19-22)" OFF)
+set(_cobra_build_llvm_library_default OFF)
+if(DEFINED COBRA_BUILD_LLVM)
+    if(NOT DEFINED COBRA_BUILD_LLVM_LIBRARY)
+        set(_cobra_build_llvm_library_default ${COBRA_BUILD_LLVM})
+    endif()
+    message(DEPRECATION "COBRA_BUILD_LLVM is deprecated; use COBRA_BUILD_LLVM_LIBRARY instead")
+endif()
+
+option(COBRA_BUILD_LLVM_LIBRARY "Build the LLVM integration library (requires LLVM 19-22)" ${_cobra_build_llvm_library_default})
+option(COBRA_BUILD_LLVM_PASS "Build the LLVM pass plugin (requires COBRA_BUILD_LLVM_LIBRARY, LLVM 19-22)" OFF)
 option(COBRA_BUILD_TESTS "Build tests (requires GoogleTest in prefix)" OFF)
 option(COBRA_ENABLE_TRACE "Enable detailed pipeline tracing to stderr (debug builds)" OFF)
 option(COBRA_ENABLE_SIG_STATS "Enable signature evaluation counters for profiling builds" OFF)
 option(COBRA_ENABLE_TRACY "Enable Tracy profiler instrumentation" OFF)
 
 if(COBRA_BUILD_LLVM_PASS)
+    set(COBRA_BUILD_LLVM_LIBRARY ON)
+endif()
+
+if(COBRA_BUILD_LLVM_LIBRARY)
     find_package(LLVM REQUIRED CONFIG)
     message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 endif()
@@ -94,7 +107,7 @@ if(Z3_FOUND)
     add_subdirectory(lib/verify)
 endif()
 
-if(COBRA_BUILD_LLVM_PASS)
+if(COBRA_BUILD_LLVM_LIBRARY)
     add_subdirectory(lib/llvm)
 endif()
 
@@ -115,6 +128,11 @@ install(DIRECTORY include/cobra
 set(_cobra_install_targets cobra-core cobra-cli)
 if(Z3_FOUND)
     list(APPEND _cobra_install_targets cobra-verify)
+endif()
+set(COBRA_HAS_LLVM_TARGET OFF)
+if(COBRA_BUILD_LLVM_LIBRARY)
+    list(APPEND _cobra_install_targets cobra-llvm)
+    set(COBRA_HAS_LLVM_TARGET ON)
 endif()
 
 install(TARGETS ${_cobra_install_targets}
