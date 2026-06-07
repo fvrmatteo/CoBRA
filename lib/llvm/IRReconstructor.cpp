@@ -10,6 +10,20 @@
 
 namespace cobra {
 
+    namespace {
+
+        llvm::Value *MaterializeAtCandidateWidth(
+            llvm::Value *value, llvm::IntegerType *target_ty, llvm::IRBuilder<> &builder
+        ) {
+            auto *value_ty = llvm::dyn_cast< llvm::IntegerType >(value->getType());
+            if (value_ty == nullptr || value_ty == target_ty) {
+                return value;
+            }
+            return builder.CreateZExtOrTrunc(value, target_ty, "cobra.cast");
+        }
+
+    } // namespace
+
     llvm::Value *ReconstructIr(
         const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
         const std::vector< uint32_t > &var_map
@@ -22,8 +36,12 @@ namespace cobra {
 
             case Expr::Kind::kVariable: {
                 uint32_t leaf_idx = expr.var_index;
-                if (!var_map.empty()) { leaf_idx = var_map[expr.var_index]; }
-                return candidate.leaf_values[leaf_idx];
+                if (!var_map.empty()) {
+                    leaf_idx = var_map[expr.var_index];
+                }
+                return MaterializeAtCandidateWidth(
+                    candidate.leaf_values[leaf_idx], int_ty, builder
+                );
             }
 
             case Expr::Kind::kAdd: {
