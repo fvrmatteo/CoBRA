@@ -1,14 +1,30 @@
 #pragma once
 
+#include "cobra/verify/Z3Verifier.h"
+
+#include <cstdint>
+
 #include "llvm/IR/PassManager.h"
 
 namespace cobra {
 
+    struct CobraPassOptions
+    {
+        uint32_t max_vars     = 16;
+        uint32_t min_ast_size = 3;
+        bool z3_verify        = false;
+        Z3VerificationSettings z3_settings;
+    };
+
     class CobraPass : public llvm::PassInfoMixin< CobraPass >
     {
       public:
-        explicit CobraPass(uint32_t max_vars = 16, uint32_t min_ast_size = 4)
-            : max_vars_(max_vars), min_ast_size_(min_ast_size) {}
+        explicit CobraPass(uint32_t max_vars = 16, uint32_t min_ast_size = 3)
+            : CobraPass(
+                  CobraPassOptions{ .max_vars = max_vars, .min_ast_size = min_ast_size }
+              ) {}
+
+        explicit CobraPass(CobraPassOptions options) : options_(options) {}
 
         // NOLINTNEXTLINE(readability-identifier-naming) - LLVM PassInfoMixin requires 'run'
         llvm::PreservedAnalyses run(llvm::Function &f, llvm::FunctionAnalysisManager &am);
@@ -18,8 +34,7 @@ namespace cobra {
         } // NOLINT(readability-identifier-naming) - LLVM interface
 
       private:
-        uint32_t max_vars_;
-        uint32_t min_ast_size_;
+        CobraPassOptions options_;
     };
 
 } // namespace cobra

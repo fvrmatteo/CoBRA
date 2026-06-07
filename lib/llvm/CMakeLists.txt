@@ -32,6 +32,10 @@ if(cobra_llvm_compile_definitions)
     target_compile_definitions(cobra-llvm-obj PRIVATE ${cobra_llvm_compile_definitions})
 endif()
 
+if(Z3_FOUND)
+    target_compile_definitions(cobra-llvm-obj PRIVATE COBRA_HAS_Z3=1)
+endif()
+
 if(cobra_llvm_compile_options)
     target_compile_options(cobra-llvm-obj PRIVATE ${cobra_llvm_compile_options})
 endif()
@@ -50,6 +54,10 @@ target_link_libraries(cobra-llvm PUBLIC
     cobra-core
     ${cobra_llvm_llvm_libs}
 )
+
+if(Z3_FOUND)
+    target_link_libraries(cobra-llvm PRIVATE cobra-verify)
+endif()
 
 target_include_directories(cobra-llvm PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>

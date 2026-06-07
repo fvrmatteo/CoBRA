@@ -2,7 +2,12 @@
 #include "IRReconstructor.h"
 #include "MBADetector.h"
 #include "cobra/core/ExprCost.h"
+#include "cobra/core/ExprUtils.h"
 #include "cobra/core/Simplifier.h"
+
+#ifdef COBRA_HAS_Z3
+    #include "cobra/verify/Z3Verifier.h"
+#endif
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -29,13 +34,13 @@ namespace cobra {
     CobraPass::run(llvm::Function &f, llvm::FunctionAnalysisManager & /*AM*/) {
         bool changed = false;
 
-        auto candidates = DetectMbaCandidates(f, min_ast_size_, max_vars_);
+        auto candidates = DetectMbaCandidates(f, options_.min_ast_size, options_.max_vars);
 
         NumCandidates += candidates.size();
 
         for (auto &cand : candidates) {
             Options opts{ .bitwidth   = cand.bitwidth,
-                          .max_vars   = max_vars_,
+                          .max_vars   = options_.max_vars,
                           .spot_check = true,
                           .evaluator  = cand.evaluator };
 
@@ -61,6 +66,46 @@ namespace cobra {
                 );
                 continue;
             }
+
+#ifdef COBRA_HAS_Z3
+            if (options_.z3_verify) {
+                if (ast == nullptr) {
+                    ++NumSkippedUnsupported;
+                    LLVM_DEBUG(
+                        llvm::dbgs() << "CoBRA: skipping — Z3 verification requested but "
+                                        "candidate AST is unavailable\n"
+                    );
+                    continue;
+                }
+
+                auto z3_expr = CloneExpr(*result.value().expr);
+                auto idx_map = BuildVarSupport(cand.var_names, result.value().real_vars);
+                if (!idx_map.empty()) {
+                    RemapVarIndices(*z3_expr, idx_map);
+                }
+
+                auto z3_result = Z3VerifyExprs(
+                    *ast, *z3_expr, cand.var_names, cand.bitwidth, options_.z3_settings
+                );
+                if (!z3_result.equivalent) {
+                    ++NumSkippedUnsupported;
+                    LLVM_DEBUG(
+                        llvm::dbgs() << "CoBRA: skipping — Z3 verification failed: "
+                                     << z3_result.counterexample << "\n"
+                    );
+                    continue;
+                }
+            }
+#else
+            if (options_.z3_verify) {
+                ++NumSkippedUnsupported;
+                LLVM_DEBUG(
+                    llvm::dbgs() << "CoBRA: skipping — built without Z3 support but Z3 "
+                                    "verification requested\n"
+                );
+                continue;
+            }
+#endif
 
             // Cost gate: don't replace if simplified form is not
             // smaller. nuw/nsw flags are intentionally dropped —

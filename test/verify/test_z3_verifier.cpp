@@ -133,7 +133,11 @@ TEST(Z3VerifierTest, Bitwidth1Equivalent) {
 TEST(Z3VerifierTest, ExprEquivalenceIdentical) {
     auto e1     = Expr::BitwiseAnd(Expr::Variable(0), Expr::Constant(0xFF));
     auto e2     = Expr::BitwiseAnd(Expr::Variable(0), Expr::Constant(0xFF));
-    auto result = Z3VerifyExprs(*e1, *e2, { "x" }, 64);
+    auto result = Z3VerifyExprs(
+        *e1, *e2, { "x" }, 64,
+        Z3VerificationSettings{ .timeout_ms          = 1000,
+                                .unknown_result_mode = Z3UnknownResultMode::kFail }
+    );
     EXPECT_TRUE(result.equivalent);
 }
 
@@ -141,7 +145,11 @@ TEST(Z3VerifierTest, ExprEquivalenceIdentical) {
 TEST(Z3VerifierTest, ExprNonEquivalence) {
     auto e1     = Expr::BitwiseAnd(Expr::Variable(0), Expr::Constant(0xFF));
     auto e2     = Expr::Variable(0);
-    auto result = Z3VerifyExprs(*e1, *e2, { "x" }, 64);
+    auto result = Z3VerifyExprs(
+        *e1, *e2, { "x" }, 64,
+        Z3VerificationSettings{ .timeout_ms          = 1000,
+                                .unknown_result_mode = Z3UnknownResultMode::kTreatAsEquivalent }
+    );
     EXPECT_FALSE(result.equivalent);
 }
 

@@ -4,12 +4,46 @@
 #include <cstdint>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <z3.h>
 
 namespace cobra {
 
     namespace {
+
+        Z3VerifyResult BuildVerifyResult(
+            Z3_context ctx, Z3_solver solver, Z3_lbool status, Z3UnknownResultMode unknown_mode
+        ) {
+            Z3VerifyResult result;
+
+            if (status == Z3_L_FALSE) {
+                result.equivalent = true;
+                return result;
+            }
+
+            if (status == Z3_L_TRUE) {
+                result.equivalent = false;
+                Z3_model model    = Z3_solver_get_model(ctx, solver);
+                std::ostringstream ss;
+                ss << Z3_model_to_string(ctx, model);
+                result.counterexample = ss.str();
+                return result;
+            }
+
+            result.unknown = true;
+
+            const char *reason = Z3_solver_get_reason_unknown(ctx, solver);
+            if (reason != nullptr && std::string_view(reason) == "timeout") {
+                result.timed_out = true;
+            }
+
+            result.equivalent     = unknown_mode == Z3UnknownResultMode::kTreatAsEquivalent;
+            result.counterexample = reason == nullptr
+                ? "Z3 returned unknown"
+                : "Z3 returned unknown: " + std::string(reason);
+            return result;
+        }
 
         Z3_ast BuildZ3Expr(
             Z3_context ctx, const Expr &expr, const std::vector< Z3_ast > &var_asts,
@@ -79,12 +113,16 @@ namespace cobra {
 
             const size_t kLen = 1ULL << num_vars;
             for (size_t i = 1; i < kLen; ++i) {
-                if (coeffs[i] == 0) { continue; }
+                if (coeffs[i] == 0) {
+                    continue;
+                }
 
                 // Build AND-product of all variables whose bits are set in i
                 Z3_ast product = nullptr;
                 for (uint32_t v = 0; v < num_vars; ++v) {
-                    if ((i & (1ULL << v)) == 0u) { continue; }
+                    if ((i & (1ULL << v)) == 0u) {
+                        continue;
+                    }
                     if (product == nullptr) {
                         product = var_asts[v];
                     } else {
@@ -104,10 +142,10 @@ namespace cobra {
     Z3VerifyResult Z3Verify(
         const std::vector< uint64_t > &cob_coeffs, const Expr &simplified,
         const std::vector< std::string > &var_names, uint32_t num_vars, uint32_t bitwidth,
-        uint32_t timeout_ms
+        Z3VerificationSettings settings
     ) {
         Z3_config cfg = Z3_mk_config();
-        Z3_set_param_value(cfg, "timeout", std::to_string(timeout_ms).c_str());
+        Z3_set_param_value(cfg, "timeout", std::to_string(settings.timeout_ms).c_str());
         Z3_context ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
 
@@ -130,22 +168,9 @@ namespace cobra {
         Z3_solver_inc_ref(ctx, solver);
         Z3_solver_assert(ctx, solver, neq);
 
-        Z3VerifyResult result;
-        const Z3_lbool kStatus = Z3_solver_check(ctx, solver);
-
-        if (kStatus == Z3_L_FALSE) {
-            result.equivalent = true;
-        } else if (kStatus == Z3_L_TRUE) {
-            result.equivalent = false;
-            Z3_model model    = Z3_solver_get_model(ctx, solver);
-            std::ostringstream ss;
-            ss << Z3_model_to_string(ctx, model);
-            result.counterexample = ss.str();
-        } else {
-            result.equivalent     = false;
-            result.timed_out      = true;
-            result.counterexample = "Z3 returned unknown (possible timeout)";
-        }
+        Z3VerifyResult result = BuildVerifyResult(
+            ctx, solver, Z3_solver_check(ctx, solver), settings.unknown_result_mode
+        );
 
         Z3_solver_dec_ref(ctx, solver);
         Z3_del_context(ctx);
@@ -155,10 +180,11 @@ namespace cobra {
 
     Z3VerifyResult Z3VerifyExprs(
         const Expr &original, const Expr &simplified,
-        const std::vector< std::string > &var_names, uint32_t bitwidth, uint32_t timeout_ms
+        const std::vector< std::string > &var_names, uint32_t bitwidth,
+        Z3VerificationSettings settings
     ) {
         Z3_config cfg = Z3_mk_config();
-        Z3_set_param_value(cfg, "timeout", std::to_string(timeout_ms).c_str());
+        Z3_set_param_value(cfg, "timeout", std::to_string(settings.timeout_ms).c_str());
         Z3_context ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
 
@@ -180,22 +206,9 @@ namespace cobra {
         Z3_solver_inc_ref(ctx, solver);
         Z3_solver_assert(ctx, solver, neq);
 
-        Z3VerifyResult result;
-        const Z3_lbool kStatus = Z3_solver_check(ctx, solver);
-
-        if (kStatus == Z3_L_FALSE) {
-            result.equivalent = true;
-        } else if (kStatus == Z3_L_TRUE) {
-            result.equivalent = false;
-            Z3_model model    = Z3_solver_get_model(ctx, solver);
-            std::ostringstream ss;
-            ss << Z3_model_to_string(ctx, model);
-            result.counterexample = ss.str();
-        } else {
-            result.equivalent     = false;
-            result.timed_out      = true;
-            result.counterexample = "Z3 returned unknown (possible timeout)";
-        }
+        Z3VerifyResult result = BuildVerifyResult(
+            ctx, solver, Z3_solver_check(ctx, solver), settings.unknown_result_mode
+        );
 
         Z3_solver_dec_ref(ctx, solver);
         Z3_del_context(ctx);
