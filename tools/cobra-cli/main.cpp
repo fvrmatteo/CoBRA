@@ -39,7 +39,9 @@ namespace {
         std::vector< uint64_t > sig(kLen);
         for (size_t i = 0; i < kLen; ++i) {
             std::vector< uint64_t > var_values(num_vars);
-            for (uint32_t v = 0; v < num_vars; ++v) { var_values[v] = (i >> v) & 1; }
+            for (uint32_t v = 0; v < num_vars; ++v) {
+                var_values[v] = (i >> v) & 1;
+            }
             sig[i] = cobra::EvalExpr(ast, var_values, bitwidth);
         }
         return sig;
@@ -62,22 +64,48 @@ namespace {
     void PrintStructuralFlags(cobra::StructuralFlag flags) {
         bool first = true;
         auto emit  = [&](const char *name) {
-            if (!first) { std::cerr << ", "; }
+            if (!first) {
+                std::cerr << ", ";
+            }
             std::cerr << name;
             first = false;
         };
-        if ((flags & cobra::kSfHasBitwise) != 0u) { emit("bitwise"); }
-        if ((flags & cobra::kSfHasArithmetic) != 0u) { emit("arithmetic"); }
-        if ((flags & cobra::kSfHasMul) != 0u) { emit("mul"); }
-        if ((flags & cobra::kSfHasMultilinearProduct) != 0u) { emit("multilinear-product"); }
-        if ((flags & cobra::kSfHasSingletonPower) != 0u) { emit("singleton-power"); }
-        if ((flags & cobra::kSfHasSingletonPowerGt2) != 0u) { emit("singleton-power-gt2"); }
-        if ((flags & cobra::kSfHasMixedProduct) != 0u) { emit("mixed-product"); }
-        if ((flags & cobra::kSfHasBitwiseOverArith) != 0u) { emit("bitwise-over-arith"); }
-        if ((flags & cobra::kSfHasArithOverBitwise) != 0u) { emit("arith-over-bitwise"); }
-        if ((flags & cobra::kSfHasMultivarHighPower) != 0u) { emit("multivar-high-power"); }
-        if ((flags & cobra::kSfHasUnknownShape) != 0u) { emit("unknown-shape"); }
-        if (first) { std::cerr << "none"; }
+        if ((flags & cobra::kSfHasBitwise) != 0u) {
+            emit("bitwise");
+        }
+        if ((flags & cobra::kSfHasArithmetic) != 0u) {
+            emit("arithmetic");
+        }
+        if ((flags & cobra::kSfHasMul) != 0u) {
+            emit("mul");
+        }
+        if ((flags & cobra::kSfHasMultilinearProduct) != 0u) {
+            emit("multilinear-product");
+        }
+        if ((flags & cobra::kSfHasSingletonPower) != 0u) {
+            emit("singleton-power");
+        }
+        if ((flags & cobra::kSfHasSingletonPowerGt2) != 0u) {
+            emit("singleton-power-gt2");
+        }
+        if ((flags & cobra::kSfHasMixedProduct) != 0u) {
+            emit("mixed-product");
+        }
+        if ((flags & cobra::kSfHasBitwiseOverArith) != 0u) {
+            emit("bitwise-over-arith");
+        }
+        if ((flags & cobra::kSfHasArithOverBitwise) != 0u) {
+            emit("arith-over-bitwise");
+        }
+        if ((flags & cobra::kSfHasMultivarHighPower) != 0u) {
+            emit("multivar-high-power");
+        }
+        if ((flags & cobra::kSfHasUnknownShape) != 0u) {
+            emit("unknown-shape");
+        }
+        if (first) {
+            std::cerr << "none";
+        }
     }
 
     int SimplifyAndPrint(
@@ -86,14 +114,18 @@ namespace {
     ) {
         auto num_vars = static_cast< uint32_t >(vars.size());
         COBRA_TRACE("CLI", "SimplifyAndPrint: vars={} bitwidth={}", num_vars, bitwidth);
-        if (verbose) { std::cerr << "Evaluating signature vector...\n"; }
+        if (verbose) {
+            std::cerr << "Evaluating signature vector...\n";
+        }
         auto sig = EvaluateToSignature(ast, num_vars, bitwidth);
         COBRA_TRACE_SIG("CLI", "signature vector", sig);
 
         if (verbose) {
             std::cerr << "Signature vector (" << num_vars << " vars): [";
             for (size_t i = 0; i < sig.size(); ++i) {
-                if (i > 0) { std::cerr << ", "; }
+                if (i > 0) {
+                    std::cerr << ", ";
+                }
                 std::cerr << sig[i];
             }
             std::cerr << "]\n";
@@ -104,7 +136,9 @@ namespace {
             ast, bitwidth, cobra::EvaluatorTraceKind::kCliOriginalAst
         );
 
-        if (verbose) { std::cerr << "Simplifying...\n"; }
+        if (verbose) {
+            std::cerr << "Simplifying...\n";
+        }
         COBRA_TRACE("CLI", "Simplify: calling core simplifier");
         auto result = cobra::Simplify(sig, vars, &ast, opts);
         COBRA_TRACE("CLI", "Simplify: returned has_value={}", result.has_value());
@@ -143,7 +177,9 @@ namespace {
                     }
                 }
                 if (!found) {
-                    if (!first) { std::cerr << ", "; }
+                    if (!first) {
+                        std::cerr << ", ";
+                    }
                     std::cerr << v;
                     first = false;
                 }
@@ -151,7 +187,9 @@ namespace {
             std::cerr << "), reduced to " << result.value().real_vars.size() << " var"
                       << (result.value().real_vars.size() != 1 ? "s" : "") << ": ";
             for (size_t i = 0; i < result.value().real_vars.size(); ++i) {
-                if (i > 0) { std::cerr << ", "; }
+                if (i > 0) {
+                    std::cerr << ", ";
+                }
                 std::cerr << result.value().real_vars[i];
             }
             std::cerr << "\n";
@@ -166,7 +204,14 @@ namespace {
         {
             std::vector< uint32_t > var_map;
             if (result.value().real_vars.size() < vars.size()) {
-                var_map = cobra::BuildVarSupport(vars, result.value().real_vars);
+                auto checked_var_map =
+                    cobra::TryBuildVarSupport(vars, result.value().real_vars);
+                if (!checked_var_map.has_value()) {
+                    std::cerr << "Error: simplified variable set is not contained in the "
+                                 "original variables\n";
+                    return 1;
+                }
+                var_map = std::move(*checked_var_map);
             }
 
             auto fw =
@@ -178,7 +223,9 @@ namespace {
                     std::cerr << "Verifying full-width equivalence..."
                                  " failed\n";
                     std::cerr << "  Failing inputs:";
-                    for (auto v : fw.failing_input) { std::cerr << " " << v; }
+                    for (auto v : fw.failing_input) {
+                        std::cerr << " " << v;
+                    }
                     std::cerr << "\n";
                 }
                 std::cerr << "Error: CoB result is only correct on "
@@ -197,8 +244,15 @@ namespace {
 #ifdef COBRA_HAS_Z3
         if (verify) {
             auto z3_expr = cobra::CloneExpr(*result.value().expr);
-            auto idx_map = cobra::BuildVarSupport(vars, result.value().real_vars);
-            if (!idx_map.empty()) { cobra::RemapVarIndices(*z3_expr, idx_map); }
+            auto idx_map = cobra::TryBuildVarSupport(vars, result.value().real_vars);
+            if (!idx_map.has_value()) {
+                std::cerr << "Error: simplified variable set is not contained in the original "
+                             "variables\n";
+                return 1;
+            }
+            if (!idx_map->empty()) {
+                cobra::RemapVarIndices(*z3_expr, *idx_map);
+            }
 
             auto z3r = cobra::Z3VerifyExprs(ast, *z3_expr, vars, bitwidth);
             if (z3r.equivalent) {
@@ -209,7 +263,9 @@ namespace {
             }
         }
 #else
-        if (verify) { std::cerr << "Warning: Z3 not available, --verify ignored\n"; }
+        if (verify) {
+            std::cerr << "Warning: Z3 not available, --verify ignored\n";
+        }
 #endif
 
         return 0;
@@ -267,12 +323,16 @@ int main(int argc, char *argv[]) {
     auto &vars = parsed.value().vars;
 
     COBRA_TRACE("CLI", "Variables: count={}", vars.size());
-    for (size_t i = 0; i < vars.size(); ++i) { COBRA_TRACE("CLI", "  var[{}]={}", i, vars[i]); }
+    for (size_t i = 0; i < vars.size(); ++i) {
+        COBRA_TRACE("CLI", "  var[{}]={}", i, vars[i]);
+    }
 
     if (verbose) {
         std::cerr << "Variables: ";
         for (size_t i = 0; i < vars.size(); ++i) {
-            if (i > 0) { std::cerr << ", "; }
+            if (i > 0) {
+                std::cerr << ", ";
+            }
             std::cerr << vars[i];
         }
         std::cerr << "\n";

@@ -2,6 +2,7 @@
 
 #include "cobra/core/Expr.h"
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,13 @@ namespace cobra {
     void RemapVarIndices(Expr &expr, const std::vector< uint32_t > &index_map);
 
     /// Map a subset of variable names to their indices in the full variable list.
+    std::optional< std::vector< uint32_t > > TryBuildVarSupport(
+        const std::vector< std::string > &all_vars,
+        const std::vector< std::string > &subset_vars
+    );
+
+    /// Map a subset of variable names to their indices in the full variable list.
+    /// Throws std::out_of_range when subset_vars contains a name not present in all_vars.
     std::vector< uint32_t > BuildVarSupport(
         const std::vector< std::string > &all_vars,
         const std::vector< std::string > &subset_vars

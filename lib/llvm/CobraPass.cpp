@@ -79,9 +79,17 @@ namespace cobra {
                 }
 
                 auto z3_expr = CloneExpr(*result.value().expr);
-                auto idx_map = BuildVarSupport(cand.var_names, result.value().real_vars);
-                if (!idx_map.empty()) {
-                    RemapVarIndices(*z3_expr, idx_map);
+                auto idx_map = TryBuildVarSupport(cand.var_names, result.value().real_vars);
+                if (!idx_map.has_value()) {
+                    ++NumSkippedUnsupported;
+                    LLVM_DEBUG(
+                        llvm::dbgs() << "CoBRA: skipping — real_vars not contained in "
+                                        "candidate variable set\n"
+                    );
+                    continue;
+                }
+                if (!idx_map->empty()) {
+                    RemapVarIndices(*z3_expr, *idx_map);
                 }
 
                 auto z3_result = Z3VerifyExprs(
@@ -129,15 +137,16 @@ namespace cobra {
             std::vector< uint32_t > var_map;
             const auto &real_vars = result.value().real_vars;
             if (!real_vars.empty() && real_vars.size() != cand.var_names.size()) {
-                var_map.reserve(real_vars.size());
-                for (const auto &rv : real_vars) {
-                    for (uint32_t j = 0; j < cand.var_names.size(); ++j) {
-                        if (cand.var_names[j] == rv) {
-                            var_map.push_back(j);
-                            break;
-                        }
-                    }
+                auto checked_var_map = TryBuildVarSupport(cand.var_names, real_vars);
+                if (!checked_var_map.has_value()) {
+                    ++NumSkippedUnsupported;
+                    LLVM_DEBUG(
+                        llvm::dbgs() << "CoBRA: skipping — real_vars not contained in "
+                                        "candidate variable set\n"
+                    );
+                    continue;
                 }
+                var_map = std::move(*checked_var_map);
             }
 
             llvm::IRBuilder<> builder(cand.root);

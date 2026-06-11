@@ -11,17 +11,38 @@
 
 namespace cobra {
 
-    std::vector< uint32_t > BuildVarSupport(
+    std::optional< std::vector< uint32_t > > TryBuildVarSupport(
         const std::vector< std::string > &all_vars,
         const std::vector< std::string > &subset_vars
     ) {
         std::unordered_map< std::string, uint32_t > idx;
-        for (uint32_t j = 0; j < all_vars.size(); ++j) { idx[all_vars[j]] = j; }
+        for (uint32_t j = 0; j < all_vars.size(); ++j) {
+            idx[all_vars[j]] = j;
+        }
 
         std::vector< uint32_t > support;
         support.reserve(subset_vars.size());
-        for (const auto &v : subset_vars) { support.push_back(idx.at(v)); }
+        for (const auto &v : subset_vars) {
+            auto it = idx.find(v);
+            if (it == idx.end()) {
+                return std::nullopt;
+            }
+            support.push_back(it->second);
+        }
         return support;
+    }
+
+    std::vector< uint32_t > BuildVarSupport(
+        const std::vector< std::string > &all_vars,
+        const std::vector< std::string > &subset_vars
+    ) {
+        auto support = TryBuildVarSupport(all_vars, subset_vars);
+        if (!support.has_value()) {
+            throw std::out_of_range(
+                "BuildVarSupport: subset variable missing from full variable list"
+            );
+        }
+        return *support;
     }
 
     void RemapVarIndices(Expr &expr, const std::vector< uint32_t > &index_map) {
@@ -29,7 +50,9 @@ namespace cobra {
             expr.var_index = index_map.at(expr.var_index);
             return;
         }
-        for (auto &child : expr.children) { RemapVarIndices(*child, index_map); }
+        for (auto &child : expr.children) {
+            RemapVarIndices(*child, index_map);
+        }
     }
 
     std::unique_ptr< Expr > BuildAndProduct(uint64_t mask) {
@@ -47,21 +70,31 @@ namespace cobra {
     std::unique_ptr< Expr > ApplyCoefficient(
         std::unique_ptr< Expr > expr, uint64_t coeff, uint32_t bitwidth
     ) { // NOLINT(readability-identifier-naming)
-        if (coeff == 1) { return expr; }
-        if (coeff == Bitmask(bitwidth)) { return Expr::Negate(std::move(expr)); }
+        if (coeff == 1) {
+            return expr;
+        }
+        if (coeff == Bitmask(bitwidth)) {
+            return Expr::Negate(std::move(expr));
+        }
         return Expr::Mul(Expr::Constant(coeff), std::move(expr));
     }
 
     bool IsConstantSubtree(const Expr &expr) {
-        if (expr.kind == Expr::Kind::kConstant) { return true; }
-        if (expr.kind == Expr::Kind::kVariable) { return false; }
+        if (expr.kind == Expr::Kind::kConstant) {
+            return true;
+        }
+        if (expr.kind == Expr::Kind::kVariable) {
+            return false;
+        }
         return std::ranges::all_of(expr.children, [](const auto &child) {
             return IsConstantSubtree(*child);
         });
     }
 
     bool ContainsShr(const Expr &expr) {
-        if (expr.kind == Expr::Kind::kShr) { return true; }
+        if (expr.kind == Expr::Kind::kShr) {
+            return true;
+        }
         return std::ranges::any_of(expr.children, [](const auto &child) {
             return ContainsShr(*child);
         });
@@ -72,7 +105,9 @@ namespace cobra {
             out.push_back(expr.var_index);
             return;
         }
-        for (const auto &child : expr.children) { CollectVariables(*child, out); }
+        for (const auto &child : expr.children) {
+            CollectVariables(*child, out);
+        }
     }
 
     uint64_t EvalConstantExpr(const Expr &expr, uint32_t bitwidth) {
@@ -115,7 +150,9 @@ namespace cobra {
     }
 
     bool HasVarDep(const Expr &expr) {
-        if (expr.kind == Expr::Kind::kVariable) { return true; }
+        if (expr.kind == Expr::Kind::kVariable) {
+            return true;
+        }
         return std::ranges::any_of(expr.children, [](const auto &c) { return HasVarDep(*c); });
     }
 
@@ -158,7 +195,9 @@ namespace cobra {
             }
 
             // Flatten Add chains and combine constant terms.
-            if (expr->kind != Expr::Kind::kAdd) { return expr; }
+            if (expr->kind != Expr::Kind::kAdd) {
+                return expr;
+            }
 
             std::vector< std::unique_ptr< Expr > > terms;
             FlattenAdd(std::move(expr), terms);
@@ -174,7 +213,9 @@ namespace cobra {
             }
 
             // Rebuild: non-constant terms first, then constant if nonzero.
-            if (non_const.empty()) { return Expr::Constant(const_sum); }
+            if (non_const.empty()) {
+                return Expr::Constant(const_sum);
+            }
 
             auto result = std::move(non_const[0]);
             for (size_t i = 1; i < non_const.size(); ++i) {
@@ -194,7 +235,9 @@ namespace cobra {
 
             // Add(Neg(x), all_ones) or Add(all_ones, Neg(x)) → Not(x)
             // since -x + (2^n - 1) = ~x in modular arithmetic.
-            if (expr->kind != Expr::Kind::kAdd) { return expr; }
+            if (expr->kind != Expr::Kind::kAdd) {
+                return expr;
+            }
 
             const uint64_t kMask = Bitmask(bitwidth);
             auto &lhs            = expr->children[0];
@@ -244,14 +287,18 @@ namespace cobra {
                 child = ExtractCommonFactor(std::move(child));
             }
 
-            if (expr->kind != Expr::Kind::kAdd) { return expr; }
+            if (expr->kind != Expr::Kind::kAdd) {
+                return expr;
+            }
 
             // Flatten the Add chain.
             std::vector< std::unique_ptr< Expr > > terms;
             FlattenAdd(std::move(expr), terms);
 
             if (terms.size() < 2) {
-                if (terms.size() == 1) { return std::move(terms[0]); }
+                if (terms.size() == 1) {
+                    return std::move(terms[0]);
+                }
                 return Expr::Constant(0);
             }
 
@@ -277,8 +324,12 @@ namespace cobra {
             // it appears (structurally) in ALL other terms.
             for (size_t fi = 0; fi < all_factors[0].factors.size(); ++fi) {
                 auto &candidate = all_factors[0].factors[fi];
-                if (candidate->kind == Expr::Kind::kConstant) { continue; }
-                if (candidate->kind == Expr::Kind::kVariable) { continue; }
+                if (candidate->kind == Expr::Kind::kConstant) {
+                    continue;
+                }
+                if (candidate->kind == Expr::Kind::kVariable) {
+                    continue;
+                }
 
                 auto candidate_hash = std::hash< Expr >{}(*candidate);
 
@@ -290,7 +341,9 @@ namespace cobra {
                     bool found = false;
                     for (size_t fj = 0; fj < all_factors[ti].factors.size(); ++fj) {
                         auto &f = all_factors[ti].factors[fj];
-                        if (f->kind == Expr::Kind::kConstant) { continue; }
+                        if (f->kind == Expr::Kind::kConstant) {
+                            continue;
+                        }
                         if (std::hash< Expr >{}(*f) == candidate_hash
                             && f->kind == candidate->kind)
                         {
@@ -307,7 +360,9 @@ namespace cobra {
                     }
                 }
 
-                if (!universal) { continue; }
+                if (!universal) {
+                    continue;
+                }
 
                 // Found a universal factor! Extract it.
                 auto common = std::move(all_factors[0].factors[fi]);
@@ -336,7 +391,9 @@ namespace cobra {
 
             // No universal factor found. Rebuild original Add chain.
             std::vector< std::unique_ptr< Expr > > rebuilt_terms;
-            for (auto &tf : all_factors) { rebuilt_terms.push_back(RebuildMul(tf.factors)); }
+            for (auto &tf : all_factors) {
+                rebuilt_terms.push_back(RebuildMul(tf.factors));
+            }
             auto result = std::move(rebuilt_terms[0]);
             for (size_t i = 1; i < rebuilt_terms.size(); ++i) {
                 result = Expr::Add(std::move(result), std::move(rebuilt_terms[i]));
@@ -363,7 +420,9 @@ namespace cobra {
         // monomials, avoiding false replacements on compound
         // bitwise expressions like AND(x+y, z).
         bool IsPureProduct(const Expr &e) {
-            if (e.kind == Expr::Kind::kVariable) { return true; }
+            if (e.kind == Expr::Kind::kVariable) {
+                return true;
+            }
             if (e.kind == Expr::Kind::kAnd || e.kind == Expr::Kind::kMul) {
                 return std::ranges::all_of(e.children, [](const auto &c) {
                     return IsPureProduct(*c);
@@ -375,7 +434,9 @@ namespace cobra {
     } // namespace
 
     std::unique_ptr< Expr > RepairProductShadow(std::unique_ptr< Expr > expr) {
-        for (auto &child : expr->children) { child = RepairProductShadow(std::move(child)); }
+        for (auto &child : expr->children) {
+            child = RepairProductShadow(std::move(child));
+        }
 
         if (expr->kind == Expr::Kind::kAnd && expr->children.size() == 2
             && IsPureProduct(*expr->children[0]) && IsPureProduct(*expr->children[1]))

@@ -22,9 +22,12 @@ namespace cobra {
             if (real_vars.empty() || real_vars.size() == all_vars.size()) {
                 return FullWidthCheckEval(eval, kAllCount, reduced_expr, bitwidth);
             }
-            auto idx_map  = BuildVarSupport(all_vars, real_vars);
+            auto idx_map = TryBuildVarSupport(all_vars, real_vars);
+            if (!idx_map.has_value()) {
+                return CheckResult{ .passed = false, .failing_input = {} };
+            }
             auto remapped = CloneExpr(reduced_expr);
-            RemapVarIndices(*remapped, idx_map);
+            RemapVarIndices(*remapped, *idx_map);
             return FullWidthCheckEval(eval, kAllCount, *remapped, bitwidth);
         }
 
