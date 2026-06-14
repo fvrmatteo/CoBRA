@@ -63,7 +63,9 @@ namespace cobra {
             while (!work.empty()) {
                 auto *v = work.front();
                 work.pop();
-                if (!visited.insert(v).second) { continue; }
+                if (!visited.insert(v).second) {
+                    continue;
+                }
 
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
                 if ((inst != nullptr) && IsMbaOpcode(inst->getOpcode())) {
@@ -79,7 +81,9 @@ namespace cobra {
                     }
 
                     tree_insts.push_back(inst);
-                    for (auto &op : inst->operands()) { work.push(op.get()); }
+                    for (auto &op : inst->operands()) {
+                        work.push(op.get());
+                    }
                 } else if (auto *phi = llvm::dyn_cast< llvm::PHINode >(v)) {
                     // Check if every incoming value is an MBA opcode
                     // instruction (or a constant).  If so, treat the
@@ -87,7 +91,9 @@ namespace cobra {
                     bool all_mba = phi->getNumIncomingValues() > 0;
                     for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
                         auto *inc = phi->getIncomingValue(i);
-                        if (llvm::isa< llvm::ConstantInt >(inc)) { continue; }
+                        if (llvm::isa< llvm::ConstantInt >(inc)) {
+                            continue;
+                        }
                         auto *inc_inst = llvm::dyn_cast< llvm::Instruction >(inc);
                         if ((inc_inst == nullptr) || !IsMbaOpcode(inc_inst->getOpcode())) {
                             all_mba = false;
@@ -120,11 +126,14 @@ namespace cobra {
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
         ) {
             llvm::DenseMap< llvm::Value *, uint64_t > cache;
+            llvm::DenseSet< llvm::Value * > in_progress;
             uint64_t mask = Bitmask(bitwidth);
 
             std::function< uint64_t(llvm::Value *) > eval = [&](llvm::Value *v) -> uint64_t {
                 auto it = cache.find(v);
-                if (it != cache.end()) { return it->second; }
+                if (it != cache.end()) {
+                    return it->second;
+                }
 
                 auto ait = assignments.find(v);
                 if (ait != assignments.end()) {
@@ -138,12 +147,24 @@ namespace cobra {
                     return val;
                 }
 
+                // Some partially reconstructed MBA trees can still contain
+                // operand/phi cycles. Those are unsupported for constant
+                // evaluation, so stop recursion and conservatively fold the
+                // cyclic sub-expression to zero instead of recursing forever.
+                if (!in_progress.insert(v).second) {
+                    cache[v] = 0;
+                    return 0;
+                }
+
+                uint64_t result = 0;
+
                 // Phi redirect: follow the chosen arm.
                 auto pit = phi_redirects.find(v);
                 if (pit != phi_redirects.end()) {
-                    const uint64_t val = eval(pit->second);
-                    cache[v]           = val;
-                    return val;
+                    result   = eval(pit->second);
+                    cache[v] = result;
+                    in_progress.erase(v);
+                    return result;
                 }
 
                 auto *inst = llvm::cast< llvm::Instruction >(v);
@@ -151,14 +172,14 @@ namespace cobra {
                 if (inst->getOpcode() == llvm::Instruction::ZExt
                     || inst->getOpcode() == llvm::Instruction::SExt)
                 {
-                    const uint64_t operand = eval(inst->getOperand(0));
-                    cache[v]               = operand & mask;
-                    return cache[v];
+                    result   = eval(inst->getOperand(0)) & mask;
+                    cache[v] = result;
+                    in_progress.erase(v);
+                    return result;
                 }
 
                 const uint64_t lhs = eval(inst->getOperand(0));
                 const uint64_t rhs = eval(inst->getOperand(1));
-                uint64_t result    = 0;
 
                 switch (inst->getOpcode()) {
                     case llvm::Instruction::Add:
@@ -191,6 +212,7 @@ namespace cobra {
                 }
 
                 cache[v] = result;
+                in_progress.erase(v);
                 return result;
             };
 
@@ -204,7 +226,9 @@ namespace cobra {
 
             std::function< bool(llvm::Value *) > check = [&](llvm::Value *v) -> bool {
                 auto it = depends_on_var.find(v);
-                if (it != depends_on_var.end()) { return it->second; }
+                if (it != depends_on_var.end()) {
+                    return it->second;
+                }
 
                 if (llvm::isa< llvm::ConstantInt >(v)) {
                     depends_on_var[v] = false;
@@ -244,23 +268,35 @@ namespace cobra {
             while (!work.empty()) {
                 auto *v = work.front();
                 work.pop();
-                if (!visited.insert(v).second) { continue; }
+                if (!visited.insert(v).second) {
+                    continue;
+                }
                 check(v);
                 if (auto *inst = llvm::dyn_cast< llvm::Instruction >(v)) {
                     if (visited_tree.contains(inst) != 0u) {
-                        for (auto &op : inst->operands()) { work.push(op.get()); }
+                        for (auto &op : inst->operands()) {
+                            work.push(op.get());
+                        }
                     }
                 }
             }
 
             for (auto *v : visited) {
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
-                if (inst == nullptr) { continue; }
-                if (inst->getOpcode() != llvm::Instruction::Mul) { continue; }
-                if (visited_tree.contains(inst) == 0u) { continue; }
+                if (inst == nullptr) {
+                    continue;
+                }
+                if (inst->getOpcode() != llvm::Instruction::Mul) {
+                    continue;
+                }
+                if (visited_tree.contains(inst) == 0u) {
+                    continue;
+                }
                 const bool lhs_dep = depends_on_var.lookup(inst->getOperand(0));
                 const bool rhs_dep = depends_on_var.lookup(inst->getOperand(1));
-                if (lhs_dep && rhs_dep) { return true; }
+                if (lhs_dep && rhs_dep) {
+                    return true;
+                }
             }
             return false;
         }
@@ -289,7 +325,9 @@ namespace cobra {
             }
 
             auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
-            if (inst == nullptr || !tree_set.contains(inst)) { return nullptr; }
+            if (inst == nullptr || !tree_set.contains(inst)) {
+                return nullptr;
+            }
 
             // ZExt/SExt — pass through to inner operand
             if (inst->getOpcode() == llvm::Instruction::ZExt
@@ -303,20 +341,28 @@ namespace cobra {
             // LShr with constant shift amount
             if (inst->getOpcode() == llvm::Instruction::LShr) {
                 auto *shift_amt = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
-                if (shift_amt == nullptr) { return nullptr; }
+                if (shift_amt == nullptr) {
+                    return nullptr;
+                }
                 auto child =
                     BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
-                if (child == nullptr) { return nullptr; }
+                if (child == nullptr) {
+                    return nullptr;
+                }
                 return Expr::LogicalShr(std::move(child), shift_amt->getZExtValue());
             }
 
             // Shl with constant shift amount
             if (inst->getOpcode() == llvm::Instruction::Shl) {
                 auto *shift_amt = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
-                if (shift_amt == nullptr) { return nullptr; }
+                if (shift_amt == nullptr) {
+                    return nullptr;
+                }
                 auto child =
                     BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
-                if (child == nullptr) { return nullptr; }
+                if (child == nullptr) {
+                    return nullptr;
+                }
                 uint64_t mul_val = 1ULL << shift_amt->getZExtValue();
                 return Expr::Mul(std::move(child), Expr::Constant(mul_val));
             }
@@ -326,7 +372,9 @@ namespace cobra {
                 BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
             auto rhs =
                 BuildExprFromIR(inst->getOperand(1), leaves, tree_set, mask, phi_redirects);
-            if (lhs == nullptr || rhs == nullptr) { return nullptr; }
+            if (lhs == nullptr || rhs == nullptr) {
+                return nullptr;
+            }
 
             switch (inst->getOpcode()) {
                 case llvm::Instruction::Add:
@@ -342,10 +390,14 @@ namespace cobra {
                 case llvm::Instruction::Xor: {
                     // Detect NOT: xor %x, -1
                     if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1))) {
-                        if (ci->isAllOnesValue()) { return Expr::BitwiseNot(std::move(lhs)); }
+                        if (ci->isAllOnesValue()) {
+                            return Expr::BitwiseNot(std::move(lhs));
+                        }
                     }
                     if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(0))) {
-                        if (ci->isAllOnesValue()) { return Expr::BitwiseNot(std::move(rhs)); }
+                        if (ci->isAllOnesValue()) {
+                            return Expr::BitwiseNot(std::move(rhs));
+                        }
                     }
                     return Expr::BitwiseXor(std::move(lhs), std::move(rhs));
                 }
@@ -368,23 +420,35 @@ namespace cobra {
             while (!work.empty()) {
                 auto *v = work.front();
                 work.pop();
-                if (!visited.insert(v).second) { continue; }
+                if (!visited.insert(v).second) {
+                    continue;
+                }
 
-                if (llvm::isa< llvm::ConstantInt >(v)) { continue; }
-                if (leaf_set.contains(v)) { continue; }
+                if (llvm::isa< llvm::ConstantInt >(v)) {
+                    continue;
+                }
+                if (leaf_set.contains(v)) {
+                    continue;
+                }
 
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
-                if ((inst == nullptr) || !IsMbaOpcode(inst->getOpcode())) { return false; }
+                if ((inst == nullptr) || !IsMbaOpcode(inst->getOpcode())) {
+                    return false;
+                }
 
                 // LShr with variable shift — can't evaluate
                 if (inst->getOpcode() == llvm::Instruction::LShr
                     && !llvm::isa< llvm::ConstantInt >(inst->getOperand(1)))
                 {
-                    if (!leaf_set.contains(inst)) { return false; }
+                    if (!leaf_set.contains(inst)) {
+                        return false;
+                    }
                     continue;
                 }
 
-                for (auto &op : inst->operands()) { work.push(op.get()); }
+                for (auto &op : inst->operands()) {
+                    work.push(op.get());
+                }
             }
             return true;
         }
@@ -397,13 +461,17 @@ namespace cobra {
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
             const std::vector< llvm::Value * > &leaves, uint32_t bitwidth
         ) {
-            if (phi_redirects.empty()) { return true; }
+            if (phi_redirects.empty()) {
+                return true;
+            }
 
             const uint64_t mask           = Bitmask(bitwidth);
             constexpr uint32_t kNumProbes = 8;
 
             llvm::DenseSet< llvm::Value * > leaf_set;
-            for (auto *lv : leaves) { leaf_set.insert(lv); }
+            for (auto *lv : leaves) {
+                leaf_set.insert(lv);
+            }
 
             // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp)
             std::mt19937_64 rng(0xC0B7A);
@@ -413,7 +481,9 @@ namespace cobra {
 
                 for (uint32_t probe = 0; probe < kNumProbes; ++probe) {
                     llvm::DenseMap< llvm::Value *, uint64_t > assignments;
-                    for (auto *leaf : leaves) { assignments[leaf] = rng() & mask; }
+                    for (auto *leaf : leaves) {
+                        assignments[leaf] = rng() & mask;
+                    }
 
                     // Evaluate chosen arm.
                     uint64_t chosen_val = 0;
@@ -429,10 +499,14 @@ namespace cobra {
                     // Check every other arm.
                     for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
                         auto *inc = phi->getIncomingValue(i);
-                        if (inc == chosen) { continue; }
+                        if (inc == chosen) {
+                            continue;
+                        }
 
                         // Pre-check: arm's dependencies must be in our leaf set.
-                        if (!ArmDepsInLeafSet(inc, leaf_set)) { return false; }
+                        if (!ArmDepsInLeafSet(inc, leaf_set)) {
+                            return false;
+                        }
 
                         uint64_t inc_val = 0;
                         if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(inc)) {
@@ -444,7 +518,9 @@ namespace cobra {
                             );
                         }
 
-                        if (inc_val != chosen_val) { return false; }
+                        if (inc_val != chosen_val) {
+                            return false;
+                        }
                     }
                 }
             }
@@ -464,27 +540,41 @@ namespace cobra {
         // they can be emitted as standalone candidates.
         for (auto *bb : post_order(&f)) {
             for (auto &inst : llvm::reverse(*bb)) {
-                if (!IsMbaOpcode(inst.getOpcode())) { continue; }
-                if (already_in_tree.contains(&inst) != 0u) { continue; }
+                if (!IsMbaOpcode(inst.getOpcode())) {
+                    continue;
+                }
+                if (already_in_tree.contains(&inst) != 0u) {
+                    continue;
+                }
 
-                if (!inst.getType()->isIntegerTy()) { continue; }
+                if (!inst.getType()->isIntegerTy()) {
+                    continue;
+                }
                 const uint32_t bw = inst.getType()->getIntegerBitWidth();
-                if (bw > 64) { continue; }
+                if (bw > 64) {
+                    continue;
+                }
 
                 llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
                 std::vector< llvm::Value * > leaves;
                 llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
                 CollectTree(&inst, tree_insts, leaves, phi_redirects);
 
-                if (tree_insts.size() < min_ast_size) { continue; }
+                if (tree_insts.size() < min_ast_size) {
+                    continue;
+                }
 
                 constexpr uint32_t kPreElimCap = 20;
-                if (leaves.size() > kPreElimCap) { continue; }
+                if (leaves.size() > kPreElimCap) {
+                    continue;
+                }
 
                 const llvm::DenseSet< llvm::Value * > tree_set(
                     tree_insts.begin(), tree_insts.end()
                 );
-                if (HasPolynomialMul(&inst, tree_set)) { continue; }
+                if (HasPolynomialMul(&inst, tree_set)) {
+                    continue;
+                }
 
                 // Verify transparent phis — if any arm diverges,
                 // re-collect without phi transparency.
@@ -497,11 +587,17 @@ namespace cobra {
                         /*try_phi_transparency=*/false
                     );
 
-                    if (tree_insts.size() < min_ast_size) { continue; }
-                    if (leaves.size() > kPreElimCap) { continue; }
+                    if (tree_insts.size() < min_ast_size) {
+                        continue;
+                    }
+                    if (leaves.size() > kPreElimCap) {
+                        continue;
+                    }
                 }
 
-                for (auto *ti : tree_insts) { already_in_tree.insert(ti); }
+                for (auto *ti : tree_insts) {
+                    already_in_tree.insert(ti);
+                }
 
                 const auto num_vars  = static_cast< uint32_t >(leaves.size());
                 const size_t sig_len = 1ULL << num_vars;
@@ -560,4 +656,3 @@ namespace cobra {
     }
 
 } // namespace cobra
-
