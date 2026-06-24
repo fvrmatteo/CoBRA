@@ -32,6 +32,18 @@ namespace cobra {
         for (auto &child : expr.children) { RemapVarIndices(*child, index_map); }
     }
 
+    bool ExprStructurallyEqual(const Expr &lhs, const Expr &rhs) {
+        if (lhs.kind != rhs.kind || lhs.constant_val != rhs.constant_val
+            || lhs.var_index != rhs.var_index || lhs.children.size() != rhs.children.size())
+        {
+            return false;
+        }
+        for (size_t i = 0; i < lhs.children.size(); ++i) {
+            if (!ExprStructurallyEqual(*lhs.children[i], *rhs.children[i])) { return false; }
+        }
+        return true;
+    }
+
     std::unique_ptr< Expr > BuildAndProduct(uint64_t mask) {
         std::unique_ptr< Expr > result;
         while (mask != 0) {

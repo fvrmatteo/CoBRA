@@ -18,6 +18,10 @@ namespace cobra {
     /// Rewrite every kVariable node's var_index through index_map.
     void RemapVarIndices(Expr &expr, const std::vector< uint32_t > &index_map);
 
+    /// Deep structural equality: same kind, constant, var_index, and children
+    /// (in order). Unlike std::hash<Expr> this never reports false positives.
+    bool ExprStructurallyEqual(const Expr &lhs, const Expr &rhs);
+
     /// Map a subset of variable names to their indices in the full variable list.
     std::vector< uint32_t > BuildVarSupport(
         const std::vector< std::string > &all_vars,
