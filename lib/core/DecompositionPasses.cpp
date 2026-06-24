@@ -166,6 +166,26 @@ namespace cobra {
                 FullWidthCheckEval(*active_eval, num_vars, *core_payload.expr, ctx.bitwidth);
 
             if (direct_check.passed) {
+                // A degenerate product core -- the whole input as a single
+                // product term (single_product) -- "passes" the direct check
+                // only because it IS the input. Emitting it short-circuits the
+                // worklist as a no-op winner before the decomposition/signature
+                // passes can recover a simpler form. When such a core also has a
+                // (full-width-confirmed) spurious variable, a real reduction is
+                // reachable, so decline the short-circuit and let later passes
+                // run. Genuine sum-of-product cores (single_product == false)
+                // and cores with no spurious variable are unaffected.
+                if (expected_kind == ExtractorKind::kProductAST && core_payload.single_product
+                    && !EliminateAuxVars(decomp_sig, active_vars, *active_eval, ctx.bitwidth)
+                            .spurious_vars.empty())
+                {
+                    return Ok(
+                        PassResult{
+                            .decision    = PassDecision::kNotApplicable,
+                            .disposition = ItemDisposition::kRetainCurrent,
+                        }
+                    );
+                }
                 auto cost_info = ComputeCost(*core_payload.expr);
                 WorkItem cand_item;
                 cand_item.payload = CandidatePayload{
