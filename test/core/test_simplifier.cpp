@@ -1893,7 +1893,7 @@ TEST(SimplifierTest, RejectsExcessiveInputVarCount) {
     // any allocation.
     std::vector< std::string > vars;
     for (int i = 0; i < 25; ++i) { vars.push_back("x" + std::to_string(i)); }
-    std::vector< uint64_t > sig(2, 0);  // size doesn't matter; rejected first
+    std::vector< uint64_t > sig(2, 0); // size doesn't matter; rejected first
     Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = false };
 
     auto result = Simplify(sig, vars, nullptr, opts);
@@ -1954,4 +1954,68 @@ TEST(SimplifierTest, AcceptsInputVarCountAtCeiling) {
     auto result = Simplify(sig, vars, nullptr, opts);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(Render(*result.value().expr, result.value().real_vars), "7");
+}
+
+namespace {
+    // s(v) = 1 - 2*(v & 1), a +-1 value (s^2 == 1). GAMBA parity sign-flip.
+    std::unique_ptr< Expr > SignFlip(uint32_t var_index) {
+        return Expr::Add(
+            Expr::Constant(1),
+            Expr::Mul(
+                Expr::BitwiseAnd(Expr::Variable(var_index), Expr::Constant(1)),
+                Expr::Constant(static_cast< uint64_t >(-2))
+            )
+        );
+    }
+
+    bool RendersToSum(const SimplifyOutcome &out, const char *a, const char *b) {
+        auto text = Render(*out.expr, out.real_vars);
+        return text == std::string(a) + " + " + b || text == std::string(b) + " + " + a;
+    }
+} // namespace
+
+// GAMBA recon: parity sign-square E*s*s -> E for multi-variable E. The
+// degenerate single-product core (the whole input) used to short-circuit the
+// worklist before the recovery passes ran, leaving the input unchanged.
+TEST(SimplifierTest, SignSquareCollapseMultiVar) {
+    // (x1 + x2) * s(x3) * s(x3)  ==  x1 + x2
+    auto ast = Expr::Mul(
+        Expr::Mul(Expr::Add(Expr::Variable(0), Expr::Variable(1)), SignFlip(2)), SignFlip(2)
+    );
+    std::vector< std::string > vars = { "x1", "x2", "x3" };
+
+    auto sig = EvaluateBooleanSignature(*ast, 3, 64);
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+    opts.evaluator = Evaluator::FromExpr(*ast, 64);
+
+    auto result = Simplify(sig, vars, ast.get(), opts);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->kind, SimplifyOutcome::Kind::kSimplified);
+    EXPECT_TRUE(RendersToSum(result.value(), "x1", "x2"));
+    auto check = FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 3, *result->expr, 64);
+    EXPECT_TRUE(check.passed);
+}
+
+// Full Arnau target: XOR self-cancel of duplicate complex operands plus the
+// sign-square collapse must together reduce to x1 + x2.
+TEST(SimplifierTest, SignSquareWithXorSelfCancel) {
+    // ((((x1+x2)*s3) ^ ((x5+3)*s4) ^ ((x5+3)*s4)) * s3)  ==  x1 + x2
+    auto term_a = Expr::Mul(Expr::Add(Expr::Variable(0), Expr::Variable(1)), SignFlip(2));
+    auto term_b = [&]() {
+        return Expr::Mul(Expr::Add(Expr::Variable(4), Expr::Constant(3)), SignFlip(3));
+    };
+    auto inner = Expr::BitwiseXor(Expr::BitwiseXor(std::move(term_a), term_b()), term_b());
+    auto ast   = Expr::Mul(std::move(inner), SignFlip(2));
+    std::vector< std::string > vars = { "x1", "x2", "x3", "x4", "x5" };
+
+    auto sig = EvaluateBooleanSignature(*ast, 5, 64);
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+    opts.evaluator = Evaluator::FromExpr(*ast, 64);
+
+    auto result = Simplify(sig, vars, ast.get(), opts);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->kind, SimplifyOutcome::Kind::kSimplified);
+    EXPECT_TRUE(RendersToSum(result.value(), "x1", "x2"));
+    auto check = FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 5, *result->expr, 64);
+    EXPECT_TRUE(check.passed);
 }
