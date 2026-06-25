@@ -2019,3 +2019,65 @@ TEST(SimplifierTest, SignSquareWithXorSelfCancel) {
     auto check = FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 5, *result->expr, 64);
     EXPECT_TRUE(check.passed);
 }
+
+namespace {
+    bool RendersToAndConst(const SimplifyOutcome &out, const char *v, uint64_t c) {
+        auto text = Render(*out.expr, out.real_vars);
+        auto cs   = std::to_string(c);
+        return text == std::string(v) + " & " + cs || text == cs + " & " + std::string(v);
+    }
+
+    // ((x & m) + (y & ymask)) & outmask
+    std::unique_ptr< Expr > MaskedAdd(uint64_t m, uint64_t ymask, uint64_t outmask) {
+        return Expr::BitwiseAnd(
+            Expr::Add(
+                Expr::BitwiseAnd(Expr::Variable(0), Expr::Constant(m)),
+                Expr::BitwiseAnd(Expr::Variable(1), Expr::Constant(ymask))
+            ),
+            Expr::Constant(outmask)
+        );
+    }
+
+    SimplifyOutcome RunAst(const Expr &ast, std::vector< std::string > vars) {
+        auto nv  = static_cast< uint32_t >(vars.size());
+        auto sig = EvaluateBooleanSignature(ast, nv, 64);
+        Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+        opts.evaluator = Evaluator::FromExpr(ast, 64);
+        auto result    = Simplify(sig, vars, &ast, opts);
+        return std::move(result.value());
+    }
+} // namespace
+
+// GAMBA recon: carry-free masked addition. ((x & 128) + (y & 127)) & 128 == x & 128
+// because y&127 < 128 is disjoint from bit 7, so the add can't carry into it. The
+// {0,1} signature is all-zero (bit 7 invisible); recovered once TemplateDecomposer
+// can synthesize the mask constant 128.
+TEST(SimplifierTest, MaskedCarryFreeAddBit7) {
+    auto ast = MaskedAdd(128, 127, 128);
+    auto out = RunAst(*ast, { "x", "y" });
+    EXPECT_EQ(out.kind, SimplifyOutcome::Kind::kSimplified);
+    EXPECT_TRUE(RendersToAndConst(out, "x", 128));
+    EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 2, *out.expr, 64).passed);
+}
+
+// Whole family across the former bit>=3 threshold: ((x&2^k)+(y&(2^k-1)))&2^k -> x&2^k.
+TEST(SimplifierTest, MaskedCarryFreeAddFamily) {
+    for (uint32_t bit : { 3u, 4u, 5u, 6u, 7u, 8u }) {
+        const uint64_t m = uint64_t{ 1 } << bit;
+        auto ast         = MaskedAdd(m, m - 1, m);
+        auto out         = RunAst(*ast, { "x", "y" });
+        EXPECT_EQ(out.kind, SimplifyOutcome::Kind::kSimplified) << "bit " << bit;
+        EXPECT_TRUE(RendersToAndConst(out, "x", m)) << "bit " << bit;
+        EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 2, *out.expr, 64).passed)
+            << "bit " << bit;
+    }
+}
+
+// Soundness: a genuine carry ((x & 255) + (y & 255)) & 255 must NOT collapse to
+// x & 255 (it is (x + y) & 255). Whatever is returned must stay full-width-correct.
+TEST(SimplifierTest, MaskedAddWithCarryNotFalselyCollapsed) {
+    auto ast = MaskedAdd(255, 255, 255);
+    auto out = RunAst(*ast, { "x", "y" });
+    EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 2, *out.expr, 64).passed);
+    EXPECT_FALSE(RendersToAndConst(out, "x", 255));
+}
