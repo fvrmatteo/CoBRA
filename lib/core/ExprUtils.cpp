@@ -72,17 +72,10 @@ namespace cobra {
         });
     }
 
-    bool ContainsShr(const Expr &expr) {
-        if (expr.kind == Expr::Kind::kShr) { return true; }
-        return std::ranges::any_of(expr.children, [](const auto &child) {
-            return ContainsShr(*child);
-        });
-    }
-
-    bool ContainsXor(const Expr &expr) {
-        if (expr.kind == Expr::Kind::kXor) { return true; }
-        return std::ranges::any_of(expr.children, [](const auto &child) {
-            return ContainsXor(*child);
+    bool ContainsType(const Expr &expr, Expr::Kind kind) {
+        if (expr.kind == kind) { return true; }
+        return std::ranges::any_of(expr.children, [kind](const auto &child) {
+            return ContainsType(*child, kind);
         });
     }
 

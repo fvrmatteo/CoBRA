@@ -31,11 +31,8 @@ namespace cobra {
     /// Check if an Expr subtree contains only constants (no variables).
     bool IsConstantSubtree(const Expr &expr);
 
-    /// Returns true if any node in the AST is kShr.
-    bool ContainsShr(const Expr &expr);
-
-    /// Returns true if any node in the AST is kXor.
-    bool ContainsXor(const Expr &expr);
+    /// Returns true if any node in the AST has the given kind.
+    bool ContainsType(const Expr &expr, Expr::Kind kind);
 
     /// Append the var_index of every kVariable node (pre-order). Duplicates
     /// are preserved; callers that want a deduplicated support set must

@@ -1122,7 +1122,7 @@ TEST(SimplifierTest, RepairProductShadow_CompoundChildSkipped) {
 // --- Dynamic masking fallback tests ---
 
 TEST(SimplifierTest, DynamicMask_ShrRejectsOptimization) {
-    // 0xFF & (x >> 1): ContainsShr rejects dynamic masking,
+    // 0xFF & (x >> 1): the shift check rejects dynamic masking,
     // falls through to normal pipeline.
     auto inner  = Expr::LogicalShr(Expr::Variable(0), 1);
     auto masked = Expr::BitwiseAnd(Expr::Constant(0xFF), std::move(inner));
