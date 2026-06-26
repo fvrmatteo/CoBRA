@@ -2109,3 +2109,27 @@ TEST(SimplifierTest, MaskedAddWithCarryNotFalselyCollapsed) {
     EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 2, *out.expr, 64).passed);
     EXPECT_FALSE(RendersToAndConst(out, "x", 255));
 }
+
+// Never return a result more expensive than the input. sum(xi) - xor(xi) is
+// CoB-linear, so change-of-basis recovers an exponential AND-basis blow-up; the
+// input is already minimal, so the cost gate must keep it instead.
+TEST(SimplifierTest, DoesNotExpandBeyondInput) {
+    auto sum = Expr::Variable(0);
+    auto xr  = Expr::Variable(0);
+    for (uint32_t i = 1; i < 8; ++i) {
+        sum = Expr::Add(std::move(sum), Expr::Variable(i));
+        xr  = Expr::BitwiseXor(std::move(xr), Expr::Variable(i));
+    }
+    auto ast = Expr::Add(std::move(sum), Expr::Negate(std::move(xr)));
+    std::vector< std::string > vars;
+    for (uint32_t i = 0; i < 8; ++i) { vars.push_back("x" + std::to_string(i)); }
+
+    auto input_cost = ComputeCost(*ast).cost;
+    auto sig        = EvaluateBooleanSignature(*ast, 8, 64);
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+    opts.evaluator = Evaluator::FromExpr(*ast, 64);
+    auto result    = Simplify(sig, vars, ast.get(), opts);
+    ASSERT_TRUE(result.has_value());
+    // The result must not be strictly more expensive than the input.
+    EXPECT_FALSE(IsBetter(input_cost, ComputeCost(*result->expr).cost));
+}

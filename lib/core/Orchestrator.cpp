@@ -845,7 +845,6 @@ namespace cobra {
             SimplifyOutcome outcome;
 
             if (result.outcome.Succeeded()) {
-                outcome.kind      = SimplifyOutcome::Kind::kSimplified;
                 outcome.real_vars = result.outcome.RealVars();
                 // Read PassOutcome.Verification() instead of the parallel
                 // ItemMetadata.verification field. The two were initialized
@@ -858,6 +857,35 @@ namespace cobra {
                     result.outcome.Verification() == VerificationState::kVerified;
                 outcome.expr       = CleanupFinalExpr(result.outcome.TakeExpr(), bitwidth);
                 outcome.sig_vector = std::move(result.metadata.sig_vector);
+                outcome.kind       = SimplifyOutcome::Kind::kSimplified;
+
+                // Don't return a result that blows up relative to the input. A
+                // CoB-linear function (e.g. sum(xi) - xor(xi)) recovers an
+                // exponential AND-basis expansion that is correct but far larger
+                // than the already-minimal input; keep the input in that case.
+                // Gate only when the output BOTH more than doubles the input AND
+                // is large in absolute terms: the ratio spares genuine
+                // simplifications of large obfuscated inputs (cheaper output), and
+                // the absolute floor spares the small expansions of legitimate
+                // canonicalization (e.g. NOT-over-arith lowering ~(b*b) ->
+                // -(b*b)-1, which roughly doubles a tiny expression).
+                constexpr uint32_t kBlowupAbsFloor = 32;
+                if (original_expr != nullptr) {
+                    const auto in_size  = ComputeCost(*original_expr).cost.weighted_size;
+                    const auto out_size = ComputeCost(*outcome.expr).cost.weighted_size;
+                    if (out_size > 2 * in_size && out_size > kBlowupAbsFloor) {
+                        outcome.kind = SimplifyOutcome::Kind::kUnchangedUnsupported;
+                        outcome.expr = CloneExpr(*original_expr);
+                        outcome.real_vars.clear();
+                        outcome.verified = false;
+                        // Stamp a structured reason so the unsupported result
+                        // still satisfies the has_structured_reason invariant
+                        // (set on result.metadata so the copy below propagates).
+                        result.metadata.reason_code =
+                            ReasonCode{ ReasonCategory::kCostRejected,
+                                        ReasonDomain::kOrchestrator, 0 };
+                    }
+                }
             } else {
                 outcome.kind = SimplifyOutcome::Kind::kUnchangedUnsupported;
                 outcome.expr = original_expr != nullptr ? CloneExpr(*original_expr) : nullptr;
