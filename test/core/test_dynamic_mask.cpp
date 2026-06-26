@@ -64,20 +64,20 @@ TEST(DynamicMaskTest, DetectRootLowBitMask_NotAndNode) {
     EXPECT_FALSE(mask.has_value());
 }
 
-TEST(DynamicMaskTest, ContainsShr_False) {
+TEST(DynamicMaskTest, ContainsTypeShrFalse) {
     auto expr = Expr::Add(
         Expr::BitwiseAnd(Expr::Variable(0), Expr::Variable(1)),
         Expr::BitwiseNot(Expr::Variable(0))
     );
-    EXPECT_FALSE(ContainsShr(*expr));
+    EXPECT_FALSE(ContainsType(*expr, Expr::Kind::kShr));
 }
 
-TEST(DynamicMaskTest, ContainsShr_True) {
+TEST(DynamicMaskTest, ContainsTypeShrTrue) {
     auto expr = Expr::Add(Expr::LogicalShr(Expr::Variable(0), 3), Expr::Variable(1));
-    EXPECT_TRUE(ContainsShr(*expr));
+    EXPECT_TRUE(ContainsType(*expr, Expr::Kind::kShr));
 }
 
-TEST(DynamicMaskTest, ContainsShr_Deep) {
+TEST(DynamicMaskTest, ContainsTypeShrDeep) {
     auto expr = Expr::BitwiseAnd(
         Expr::Add(
             Expr::Variable(0),
@@ -85,29 +85,31 @@ TEST(DynamicMaskTest, ContainsShr_Deep) {
         ),
         Expr::Constant(0xFF)
     );
-    EXPECT_TRUE(ContainsShr(*expr));
+    EXPECT_TRUE(ContainsType(*expr, Expr::Kind::kShr));
 }
 
-TEST(DynamicMaskTest, ContainsXorFalse) {
+TEST(DynamicMaskTest, ContainsTypeXorFalse) {
     auto expr = Expr::Add(
         Expr::BitwiseAnd(Expr::Variable(0), Expr::Variable(1)),
         Expr::BitwiseOr(Expr::Variable(0), Expr::Constant(3))
     );
-    EXPECT_FALSE(ContainsXor(*expr));
+    EXPECT_FALSE(ContainsType(*expr, Expr::Kind::kXor));
 }
 
-TEST(DynamicMaskTest, ContainsXorTrue) {
+TEST(DynamicMaskTest, ContainsTypeXorTrue) {
     auto expr = Expr::BitwiseXor(Expr::Variable(0), Expr::Variable(1));
-    EXPECT_TRUE(ContainsXor(*expr));
+    EXPECT_TRUE(ContainsType(*expr, Expr::Kind::kXor));
 }
 
-TEST(DynamicMaskTest, ContainsXorDeep) {
+TEST(DynamicMaskTest, ContainsTypeXorDeep) {
     auto expr = Expr::BitwiseAnd(
         Expr::Add(
             Expr::Variable(0),
-            Expr::BitwiseOr(Expr::Variable(1), Expr::BitwiseXor(Expr::Variable(0), Expr::Variable(2)))
+            Expr::BitwiseOr(
+                Expr::Variable(1), Expr::BitwiseXor(Expr::Variable(0), Expr::Variable(2))
+            )
         ),
         Expr::Constant(0xFF)
     );
-    EXPECT_TRUE(ContainsXor(*expr));
+    EXPECT_TRUE(ContainsType(*expr, Expr::Kind::kXor));
 }

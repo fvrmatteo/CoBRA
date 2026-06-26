@@ -969,7 +969,7 @@ namespace cobra {
         // recurse only a handful of times before reaching 1 bit.
         if (input_expr != nullptr) {
             auto mask = DetectRootLowBitMask(*input_expr, opts.bitwidth);
-            if (mask.has_value() && !ContainsShr(*mask->inner)) {
+            if (mask.has_value() && !ContainsType(*mask->inner, Expr::Kind::kShr)) {
                 auto inner      = CloneExpr(*mask->inner);
                 uint32_t eff_bw = mask->effective_width;
                 auto inner_sig  = EvaluateBooleanSignature(
@@ -1396,7 +1396,9 @@ namespace cobra {
         // result is provably equivalent and sound to return directly. Fire only
         // when it actually cancelled something and the result is strictly
         // cheaper; the full-width check is defense in depth, not the proof.
-        if (input_expr != nullptr && context.evaluator && ContainsXor(*input_expr)) {
+        if (input_expr != nullptr && context.evaluator
+            && ContainsType(*input_expr, Expr::Kind::kXor))
+        {
             auto xor_peel = SimplifyXorChains(CloneExpr(*input_expr), context.bitwidth);
             if (!ExprStructurallyEqual(*xor_peel, *input_expr)
                 && IsBetter(ComputeCost(*xor_peel).cost, *input_cost))
