@@ -87,3 +87,27 @@ TEST(DynamicMaskTest, ContainsShr_Deep) {
     );
     EXPECT_TRUE(ContainsShr(*expr));
 }
+
+TEST(DynamicMaskTest, ContainsXorFalse) {
+    auto expr = Expr::Add(
+        Expr::BitwiseAnd(Expr::Variable(0), Expr::Variable(1)),
+        Expr::BitwiseOr(Expr::Variable(0), Expr::Constant(3))
+    );
+    EXPECT_FALSE(ContainsXor(*expr));
+}
+
+TEST(DynamicMaskTest, ContainsXorTrue) {
+    auto expr = Expr::BitwiseXor(Expr::Variable(0), Expr::Variable(1));
+    EXPECT_TRUE(ContainsXor(*expr));
+}
+
+TEST(DynamicMaskTest, ContainsXorDeep) {
+    auto expr = Expr::BitwiseAnd(
+        Expr::Add(
+            Expr::Variable(0),
+            Expr::BitwiseOr(Expr::Variable(1), Expr::BitwiseXor(Expr::Variable(0), Expr::Variable(2)))
+        ),
+        Expr::Constant(0xFF)
+    );
+    EXPECT_TRUE(ContainsXor(*expr));
+}
