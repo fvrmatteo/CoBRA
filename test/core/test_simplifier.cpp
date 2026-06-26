@@ -2099,6 +2099,10 @@ TEST(SimplifierTest, XorSelfCancelEndToEnd) {
     // B ^ B cancels -> no XOR remains in the rendered result.
     EXPECT_EQ(Render(*out.expr, out.real_vars).find('^'), std::string::npos);
     EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 4, *out.expr, 64).passed);
+    // The exact-XOR-cancel success must not carry the exhaustion failure
+    // lineage that the fallback path was built atop.
+    EXPECT_FALSE(out.diag.reason_code.has_value());
+    EXPECT_TRUE(out.diag.cause_chain.empty());
 }
 
 // Soundness: a genuine carry ((x & 255) + (y & 255)) & 255 must NOT collapse to
@@ -2110,10 +2114,10 @@ TEST(SimplifierTest, MaskedAddWithCarryNotFalselyCollapsed) {
     EXPECT_FALSE(RendersToAndConst(out, "x", 255));
 }
 
-// Never return a result more expensive than the input. sum(xi) - xor(xi) is
-// CoB-linear, so change-of-basis recovers an exponential AND-basis blow-up; the
-// input is already minimal, so the cost gate must keep it instead.
-TEST(SimplifierTest, DoesNotExpandBeyondInput) {
+// A change-of-basis blow-up must be rejected. sum(xi) - xor(xi) is CoB-linear,
+// so change-of-basis recovers an exponential AND-basis expansion; the input is
+// already minimal, so the cost gate keeps the input and reports kCostRejected.
+TEST(SimplifierTest, RejectsExponentialBlowup) {
     auto sum = Expr::Variable(0);
     auto xr  = Expr::Variable(0);
     for (uint32_t i = 1; i < 8; ++i) {
@@ -2130,6 +2134,12 @@ TEST(SimplifierTest, DoesNotExpandBeyondInput) {
     opts.evaluator = Evaluator::FromExpr(*ast, 64);
     auto result    = Simplify(sig, vars, ast.get(), opts);
     ASSERT_TRUE(result.has_value());
-    // The result must not be strictly more expensive than the input.
+    // The blow-up is rejected: the input is kept unchanged...
+    EXPECT_EQ(result->kind, SimplifyOutcome::Kind::kUnchangedUnsupported);
+    EXPECT_TRUE(ExprStructurallyEqual(*result->expr, *ast));
+    // ...and the result must not be strictly more expensive than the input.
     EXPECT_FALSE(IsBetter(input_cost, ComputeCost(*result->expr).cost));
+    // ...with a kCostRejected structured reason.
+    ASSERT_TRUE(result->diag.reason_code.has_value());
+    EXPECT_EQ(result->diag.reason_code->category, ReasonCategory::kCostRejected);
 }

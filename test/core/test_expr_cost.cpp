@@ -100,3 +100,41 @@ TEST(ExprCostTest, IsBetterEqual) {
     ExprCost a{ 5, 1, 3 };
     EXPECT_FALSE(IsBetter(a, a));
 }
+
+TEST(ExprCostTest, IsCostBlowupExponentialExpansion) {
+    // 100 weighted vs 10: > 2x AND > 32 absolute -> blow-up.
+    ExprCost candidate{ 100, 0, 5 };
+    ExprCost baseline{ 10, 0, 3 };
+    EXPECT_TRUE(IsCostBlowup(candidate, baseline));
+}
+
+TEST(ExprCostTest, IsCostBlowupSparedByRatio) {
+    // 30 vs 20: not more than 2x (would need > 40), so not a blow-up
+    // even though it exceeds the absolute floor.
+    ExprCost candidate{ 30, 0, 4 };
+    ExprCost baseline{ 20, 0, 4 };
+    EXPECT_FALSE(IsCostBlowup(candidate, baseline));
+}
+
+TEST(ExprCostTest, IsCostBlowupSparedBySmallAbsoluteFloor) {
+    // 15 vs 7: more than 2x, but below the absolute floor (32). This is
+    // the legitimate NOT-over-arith canonicalization that must be kept.
+    ExprCost candidate{ 15, 0, 4 };
+    ExprCost baseline{ 7, 0, 3 };
+    EXPECT_FALSE(IsCostBlowup(candidate, baseline));
+}
+
+TEST(ExprCostTest, IsCostBlowupBoundary) {
+    // Exactly at both thresholds is NOT a blow-up (strict greater-than);
+    // one past both is.
+    EXPECT_FALSE(IsCostBlowup(ExprCost{ 32, 0, 1 }, ExprCost{ 16, 0, 1 }));
+    EXPECT_TRUE(IsCostBlowup(ExprCost{ 33, 0, 1 }, ExprCost{ 16, 0, 1 }));
+}
+
+TEST(ExprCostTest, IsCostBlowupKeysOnSizeNotMulOrDepth) {
+    // The gate axis is weighted_size only: a candidate that is smaller in
+    // size is never a blow-up regardless of mul-count or depth.
+    ExprCost candidate{ 10, 50, 50 };
+    ExprCost baseline{ 100, 0, 1 };
+    EXPECT_FALSE(IsCostBlowup(candidate, baseline));
+}
