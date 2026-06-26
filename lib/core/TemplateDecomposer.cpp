@@ -19,6 +19,7 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1046,8 +1047,11 @@ namespace cobra {
         {
             uint64_t or_fold = 0;
             for (size_t i = 0; i < kNProbes; ++i) { or_fold |= target[i]; }
+            // Skip values already seeded: Push dedups the pool by probe-vals, so
+            // re-seeding the same constant only wastes a Probe() call.
+            std::unordered_set< uint64_t > seeded_vals;
             auto seed_const = [&](uint64_t c) {
-                if (c == 0) { return; }
+                if (c == 0 || !seeded_vals.insert(c).second) { return; }
                 auto e = Expr::Constant(c);
                 auto v = Probe(*e, pts, opts.bitwidth);
                 Push(pool, vmap, std::move(e), v);
