@@ -1356,6 +1356,39 @@ namespace cobra {
         }
 
         telemetry.queue_high_water = static_cast< uint32_t >(worklist.HighWaterMark());
+
+        // Exhaustion fallback: cancel structurally-repeated XOR operands in the
+        // raw input (T ^ T == 0, an EXACT identity at every bit width). When the
+        // survivors have a degenerate {0,1} signature, no signature/decomposition
+        // pass re-emits them, so the worklist exhausts even though the input
+        // collapses. Because this is exact (not a full-width approximation) the
+        // result is provably equivalent and sound to return directly. Fire only
+        // when it actually cancelled something and the result is strictly
+        // cheaper; the full-width check is defense in depth, not the proof.
+        if (input_expr != nullptr && context.evaluator) {
+            auto xor_peel = SimplifyXorChains(CloneExpr(*input_expr), context.bitwidth);
+            if (!ExprStructurallyEqual(*xor_peel, *input_expr)
+                && IsBetter(ComputeCost(*xor_peel).cost, ComputeCost(*input_expr).cost))
+            {
+                const auto num_vars = static_cast< uint32_t >(vars.size());
+                auto check          = FullWidthCheckEval(
+                    *context.evaluator, num_vars, *xor_peel, context.bitwidth
+                );
+                if (check.passed) {
+                    return Ok(ToSimplifyOutcome(
+                        OrchestratorResult{
+                            .outcome = PassOutcome::Success(
+                                std::move(xor_peel), vars, VerificationState::kVerified
+                            ),
+                            .metadata     = std::move(final_meta),
+                            .run_metadata = context.run_metadata,
+                        },
+                        input_expr, telemetry, context.bitwidth
+                    ));
+                }
+            }
+        }
+
         return Ok(ToSimplifyOutcome(
             OrchestratorResult{
                 .outcome      = PassOutcome::Blocked(std::move(exhaustion_reason)),

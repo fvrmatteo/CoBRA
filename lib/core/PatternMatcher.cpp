@@ -1443,6 +1443,57 @@ namespace cobra {
             return std::nullopt;
         }
 
+        void FlattenXor(const Expr &e, std::vector< const Expr * > &out) {
+            if (e.kind == Expr::Kind::kXor) {
+                for (const auto &child : e.children) { FlattenXor(*child, out); }
+                return;
+            }
+            out.push_back(&e);
+        }
+
+        // Cancel XOR operands appearing an even number of times (T ^ T == 0).
+        // Flattens the XOR chain and keeps each distinct operand that occurs an
+        // odd number of times. Universally sound; a FullWidthCheck backstops the
+        // structural equality. Unlike the signature path, this fires even when
+        // the surviving operand has a degenerate {0,1} signature.
+        std::optional< std::unique_ptr< Expr > >
+        TryXorSelfCancel(const Expr &expr, uint32_t bitwidth) {
+            if (expr.kind != Expr::Kind::kXor) { return std::nullopt; }
+
+            std::vector< const Expr * > operands;
+            FlattenXor(expr, operands);
+
+            std::vector< bool > consumed(operands.size(), false);
+            std::vector< const Expr * > survivors;
+            for (size_t i = 0; i < operands.size(); ++i) {
+                if (consumed[i]) { continue; }
+                size_t count = 1;
+                consumed[i]  = true;
+                for (size_t j = i + 1; j < operands.size(); ++j) {
+                    if (!consumed[j] && ExprStructurallyEqual(*operands[i], *operands[j])) {
+                        consumed[j] = true;
+                        ++count;
+                    }
+                }
+                if (count % 2 == 1) { survivors.push_back(operands[i]); }
+            }
+
+            if (survivors.size() == operands.size()) { return std::nullopt; }
+
+            std::unique_ptr< Expr > result;
+            if (survivors.empty()) {
+                result = Expr::Constant(0);
+            } else {
+                result = CloneExpr(*survivors[0]);
+                for (size_t i = 1; i < survivors.size(); ++i) {
+                    result = Expr::BitwiseXor(std::move(result), CloneExpr(*survivors[i]));
+                }
+            }
+
+            if (!VerifyRecovery(expr, *result, bitwidth)) { return std::nullopt; }
+            return result;
+        }
+
     } // namespace
 
     std::optional< std::unique_ptr< Expr > >
@@ -1498,6 +1549,21 @@ namespace cobra {
         auto recovered = TryRecoverInclusionExclusion(*expr, bitwidth);
         if (recovered.has_value()) {
             return SimplifyPatternSubtrees(std::move(*recovered), bitwidth);
+        }
+        return expr;
+    }
+
+    std::unique_ptr< Expr > SimplifyXorChains(std::unique_ptr< Expr > expr, uint32_t bitwidth) {
+        // Cancel repeated operands across the full XOR chain rooted here first
+        // (top-down): flattening the whole chain before reducing children avoids
+        // a nested pair collapsing to 0 and stranding an odd third copy.
+        auto cancelled = TryXorSelfCancel(*expr, bitwidth);
+        if (cancelled.has_value()) {
+            return SimplifyXorChains(std::move(*cancelled), bitwidth);
+        }
+        // No cancellation here: recurse into children to handle nested chains.
+        for (auto &child : expr->children) {
+            child = SimplifyXorChains(std::move(child), bitwidth);
         }
         return expr;
     }

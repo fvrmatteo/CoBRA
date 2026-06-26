@@ -802,3 +802,47 @@ TEST(PatternMatcherTest, RecoverDisjunctionDoesNotMisfireOnXor) {
     EXPECT_FALSE(ContainsKind(*result, Expr::Kind::kOr));
     EXPECT_TRUE(FullWidthCheck(*original, 2, *result, {}, 64).passed);
 }
+
+// Structural XOR self-cancellation: (A ^ B) ^ B -> A, even when A has a
+// degenerate {0,1} signature (so the signature path can't recover it).
+// A = ((x+y)&z)|3 (constant 3 on {0,1}); B = (x*z | y&85) + w (appears twice).
+TEST(PatternMatcherTest, XorSelfCancelComplexOperand) {
+    auto a = []() {
+        return Expr::BitwiseOr(
+            Expr::BitwiseAnd(
+                Expr::Add(Expr::Variable(0), Expr::Variable(1)), Expr::Variable(2)
+            ),
+            Expr::Constant(3)
+        );
+    };
+    auto b = []() {
+        return Expr::Add(
+            Expr::BitwiseOr(
+                Expr::Mul(Expr::Variable(0), Expr::Variable(2)),
+                Expr::BitwiseAnd(Expr::Variable(1), Expr::Constant(85))
+            ),
+            Expr::Variable(3)
+        );
+    };
+    auto input = Expr::BitwiseXor(Expr::BitwiseXor(a(), b()), b());
+
+    auto original = CloneExpr(*input);
+    auto result   = SimplifyXorChains(std::move(input), 64);
+
+    // B ^ B cancels; no XOR should remain, and the result equals A.
+    EXPECT_FALSE(ContainsKind(*result, Expr::Kind::kXor));
+    EXPECT_TRUE(FullWidthCheck(*original, 4, *result, {}, 64).passed);
+    EXPECT_TRUE(IsBetter(ComputeCost(*result).cost, ComputeCost(*original).cost));
+}
+
+// Odd multiplicity: T ^ T ^ T -> T (a single copy survives).
+TEST(PatternMatcherTest, XorSelfCancelOddMultiplicity) {
+    auto t        = []() { return Expr::BitwiseAnd(Expr::Variable(0), Expr::Variable(1)); };
+    auto input    = Expr::BitwiseXor(Expr::BitwiseXor(t(), t()), t());
+    auto original = CloneExpr(*input);
+    auto result   = SimplifyXorChains(std::move(input), 64);
+
+    EXPECT_FALSE(ContainsKind(*result, Expr::Kind::kXor));
+    EXPECT_EQ(result->kind, Expr::Kind::kAnd);
+    EXPECT_TRUE(FullWidthCheck(*original, 2, *result, {}, 64).passed);
+}
