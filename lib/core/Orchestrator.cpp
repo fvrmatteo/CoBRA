@@ -840,7 +840,8 @@ namespace cobra {
 
         SimplifyOutcome ToSimplifyOutcome(
             OrchestratorResult result, const Expr *original_expr,
-            const OrchestratorTelemetry &telemetry, uint32_t bitwidth
+            const OrchestratorTelemetry &telemetry, uint32_t bitwidth,
+            const std::optional< ExprCost > &input_cost
         ) {
             SimplifyOutcome outcome;
 
@@ -863,17 +864,10 @@ namespace cobra {
                 // CoB-linear function (e.g. sum(xi) - xor(xi)) recovers an
                 // exponential AND-basis expansion that is correct but far larger
                 // than the already-minimal input; keep the input in that case.
-                // Gate only when the output BOTH more than doubles the input AND
-                // is large in absolute terms: the ratio spares genuine
-                // simplifications of large obfuscated inputs (cheaper output), and
-                // the absolute floor spares the small expansions of legitimate
-                // canonicalization (e.g. NOT-over-arith lowering ~(b*b) ->
-                // -(b*b)-1, which roughly doubles a tiny expression).
-                constexpr uint32_t kBlowupAbsFloor = 32;
-                if (original_expr != nullptr) {
-                    const auto in_size  = ComputeCost(*original_expr).cost.weighted_size;
-                    const auto out_size = ComputeCost(*outcome.expr).cost.weighted_size;
-                    if (out_size > 2 * in_size && out_size > kBlowupAbsFloor) {
+                // See IsCostBlowup for the ratio/floor rationale.
+                if (original_expr != nullptr && input_cost.has_value()) {
+                    const auto out_cost = ComputeCost(*outcome.expr).cost;
+                    if (IsCostBlowup(out_cost, *input_cost)) {
                         outcome.kind = SimplifyOutcome::Kind::kUnchangedUnsupported;
                         outcome.expr = CloneExpr(*original_expr);
                         outcome.real_vars.clear();
@@ -1032,13 +1026,21 @@ namespace cobra {
         Worklist worklist;
         OrchestratorTelemetry telemetry;
 
+        // Cost of the raw input, computed once and reused by every return path
+        // (the blow-up gate in ToSimplifyOutcome and the XOR exhaustion
+        // fallback). Absent when there is no input AST (sig-only path).
+        const std::optional< ExprCost > input_cost =
+            input_expr ? std::optional< ExprCost >(ComputeCost(*input_expr).cost)
+                       : std::nullopt;
+
         // Seeding
         if (input_expr == nullptr) {
             auto seed_result = SeedNoAst(sig, vars, context, worklist);
             if (!seed_result.has_value()) { return std::unexpected(seed_result.error()); }
             if (seed_result.value().has_value()) {
                 return Ok(ToSimplifyOutcome(
-                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth
+                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth,
+                    input_cost
                 ));
             }
         } else {
@@ -1046,7 +1048,8 @@ namespace cobra {
             if (!seed_result.has_value()) { return std::unexpected(seed_result.error()); }
             if (seed_result.value().has_value()) {
                 return Ok(ToSimplifyOutcome(
-                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth
+                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth,
+                    input_cost
                 ));
             }
         }
@@ -1163,7 +1166,7 @@ namespace cobra {
                             .metadata     = std::move(item.metadata),
                             .run_metadata = context.run_metadata,
                         },
-                        input_expr, telemetry, context.bitwidth
+                        input_expr, telemetry, context.bitwidth, input_cost
                     ));
                 }
             }
@@ -1393,16 +1396,23 @@ namespace cobra {
         // result is provably equivalent and sound to return directly. Fire only
         // when it actually cancelled something and the result is strictly
         // cheaper; the full-width check is defense in depth, not the proof.
-        if (input_expr != nullptr && context.evaluator) {
+        if (input_expr != nullptr && context.evaluator && ContainsXor(*input_expr)) {
             auto xor_peel = SimplifyXorChains(CloneExpr(*input_expr), context.bitwidth);
             if (!ExprStructurallyEqual(*xor_peel, *input_expr)
-                && IsBetter(ComputeCost(*xor_peel).cost, ComputeCost(*input_expr).cost))
+                && IsBetter(ComputeCost(*xor_peel).cost, *input_cost))
             {
                 const auto num_vars = static_cast< uint32_t >(vars.size());
                 auto check          = FullWidthCheckEval(
                     *context.evaluator, num_vars, *xor_peel, context.bitwidth
                 );
                 if (check.passed) {
+                    // This is a genuine (exact) simplification, not the
+                    // exhaustion failure final_meta was built to describe. Drop
+                    // the stale failure lineage so the kSimplified result does
+                    // not report a search-exhausted reason or cause chain.
+                    final_meta.reason_code.reset();
+                    final_meta.cause_chain.clear();
+                    final_meta.candidate_failed_verification = false;
                     return Ok(ToSimplifyOutcome(
                         OrchestratorResult{
                             .outcome = PassOutcome::Success(
@@ -1411,7 +1421,7 @@ namespace cobra {
                             .metadata     = std::move(final_meta),
                             .run_metadata = context.run_metadata,
                         },
-                        input_expr, telemetry, context.bitwidth
+                        input_expr, telemetry, context.bitwidth, input_cost
                     ));
                 }
             }
@@ -1423,7 +1433,7 @@ namespace cobra {
                 .metadata     = std::move(final_meta),
                 .run_metadata = context.run_metadata,
             },
-            input_expr, telemetry, context.bitwidth
+            input_expr, telemetry, context.bitwidth, input_cost
         ));
     }
 
