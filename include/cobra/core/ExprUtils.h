@@ -34,6 +34,9 @@ namespace cobra {
     /// Returns true if any node in the AST is kShr.
     bool ContainsShr(const Expr &expr);
 
+    /// Returns true if any node in the AST is kXor.
+    bool ContainsXor(const Expr &expr);
+
     /// Append the var_index of every kVariable node (pre-order). Duplicates
     /// are preserved; callers that want a deduplicated support set must
     /// sort + unique the output themselves.
@@ -50,13 +53,9 @@ namespace cobra {
     /// Chains: constant folding → negation refolding → ExtractCommonFactor
     /// → constant folding.
     ///
-    /// Semantics-preserving under the assumption that std::hash<Expr>
-    /// does not collide on the input AST. ExtractCommonFactor uses
-    /// hash-based factor equality, so a hash collision could in
-    /// principle produce a non-equivalent rewrite. The hash-collision
-    /// tradeoff is accepted at the project level (see audit
-    /// 2026-05-04 lifting-passes-29 / -65). Callers requiring strict
-    /// semantics-preservation must re-verify the result.
+    /// Semantics-preserving: ExtractCommonFactor matches common factors by
+    /// exact structural equality (ExprStructurallyEqual), so the distributive
+    /// rewrite never fires on a non-equal factor.
     std::unique_ptr< Expr > CleanupFinalExpr(std::unique_ptr< Expr > expr, uint32_t bitwidth);
 
     /// Check if an Expr subtree depends on any variable.
