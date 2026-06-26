@@ -174,8 +174,12 @@ namespace cobra {
                 // (full-width-confirmed) spurious variable, a real reduction is
                 // reachable, so decline the short-circuit and let later passes
                 // run. Genuine sum-of-product cores (single_product == false)
-                // and cores with no spurious variable are unaffected.
+                // and cores with no spurious variable are unaffected. The
+                // cheap boolean elimination gates the 128-probe full-width
+                // confirmation: full-width spurious vars are always a subset
+                // of the boolean ones, so an empty boolean result is final.
                 if (expected_kind == ExtractorKind::kProductAST && core_payload.single_product
+                    && !EliminateAuxVars(decomp_sig, active_vars).spurious_vars.empty()
                     && !EliminateAuxVars(decomp_sig, active_vars, *active_eval, ctx.bitwidth)
                             .spurious_vars.empty())
                 {
