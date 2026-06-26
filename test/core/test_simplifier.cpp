@@ -2073,6 +2073,34 @@ TEST(SimplifierTest, MaskedCarryFreeAddFamily) {
     }
 }
 
+// End-to-end XOR self-cancel: (A ^ B) ^ B -> A through the full Simplify pipeline,
+// where A = ((x+y)&z)|3 (degenerate {0,1} signature) and B = (x*z | y&85) + w.
+TEST(SimplifierTest, XorSelfCancelEndToEnd) {
+    auto a = []() {
+        return Expr::BitwiseOr(
+            Expr::BitwiseAnd(
+                Expr::Add(Expr::Variable(0), Expr::Variable(1)), Expr::Variable(2)
+            ),
+            Expr::Constant(3)
+        );
+    };
+    auto b = []() {
+        return Expr::Add(
+            Expr::BitwiseOr(
+                Expr::Mul(Expr::Variable(0), Expr::Variable(2)),
+                Expr::BitwiseAnd(Expr::Variable(1), Expr::Constant(85))
+            ),
+            Expr::Variable(3)
+        );
+    };
+    auto ast = Expr::BitwiseXor(Expr::BitwiseXor(a(), b()), b());
+    auto out = RunAst(*ast, { "x", "y", "z", "w" });
+    EXPECT_EQ(out.kind, SimplifyOutcome::Kind::kSimplified);
+    // B ^ B cancels -> no XOR remains in the rendered result.
+    EXPECT_EQ(Render(*out.expr, out.real_vars).find('^'), std::string::npos);
+    EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 4, *out.expr, 64).passed);
+}
+
 // Soundness: a genuine carry ((x & 255) + (y & 255)) & 255 must NOT collapse to
 // x & 255 (it is (x + y) & 255). Whatever is returned must stay full-width-correct.
 TEST(SimplifierTest, MaskedAddWithCarryNotFalselyCollapsed) {
