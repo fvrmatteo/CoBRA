@@ -1427,11 +1427,45 @@ namespace cobra {
             return candidate;
         }
 
+        // Cheap precondition for TryRecoverInclusionExclusion: does the additive
+        // chain rooted at `e` contain a top-level 2-child AND term? Mirrors
+        // FlattenAdditive's descent (through kAdd / kNeg / constant-scaled kMul)
+        // but allocates nothing, so additive nodes with no AND term skip the
+        // FlattenAdditive + per-term scan entirely.
+        bool AdditiveHasBinaryAnd(const Expr &e) {
+            switch (e.kind) {
+                case Expr::Kind::kAdd:
+                    for (const auto &child : e.children) {
+                        if (AdditiveHasBinaryAnd(*child)) { return true; }
+                    }
+                    return false;
+                case Expr::Kind::kNeg:
+                    return AdditiveHasBinaryAnd(*e.children[0]);
+                case Expr::Kind::kMul:
+                    if (e.children.size() == 2
+                        && e.children[0]->kind == Expr::Kind::kConstant)
+                    {
+                        return AdditiveHasBinaryAnd(*e.children[1]);
+                    }
+                    if (e.children.size() == 2
+                        && e.children[1]->kind == Expr::Kind::kConstant)
+                    {
+                        return AdditiveHasBinaryAnd(*e.children[0]);
+                    }
+                    return false;
+                case Expr::Kind::kAnd:
+                    return e.children.size() == 2;
+                default:
+                    return false;
+            }
+        }
+
         std::optional< std::unique_ptr< Expr > >
         TryRecoverInclusionExclusion(const Expr &expr, uint32_t bitwidth) {
             if (expr.kind != Expr::Kind::kAdd && expr.kind != Expr::Kind::kNeg) {
                 return std::nullopt;
             }
+            if (!AdditiveHasBinaryAnd(expr)) { return std::nullopt; }
             std::vector< AdditiveTerm > terms;
             uint64_t constant = 0;
             FlattenAdditive(expr, 1, bitwidth, terms, constant);
