@@ -64,6 +64,17 @@ namespace cobra {
 
             std::array< uint8_t, kMaxPolyVars > exps{};
 
+            // Per-degree odd-part factorials at full 64-bit width, built once.
+            // OddPartFactorial(e, bw) == odd_fact[e] & Bitmask(bw), so the
+            // per-monomial product below uses the table directly under the
+            // existing kPrecMask instead of recomputing the odd-part product.
+            std::vector< uint64_t > odd_fact(static_cast< size_t >(max_degree) + 1, 1);
+            for (uint32_t e = 2; e <= max_degree; ++e) {
+                uint32_t odd = e;
+                while ((odd & 1) == 0) { odd >>= 1; }
+                odd_fact[e] = odd_fact[e - 1] * odd;
+            }
+
             for (size_t idx = 0; idx < table_size; ++idx) {
                 const uint64_t kAlpha = table[idx];
                 if (kAlpha == 0) { continue; }
@@ -99,15 +110,15 @@ namespace cobra {
 
                 const uint32_t kPrecBits = bitwidth - q;
 
-                // Compute product of odd parts mod 2^kPrecBits
+                // Product of odd parts mod 2^kPrecBits, via the precomputed
+                // table (masking by kPrecMask is equivalent to computing the
+                // odd-part product at width kPrecBits).
                 uint64_t odd_product = 1;
                 const uint64_t kPrecMask =
                     (kPrecBits >= 64) ? UINT64_MAX : ((1ULL << kPrecBits) - 1);
                 for (uint32_t i = 0; i < kK; ++i) {
                     uint8_t e = exps[support_vars[i]];
-                    if (e >= 2) {
-                        odd_product = (odd_product * OddPartFactorial(e, kPrecBits)) & kPrecMask;
-                    }
+                    if (e >= 2) { odd_product = (odd_product * odd_fact[e]) & kPrecMask; }
                 }
 
                 // h = (alpha >> q) * ModInverseOdd(odd_product) mod 2^kPrecBits
