@@ -98,3 +98,29 @@ TEST(ModInverseOddTest, SingleBit) {
     EXPECT_EQ(ModInverseOdd(1, 1), 1u);
     EXPECT_EQ(ModInverseOdd(3, 1), 1u); // 3 & 1 == 1
 }
+
+// Exhaustive: every odd residue is its own inverse's partner mod 2^bits, and
+// the result is reduced to [0, 2^bits). Covers the (3x)^2 seed at small widths
+// where the doubling loop runs 0-2 times.
+TEST(ModInverseOddTest, ExhaustiveSmallWidths) {
+    for (uint32_t bits : { 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 12u, 16u }) {
+        uint64_t mask = Bitmask(bits);
+        for (uint64_t x = 1; x <= mask; x += 2) {
+            uint64_t inv = ModInverseOdd(x, bits);
+            EXPECT_EQ((x * inv) & mask, 1u) << "bits=" << bits << " x=" << x;
+            EXPECT_EQ(inv & mask, inv) << "bits=" << bits << " x=" << x;
+        }
+    }
+}
+
+TEST(ModInverseOddTest, Random64Bit) {
+    uint64_t state = 0x123456789abcdef0ULL;
+    for (int i = 0; i < 100000; ++i) {
+        state      += 0x9E3779B97F4A7C15ULL;
+        uint64_t z  = state;
+        z           = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z           = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        uint64_t x  = (z ^ (z >> 31)) | 1ULL;
+        EXPECT_EQ(x * ModInverseOdd(x, 64), 1u) << "x=" << x;
+    }
+}
