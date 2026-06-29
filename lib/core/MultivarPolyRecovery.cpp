@@ -27,6 +27,106 @@ namespace cobra {
         };
     } // namespace multivar_poly
 
+    namespace {
+
+        // Convert an evaluated {0..max_degree}^k grid (mixed-radix base
+        // max_degree+1, little-endian over support_vars) into factorial-basis
+        // coefficients via tensor-product forward differences. The grid is
+        // consumed in place. Validation is the caller's responsibility.
+        SolverResult< NormalizedPoly > RecoverFromGrid(
+            std::vector< uint64_t > table, const std::vector< uint32_t > &support_vars,
+            uint32_t total_num_vars, uint32_t bitwidth, uint8_t max_degree
+        ) {
+            const auto kK           = static_cast< uint32_t >(support_vars.size());
+            const uint64_t kMask    = Bitmask(bitwidth);
+            const auto kBase        = static_cast< size_t >(max_degree) + 1;
+            const size_t table_size = table.size();
+
+            // Tensor-product forward differences: max_degree passes per dimension
+            for (uint32_t dim = 0; dim < kK; ++dim) {
+                size_t stride = 1;
+                for (uint32_t i = 0; i < dim; ++i) { stride *= kBase; }
+
+                for (uint32_t pass = 1; pass <= max_degree; ++pass) {
+                    for (size_t idx = table_size; idx-- > 0;) {
+                        const auto kCoord = static_cast< uint32_t >((idx / stride) % kBase);
+                        if (kCoord < pass) { continue; }
+                        table[idx] = (table[idx] - table[idx - stride]) & kMask;
+                    }
+                }
+            }
+
+            // Convert forward differences to factorial-basis coefficients
+            auto nv = static_cast< uint8_t >(total_num_vars);
+            NormalizedPoly result;
+            result.num_vars = nv;
+            result.bitwidth = bitwidth;
+
+            std::array< uint8_t, kMaxPolyVars > exps{};
+
+            for (size_t idx = 0; idx < table_size; ++idx) {
+                const uint64_t kAlpha = table[idx];
+                if (kAlpha == 0) { continue; }
+
+                // Decode mixed-radix to per-variable exponents
+                exps.fill(0);
+                size_t tmp = idx;
+                uint32_t q = 0;
+                for (uint32_t i = 0; i < kK; ++i) {
+                    const auto kE          = static_cast< uint8_t >(tmp % kBase);
+                    exps[support_vars[i]]  = kE;
+                    q                     += TwosInFactorial(kE);
+                    tmp                   /= kBase;
+                }
+
+                // Null-space term: 2^q >= bitwidth means coefficient vanishes
+                if (q >= bitwidth) { continue; }
+
+                // Divisibility gate: alpha must be divisible by 2^q
+                if (q > 0) {
+                    const uint64_t kLowBits = kAlpha & ((1ULL << q) - 1);
+                    if (kLowBits != 0) {
+                        ReasonDetail reason{
+                            .top = { .code    = { ReasonCategory::kNoSolution,
+                                                  ReasonDomain::kMultivarPoly,
+                                                  multivar_poly::kDivisibilityFail },
+                                    .message = "falling-factorial coefficient fails divisibility "
+                                                "gate" }
+                        };
+                        return SolverResult< NormalizedPoly >::Blocked(std::move(reason));
+                    }
+                }
+
+                const uint32_t kPrecBits = bitwidth - q;
+
+                // Compute product of odd parts mod 2^kPrecBits
+                uint64_t odd_product = 1;
+                const uint64_t kPrecMask =
+                    (kPrecBits >= 64) ? UINT64_MAX : ((1ULL << kPrecBits) - 1);
+                for (uint32_t i = 0; i < kK; ++i) {
+                    uint8_t e = exps[support_vars[i]];
+                    if (e >= 2) {
+                        odd_product = (odd_product * OddPartFactorial(e, kPrecBits)) & kPrecMask;
+                    }
+                }
+
+                // h = (alpha >> q) * ModInverseOdd(odd_product) mod 2^kPrecBits
+                uint64_t h = (kAlpha >> q) & kPrecMask;
+                if (odd_product != 1) {
+                    h = (h * ModInverseOdd(odd_product, kPrecBits)) & kPrecMask;
+                }
+
+                if (h == 0) { continue; }
+
+                auto key           = MonomialKey::FromExponents(exps.data(), nv);
+                result.coeffs[key] = h;
+            }
+
+            return SolverResult< NormalizedPoly >::Success(std::move(result));
+        }
+
+    } // namespace
+
     SolverResult< NormalizedPoly > RecoverMultivarPoly(
         const Evaluator &eval, const std::vector< uint32_t > &support_vars,
         uint32_t total_num_vars, uint32_t bitwidth, uint8_t max_degree
@@ -97,87 +197,9 @@ namespace cobra {
         }
         for (uint32_t i = 0; i < kK; ++i) { point[support_vars[i]] = 0; }
 
-        // Tensor-product forward differences: max_degree passes per dimension
-        for (uint32_t dim = 0; dim < kK; ++dim) {
-            size_t stride = 1;
-            for (uint32_t i = 0; i < dim; ++i) { stride *= kBase; }
-
-            for (uint32_t pass = 1; pass <= max_degree; ++pass) {
-                for (size_t idx = table_size; idx-- > 0;) {
-                    const auto kCoord = static_cast< uint32_t >((idx / stride) % kBase);
-                    if (kCoord < pass) { continue; }
-                    table[idx] = (table[idx] - table[idx - stride]) & kMask;
-                }
-            }
-        }
-
-        // Convert forward differences to factorial-basis coefficients
-        auto nv = static_cast< uint8_t >(total_num_vars);
-        NormalizedPoly result;
-        result.num_vars = nv;
-        result.bitwidth = bitwidth;
-
-        std::array< uint8_t, kMaxPolyVars > exps{};
-
-        for (size_t idx = 0; idx < table_size; ++idx) {
-            const uint64_t kAlpha = table[idx];
-            if (kAlpha == 0) { continue; }
-
-            // Decode mixed-radix to per-variable exponents
-            exps.fill(0);
-            size_t tmp = idx;
-            uint32_t q = 0;
-            for (uint32_t i = 0; i < kK; ++i) {
-                const auto kE          = static_cast< uint8_t >(tmp % kBase);
-                exps[support_vars[i]]  = kE;
-                q                     += TwosInFactorial(kE);
-                tmp                   /= kBase;
-            }
-
-            // Null-space term: 2^q >= bitwidth means coefficient vanishes
-            if (q >= bitwidth) { continue; }
-
-            // Divisibility gate: alpha must be divisible by 2^q
-            if (q > 0) {
-                const uint64_t kLowBits = kAlpha & ((1ULL << q) - 1);
-                if (kLowBits != 0) {
-                    ReasonDetail reason{
-                        .top = { .code    = { ReasonCategory::kNoSolution,
-                                              ReasonDomain::kMultivarPoly,
-                                              multivar_poly::kDivisibilityFail },
-                                .message = "falling-factorial coefficient fails divisibility "
-                                            "gate" }
-                    };
-                    return SolverResult< NormalizedPoly >::Blocked(std::move(reason));
-                }
-            }
-
-            const uint32_t kPrecBits = bitwidth - q;
-
-            // Compute product of odd parts mod 2^kPrecBits
-            uint64_t odd_product = 1;
-            const uint64_t kPrecMask =
-                (kPrecBits >= 64) ? UINT64_MAX : ((1ULL << kPrecBits) - 1);
-            for (uint32_t i = 0; i < kK; ++i) {
-                uint8_t e = exps[support_vars[i]];
-                if (e >= 2) {
-                    odd_product = (odd_product * OddPartFactorial(e, kPrecBits)) & kPrecMask;
-                }
-            }
-
-            // h = (alpha >> q) * ModInverseOdd(odd_product) mod 2^kPrecBits
-            uint64_t h = (kAlpha >> q) & kPrecMask;
-            if (odd_product != 1) {
-                h = (h * ModInverseOdd(odd_product, kPrecBits)) & kPrecMask;
-            }
-
-            if (h == 0) { continue; }
-
-            auto key           = MonomialKey::FromExponents(exps.data(), nv);
-            result.coeffs[key] = h;
-        }
-
-        return SolverResult< NormalizedPoly >::Success(std::move(result));
+        return RecoverFromGrid(
+            std::move(table), support_vars, total_num_vars, bitwidth, max_degree
+        );
     }
 
     SolverResult< PolyRecoveryResult > RecoverAndVerifyPoly(
@@ -194,20 +216,92 @@ namespace cobra {
             return SolverResult< PolyRecoveryResult >::Inapplicable(std::move(reason));
         }
 
-        // Each degree is recovered independently (no incremental reuse).
-        for (uint8_t d = min_degree; d <= max_degree_cap; ++d) {
-            auto poly = RecoverMultivarPoly(eval, support_vars, total_num_vars, bitwidth, d);
-            if (!poly.Succeeded()) { continue; }
+        // Validate the degree-independent preconditions once. RecoverMultivarPoly
+        // re-checks these per call; when they fail the old loop swallowed the
+        // Inapplicable into kNoVerifiedDegree, so mirror that by skipping the
+        // grid work and falling through to the exhaustion result.
+        bool inputs_ok = !support_vars.empty() && total_num_vars <= kMaxPolyVars
+            && bitwidth >= 2 && bitwidth <= 64;
+        if (inputs_ok) {
+            for (auto idx : support_vars) {
+                if (idx >= total_num_vars) {
+                    inputs_ok = false;
+                    break;
+                }
+            }
+        }
 
-            auto expr = BuildPolyExpr(poly.TakePayload());
-            if (!expr.has_value()) { continue; }
+        if (inputs_ok) {
+            const auto kK        = static_cast< uint32_t >(support_vars.size());
+            const uint64_t kMask = Bitmask(bitwidth);
 
-            auto check = FullWidthCheckEval(eval, total_num_vars, *expr.value(), bitwidth);
-            if (!check.passed) { continue; }
+            // Incrementally-grown {0..d}^k evaluation grid (mixed-radix base
+            // d+1). Each distinct support point is evaluated once across all
+            // degrees: a higher degree extends the grid by its new shell rather
+            // than re-evaluating from scratch (evaluator calls dominate the
+            // per-degree cost). Reuse is exact because the evaluator is pure.
+            std::vector< uint64_t > grid;
+            uint32_t grid_base = 0; // 0 = empty; otherwise current degree + 1
+            std::vector< uint64_t > point(total_num_vars, 0);
 
-            return SolverResult< PolyRecoveryResult >::Success(
-                PolyRecoveryResult{ std::move(expr.value()), d }
-            );
+            auto eval_at = [&](size_t idx, uint32_t base) -> uint64_t {
+                size_t tmp = idx;
+                for (uint32_t i = 0; i < kK; ++i) {
+                    point[support_vars[i]]  = tmp % base;
+                    tmp                    /= base;
+                }
+                const uint64_t v = eval(point) & kMask;
+                for (uint32_t i = 0; i < kK; ++i) { point[support_vars[i]] = 0; }
+                return v;
+            };
+
+            for (uint8_t d = min_degree; d <= max_degree_cap; ++d) {
+                if (d < 1) { continue; } // RecoverMultivarPoly rejects max_degree < 1
+
+                const uint32_t kBase = static_cast< uint32_t >(d) + 1;
+                size_t table_size    = 1;
+                for (uint32_t i = 0; i < kK; ++i) { table_size *= kBase; }
+
+                // Extend the grid to base kBase, evaluating only the new points.
+                if (grid_base == 0) {
+                    grid.assign(table_size, 0);
+                    for (size_t idx = 0; idx < table_size; ++idx) {
+                        grid[idx] = eval_at(idx, kBase);
+                    }
+                } else {
+                    std::vector< uint64_t > grown(table_size, 0);
+                    for (size_t idx = 0; idx < table_size; ++idx) {
+                        size_t tmp     = idx;
+                        size_t old_idx = 0;
+                        size_t place   = 1;
+                        bool is_old    = true;
+                        for (uint32_t i = 0; i < kK; ++i) {
+                            const size_t kCoord  = tmp % kBase;
+                            tmp                 /= kBase;
+                            if (kCoord >= grid_base) { is_old = false; }
+                            old_idx += kCoord * place;
+                            place   *= grid_base;
+                        }
+                        grown[idx] = is_old ? grid[old_idx] : eval_at(idx, kBase);
+                    }
+                    grid = std::move(grown);
+                }
+                grid_base = kBase;
+
+                // RecoverFromGrid consumes its grid in place, so pass a copy.
+                auto poly = RecoverFromGrid(grid, support_vars, total_num_vars, bitwidth, d);
+                if (!poly.Succeeded()) { continue; }
+
+                auto expr = BuildPolyExpr(poly.TakePayload());
+                if (!expr.has_value()) { continue; }
+
+                auto check = FullWidthCheckEval(eval, total_num_vars, *expr.value(), bitwidth);
+                if (!check.passed) { continue; }
+
+                return SolverResult< PolyRecoveryResult >::Success(
+                    PolyRecoveryResult{ std::move(expr.value()), d }
+                );
+            }
         }
         ReasonDetail reason{
             .top = { .code    = { ReasonCategory::kSearchExhausted, ReasonDomain::kMultivarPoly,
