@@ -18,6 +18,10 @@ namespace cobra {
     /// Rewrite every kVariable node's var_index through index_map.
     void RemapVarIndices(Expr &expr, const std::vector< uint32_t > &index_map);
 
+    /// Deep structural equality: same kind, constant, var_index, and children
+    /// (in order). Unlike std::hash<Expr> this never reports false positives.
+    bool ExprStructurallyEqual(const Expr &lhs, const Expr &rhs);
+
     /// Map a subset of variable names to their indices in the full variable list.
     std::vector< uint32_t > BuildVarSupport(
         const std::vector< std::string > &all_vars,
@@ -27,8 +31,8 @@ namespace cobra {
     /// Check if an Expr subtree contains only constants (no variables).
     bool IsConstantSubtree(const Expr &expr);
 
-    /// Returns true if any node in the AST is kShr.
-    bool ContainsShr(const Expr &expr);
+    /// Returns true if any node in the AST has the given kind.
+    bool ContainsType(const Expr &expr, Expr::Kind kind);
 
     /// Append the var_index of every kVariable node (pre-order). Duplicates
     /// are preserved; callers that want a deduplicated support set must
@@ -46,13 +50,9 @@ namespace cobra {
     /// Chains: constant folding → negation refolding → ExtractCommonFactor
     /// → constant folding.
     ///
-    /// Semantics-preserving under the assumption that std::hash<Expr>
-    /// does not collide on the input AST. ExtractCommonFactor uses
-    /// hash-based factor equality, so a hash collision could in
-    /// principle produce a non-equivalent rewrite. The hash-collision
-    /// tradeoff is accepted at the project level (see audit
-    /// 2026-05-04 lifting-passes-29 / -65). Callers requiring strict
-    /// semantics-preservation must re-verify the result.
+    /// Semantics-preserving: ExtractCommonFactor matches common factors by
+    /// exact structural equality (ExprStructurallyEqual), so the distributive
+    /// rewrite never fires on a non-equal factor.
     std::unique_ptr< Expr > CleanupFinalExpr(std::unique_ptr< Expr > expr, uint32_t bitwidth);
 
     /// Check if an Expr subtree depends on any variable.

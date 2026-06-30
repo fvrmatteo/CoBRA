@@ -360,7 +360,9 @@ namespace cobra {
             // Only flatten single-variable atoms without shifts.
             // Shifts mix bits across positions, breaking the per-bit
             // decomposition f(x) = f(0) + (x & pass) - (x & invert).
-            if (info.key.support.size() != 1 || ContainsShr(*info.original_subtree)) {
+            if (info.key.support.size() != 1
+                || ContainsType(*info.original_subtree, Expr::Kind::kShr))
+            {
                 new_terms.push_back(term);
                 continue;
             }

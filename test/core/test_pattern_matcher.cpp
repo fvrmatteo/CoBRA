@@ -741,3 +741,108 @@ TEST(PatternMatcherTest, FiveVarSampledCorrectness) {
         verify(rng);
     }
 }
+
+namespace {
+    bool ContainsKind(const Expr &e, Expr::Kind k) {
+        if (e.kind == k) { return true; }
+        for (const auto &c : e.children) {
+            if (ContainsKind(*c, k)) { return true; }
+        }
+        return false;
+    }
+} // namespace
+
+// Inclusion-exclusion OR recovery (GAMBA recon): A + B - (A & B) -> A | B,
+// where B is arithmetic (10*y+5) and operands are spread across a flattened
+// additive sum. Target: 10*y + 5 + x + (x^4) - ((x^4) & (10*y+5)) == x + ((x^4) | (10*y+5)).
+TEST(PatternMatcherTest, RecoverDisjunctionArithmeticOperand) {
+    auto x = []() { return Expr::Variable(0); };
+    auto y = []() { return Expr::Variable(1); };
+    auto a = [&]() { return Expr::BitwiseXor(x(), Expr::Constant(4)); };
+    auto b = [&]() { return Expr::Add(Expr::Mul(Expr::Constant(10), y()), Expr::Constant(5)); };
+    auto input = Expr::Add(
+        Expr::Add(Expr::Add(b(), x()), a()), Expr::Negate(Expr::BitwiseAnd(a(), b()))
+    );
+
+    auto original = CloneExpr(*input);
+    auto result   = SimplifyPatternSubtrees(std::move(input), 64);
+
+    EXPECT_TRUE(ContainsKind(*result, Expr::Kind::kOr));
+    EXPECT_TRUE(FullWidthCheck(*original, 2, *result, {}, 64).passed);
+    EXPECT_TRUE(IsBetter(ComputeCost(*result).cost, ComputeCost(*original).cost));
+}
+
+// Simpler 2-var instance of the same gap: (x^4) + y - ((x^4) & y) -> (x^4) | y.
+TEST(PatternMatcherTest, RecoverDisjunctionTwoVar) {
+    auto x     = []() { return Expr::Variable(0); };
+    auto y     = []() { return Expr::Variable(1); };
+    auto a     = [&]() { return Expr::BitwiseXor(x(), Expr::Constant(4)); };
+    auto input = Expr::Add(Expr::Add(a(), y()), Expr::Negate(Expr::BitwiseAnd(a(), y())));
+
+    auto original = CloneExpr(*input);
+    auto result   = SimplifyPatternSubtrees(std::move(input), 64);
+
+    EXPECT_TRUE(ContainsKind(*result, Expr::Kind::kOr));
+    EXPECT_TRUE(FullWidthCheck(*original, 2, *result, {}, 64).passed);
+}
+
+// Regression guard: XOR lowering A + B - 2*(A & B) must stay A ^ B and must
+// NOT be misrecovered as A | B (coefficient on the AND term is 2, not 1).
+TEST(PatternMatcherTest, RecoverDisjunctionDoesNotMisfireOnXor) {
+    auto x     = []() { return Expr::Variable(0); };
+    auto y     = []() { return Expr::Variable(1); };
+    auto input = Expr::Add(
+        Expr::Add(x(), y()),
+        Expr::Negate(Expr::Mul(Expr::Constant(2), Expr::BitwiseAnd(x(), y())))
+    );
+
+    auto original = CloneExpr(*input);
+    auto result   = SimplifyPatternSubtrees(std::move(input), 64);
+
+    EXPECT_FALSE(ContainsKind(*result, Expr::Kind::kOr));
+    EXPECT_TRUE(FullWidthCheck(*original, 2, *result, {}, 64).passed);
+}
+
+// Structural XOR self-cancellation: (A ^ B) ^ B -> A, even when A has a
+// degenerate {0,1} signature (so the signature path can't recover it).
+// A = ((x+y)&z)|3 (constant 3 on {0,1}); B = (x*z | y&85) + w (appears twice).
+TEST(PatternMatcherTest, XorSelfCancelComplexOperand) {
+    auto a = []() {
+        return Expr::BitwiseOr(
+            Expr::BitwiseAnd(
+                Expr::Add(Expr::Variable(0), Expr::Variable(1)), Expr::Variable(2)
+            ),
+            Expr::Constant(3)
+        );
+    };
+    auto b = []() {
+        return Expr::Add(
+            Expr::BitwiseOr(
+                Expr::Mul(Expr::Variable(0), Expr::Variable(2)),
+                Expr::BitwiseAnd(Expr::Variable(1), Expr::Constant(85))
+            ),
+            Expr::Variable(3)
+        );
+    };
+    auto input = Expr::BitwiseXor(Expr::BitwiseXor(a(), b()), b());
+
+    auto original = CloneExpr(*input);
+    auto result   = SimplifyXorChains(std::move(input), 64);
+
+    // B ^ B cancels; no XOR should remain, and the result equals A.
+    EXPECT_FALSE(ContainsKind(*result, Expr::Kind::kXor));
+    EXPECT_TRUE(FullWidthCheck(*original, 4, *result, {}, 64).passed);
+    EXPECT_TRUE(IsBetter(ComputeCost(*result).cost, ComputeCost(*original).cost));
+}
+
+// Odd multiplicity: T ^ T ^ T -> T (a single copy survives).
+TEST(PatternMatcherTest, XorSelfCancelOddMultiplicity) {
+    auto t        = []() { return Expr::BitwiseAnd(Expr::Variable(0), Expr::Variable(1)); };
+    auto input    = Expr::BitwiseXor(Expr::BitwiseXor(t(), t()), t());
+    auto original = CloneExpr(*input);
+    auto result   = SimplifyXorChains(std::move(input), 64);
+
+    EXPECT_FALSE(ContainsKind(*result, Expr::Kind::kXor));
+    EXPECT_EQ(result->kind, Expr::Kind::kAnd);
+    EXPECT_TRUE(FullWidthCheck(*original, 2, *result, {}, 64).passed);
+}

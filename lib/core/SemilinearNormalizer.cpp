@@ -203,7 +203,7 @@ namespace cobra {
             // identical Boolean truth tables but differ on full-width inputs
             // because variables evaluate to {0,1} while constants keep their
             // full value.
-            const bool kPure = !HasConstant(expr) && !ContainsShr(expr);
+            const bool kPure = !HasConstant(expr) && !ContainsType(expr, Expr::Kind::kShr);
             if (kPure && !kKey.truth_table.empty()) {
                 auto it = ctx.atom_map.find(kKey);
                 if (it != ctx.atom_map.end()) { return it->second; }

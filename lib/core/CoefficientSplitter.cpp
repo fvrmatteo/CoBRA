@@ -1,5 +1,6 @@
 #include "cobra/core/CoefficientSplitter.h"
 #include "cobra/core/BitWidth.h"
+#include "cobra/core/MathUtils.h"
 #include "cobra/core/Trace.h"
 #include <bit>
 #include <cassert>
@@ -12,20 +13,8 @@ namespace cobra {
 
     uint64_t ModInverseOddHalf(uint64_t x, uint32_t w) {
         assert(w >= 2);
-        assert(x & 1);
-
-        // Target: x^{-1} mod 2^{w-1}.
-        // Hensel lifting: inv = x is correct mod 2^3 (since x^2 = 1 mod 8
-        // for all odd x). Each iteration doubles correct bits.
-        const uint32_t kTargetBits = w - 1;
-        const uint64_t kModMask = (kTargetBits >= 64) ? UINT64_MAX : (1ULL << kTargetBits) - 1;
-
-        uint64_t inv = x & kModMask;
-        // ceil(log2(kTargetBits)) iterations, starting from 3 correct bits
-        for (uint32_t bits = 3; bits < kTargetBits; bits *= 2) {
-            inv = (inv * (2 - (x * inv))) & kModMask;
-        }
-        return inv & kModMask;
+        // x^{-1} mod 2^{w-1} is exactly the general odd inverse at width w-1.
+        return ModInverseOdd(x, w - 1);
     }
 
     namespace {

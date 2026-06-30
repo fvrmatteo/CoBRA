@@ -282,20 +282,6 @@ namespace cobra {
             size_t r = 0;
         };
 
-        bool ExprStructurallyEqual(const Expr &lhs, const Expr &rhs) {
-            if (lhs.kind != rhs.kind || lhs.constant_val != rhs.constant_val
-                || lhs.var_index != rhs.var_index || lhs.children.size() != rhs.children.size())
-            {
-                return false;
-            }
-            for (size_t i = 0; i < lhs.children.size(); ++i) {
-                if (!ExprStructurallyEqual(*lhs.children[i], *rhs.children[i])) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
         std::unique_ptr< Expr >
         ReconstructMaskedProductFactor(const Expr &inclusive_term, const Expr &exclusive_term) {
             if (inclusive_term.kind != Expr::Kind::kAnd

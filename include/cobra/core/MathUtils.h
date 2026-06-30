@@ -37,15 +37,17 @@ namespace cobra {
     }
 
     // Modular inverse of an odd number x modulo 2^bits.
-    // Hensel lifting: x*x = 1 mod 8 for all odd x, so 3 bits are
-    // correct initially. Each iteration doubles the number of
-    // correct bits.
+    // Newton/Hensel lifting: the seed ((3 * x) ^ 2) -- i.e. (3*x) XOR 2, not a
+    // square -- satisfies x * seed = 1 mod 32 for all odd x, so 5 bits are
+    // correct initially. Each iteration doubles the correct bits
+    // (5 -> 10 -> 20 -> 40 -> 80), so 64-bit inverses need 4 iterations. (The
+    // bare seed x is correct to only 3 bits and would need a 5th iteration.)
     inline uint64_t ModInverseOdd(uint64_t x, uint32_t bits) {
         assert(bits >= 1);
         assert(x & 1);
         const uint64_t kModMask = Bitmask(bits);
-        uint64_t inv            = x & kModMask;
-        for (uint32_t b = 3; b < bits; b *= 2) { inv = (inv * (2 - (x * inv))) & kModMask; }
+        uint64_t inv            = ((3 * x) ^ 2) & kModMask;
+        for (uint32_t b = 5; b < bits; b *= 2) { inv = (inv * (2 - (x * inv))) & kModMask; }
         return inv & kModMask;
     }
 
