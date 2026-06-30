@@ -101,7 +101,7 @@ namespace {
             MaskAuditResult r;
             r.line       = lineno;
             r.node_count = CountNodes(expr);
-            r.has_shr    = ContainsShr(expr);
+            r.has_shr    = ContainsType(expr, Expr::Kind::kShr);
 
             // Root mask
             auto root_mask    = DetectRootLowBitMask(expr, 64);

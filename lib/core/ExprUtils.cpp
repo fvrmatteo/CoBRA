@@ -32,6 +32,18 @@ namespace cobra {
         for (auto &child : expr.children) { RemapVarIndices(*child, index_map); }
     }
 
+    bool ExprStructurallyEqual(const Expr &lhs, const Expr &rhs) {
+        if (lhs.kind != rhs.kind || lhs.constant_val != rhs.constant_val
+            || lhs.var_index != rhs.var_index || lhs.children.size() != rhs.children.size())
+        {
+            return false;
+        }
+        for (size_t i = 0; i < lhs.children.size(); ++i) {
+            if (!ExprStructurallyEqual(*lhs.children[i], *rhs.children[i])) { return false; }
+        }
+        return true;
+    }
+
     std::unique_ptr< Expr > BuildAndProduct(uint64_t mask) {
         std::unique_ptr< Expr > result;
         while (mask != 0) {
@@ -60,10 +72,10 @@ namespace cobra {
         });
     }
 
-    bool ContainsShr(const Expr &expr) {
-        if (expr.kind == Expr::Kind::kShr) { return true; }
-        return std::ranges::any_of(expr.children, [](const auto &child) {
-            return ContainsShr(*child);
+    bool ContainsType(const Expr &expr, Expr::Kind kind) {
+        if (expr.kind == kind) { return true; }
+        return std::ranges::any_of(expr.children, [kind](const auto &child) {
+            return ContainsType(*child, kind);
         });
     }
 
@@ -133,15 +145,17 @@ namespace cobra {
 
     namespace {
 
-        // Flatten a left-folded Add chain into a list of terms.
-        void FlattenAdd(
-            std::unique_ptr< Expr > node, std::vector< std::unique_ptr< Expr > > &terms
+        // Flatten a left-folded binary associative chain of `kind` (kAdd or
+        // kMul) into its operand list, moving each leaf out of the tree.
+        void FlattenAssoc(
+            std::unique_ptr< Expr > node, Expr::Kind kind,
+            std::vector< std::unique_ptr< Expr > > &out
         ) {
-            if (node->kind == Expr::Kind::kAdd) {
-                FlattenAdd(std::move(node->children[0]), terms);
-                FlattenAdd(std::move(node->children[1]), terms);
+            if (node->kind == kind) {
+                FlattenAssoc(std::move(node->children[0]), kind, out);
+                FlattenAssoc(std::move(node->children[1]), kind, out);
             } else {
-                terms.push_back(std::move(node));
+                out.push_back(std::move(node));
             }
         }
 
@@ -161,7 +175,7 @@ namespace cobra {
             if (expr->kind != Expr::Kind::kAdd) { return expr; }
 
             std::vector< std::unique_ptr< Expr > > terms;
-            FlattenAdd(std::move(expr), terms);
+            FlattenAssoc(std::move(expr), Expr::Kind::kAdd, terms);
 
             uint64_t const_sum = 0;
             std::vector< std::unique_ptr< Expr > > non_const;
@@ -214,18 +228,6 @@ namespace cobra {
             return expr;
         }
 
-        // Flatten binary Mul chain into factor list.
-        void FlattenMul(
-            std::unique_ptr< Expr > node, std::vector< std::unique_ptr< Expr > > &factors
-        ) {
-            if (node->kind == Expr::Kind::kMul) {
-                FlattenMul(std::move(node->children[0]), factors);
-                FlattenMul(std::move(node->children[1]), factors);
-            } else {
-                factors.push_back(std::move(node));
-            }
-        }
-
         // Rebuild a left-folded Mul chain from a factor list.
         std::unique_ptr< Expr > RebuildMul(std::vector< std::unique_ptr< Expr > > &factors) {
             auto result = std::move(factors[0]);
@@ -248,7 +250,7 @@ namespace cobra {
 
             // Flatten the Add chain.
             std::vector< std::unique_ptr< Expr > > terms;
-            FlattenAdd(std::move(expr), terms);
+            FlattenAssoc(std::move(expr), Expr::Kind::kAdd, terms);
 
             if (terms.size() < 2) {
                 if (terms.size() == 1) { return std::move(terms[0]); }
@@ -266,7 +268,7 @@ namespace cobra {
             for (auto &t : terms) {
                 TermFactors tf;
                 if (t->kind == Expr::Kind::kMul) {
-                    FlattenMul(std::move(t), tf.factors);
+                    FlattenAssoc(std::move(t), Expr::Kind::kMul, tf.factors);
                 } else {
                     tf.factors.push_back(std::move(t));
                 }
@@ -280,9 +282,8 @@ namespace cobra {
                 if (candidate->kind == Expr::Kind::kConstant) { continue; }
                 if (candidate->kind == Expr::Kind::kVariable) { continue; }
 
-                auto candidate_hash = std::hash< Expr >{}(*candidate);
-
-                // Check all other terms for this factor.
+                // Check all other terms for this factor, matching on exact
+                // structural equality (never a false positive, unlike a hash).
                 bool universal = true;
                 std::vector< size_t > match_indices;
                 match_indices.push_back(fi);
@@ -291,11 +292,7 @@ namespace cobra {
                     for (size_t fj = 0; fj < all_factors[ti].factors.size(); ++fj) {
                         auto &f = all_factors[ti].factors[fj];
                         if (f->kind == Expr::Kind::kConstant) { continue; }
-                        if (std::hash< Expr >{}(*f) == candidate_hash
-                            && f->kind == candidate->kind)
-                        {
-                            // Deep equality check via CloneExpr comparison.
-                            // Use the hash as strong filter — collisions are rare.
+                        if (ExprStructurallyEqual(*f, *candidate)) {
                             found = true;
                             match_indices.push_back(fj);
                             break;
