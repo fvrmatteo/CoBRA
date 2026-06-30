@@ -94,7 +94,7 @@ namespace cobra {
 
     bool IsCostBlowup(const ExprCost &candidate, const ExprCost &baseline) {
         // Output must exceed this multiple of the input to count as a blow-up.
-        constexpr uint32_t kBlowupRatio = 2;
+        constexpr uint32_t kBlowupRatio    = 2;
         // ...and exceed this absolute weighted size, sparing the small ~2x
         // expansions of legitimate canonicalization on tiny inputs.
         constexpr uint32_t kBlowupAbsFloor = 32;

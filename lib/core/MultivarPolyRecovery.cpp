@@ -98,11 +98,12 @@ namespace cobra {
                     const uint64_t kLowBits = kAlpha & ((1ULL << q) - 1);
                     if (kLowBits != 0) {
                         ReasonDetail reason{
-                            .top = { .code    = { ReasonCategory::kNoSolution,
-                                                  ReasonDomain::kMultivarPoly,
-                                                  multivar_poly::kDivisibilityFail },
-                                    .message = "falling-factorial coefficient fails divisibility "
-                                                "gate" }
+                            .top = { .code = { ReasonCategory::kNoSolution,
+                                               ReasonDomain::kMultivarPoly,
+                                               multivar_poly::kDivisibilityFail },
+                                    .message =
+                                         "falling-factorial coefficient fails divisibility "
+                                         "gate" }
                         };
                         return SolverResult< NormalizedPoly >::Blocked(std::move(reason));
                     }
