@@ -1442,13 +1442,11 @@ namespace cobra {
                 case Expr::Kind::kNeg:
                     return AdditiveHasBinaryAnd(*e.children[0]);
                 case Expr::Kind::kMul:
-                    if (e.children.size() == 2
-                        && e.children[0]->kind == Expr::Kind::kConstant)
+                    if (e.children.size() == 2 && e.children[0]->kind == Expr::Kind::kConstant)
                     {
                         return AdditiveHasBinaryAnd(*e.children[1]);
                     }
-                    if (e.children.size() == 2
-                        && e.children[1]->kind == Expr::Kind::kConstant)
+                    if (e.children.size() == 2 && e.children[1]->kind == Expr::Kind::kConstant)
                     {
                         return AdditiveHasBinaryAnd(*e.children[0]);
                     }

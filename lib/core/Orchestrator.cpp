@@ -1029,9 +1029,9 @@ namespace cobra {
         // Cost of the raw input, computed once and reused by every return path
         // (the blow-up gate in ToSimplifyOutcome and the XOR exhaustion
         // fallback). Absent when there is no input AST (sig-only path).
-        const std::optional< ExprCost > input_cost =
-            input_expr ? std::optional< ExprCost >(ComputeCost(*input_expr).cost)
-                       : std::nullopt;
+        const std::optional< ExprCost > input_cost = input_expr
+            ? std::optional< ExprCost >(ComputeCost(*input_expr).cost)
+            : std::nullopt;
 
         // Seeding
         if (input_expr == nullptr) {
