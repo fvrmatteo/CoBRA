@@ -6,6 +6,7 @@
 #   cmake --build build-deps
 #
 # Options:
+#   COBRA_BUILD_LLVM_PASS   (default OFF) - Provide LLVM for the pass plugin
 #   USE_EXTERNAL_LLVM       (default ON)  - Use system LLVM vs build from source
 #   USE_EXTERNAL_HIGHWAY    (default OFF) - Use system highway vs build from source
 #   COBRA_BUILD_TESTS       (default OFF) - Build GoogleTest for tests
@@ -16,6 +17,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(cobra-dependencies LANGUAGES C CXX)
 
+option(COBRA_BUILD_LLVM_PASS "Build the LLVM pass plugin (requires LLVM 19-22)" OFF)
 option(USE_EXTERNAL_LLVM "Use system LLVM instead of building from source" ON)
 option(USE_EXTERNAL_ABSEIL "Use system abseil instead of building from source" OFF)
 option(USE_EXTERNAL_HIGHWAY "Use system highway instead of building from source" OFF)
@@ -28,7 +30,16 @@ include(superbuild.cmake)
 
 include(abseil.cmake)
 include(highway.cmake)
-include(llvm.cmake)
+
+# LLVM is needed only by the pass plugin, which the main project already gates
+# on COBRA_BUILD_LLVM_PASS (CMakeLists.txt:64).  Including it unconditionally
+# here made every dependency build either require a system LLVM install
+# (USE_EXTERNAL_LLVM=ON -> find_package(LLVM REQUIRED)) or build LLVM from
+# source -- neither of which cobra-core needs: libcobra-core.a references zero
+# LLVM symbols.
+if(COBRA_BUILD_LLVM_PASS)
+    include(llvm.cmake)
+endif()
 
 if(COBRA_BUILD_TESTS)
     include(googletest.cmake)
