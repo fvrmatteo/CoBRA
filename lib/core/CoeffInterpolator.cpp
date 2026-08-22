@@ -28,12 +28,16 @@ namespace cobra {
         // "without this variable" entry from the "with" entry to isolate its
         // contribution. Equivalent to evaluating directly in the (1, x, y, x&y)
         // basis rather than computing a change-of-basis matrix.
+        //
+        // Canonical block butterfly: each var pairs index i (bit clear) with
+        // i + half (bit set), so we touch exactly len/2 elements per var with
+        // no per-element bit test and contiguous access within each half-block.
         for (uint32_t var = 0; var < num_vars; ++var) {
-            const uint32_t stride = 1U << var;
-            for (size_t i = 0; i < len; ++i) {
-                if ((i & stride) != 0u) {
-                    const size_t i0 = i & ~static_cast< size_t >(stride);
-                    sig[i]          = (sig[i] - sig[i0]) & mask;
+            const size_t half  = size_t{ 1 } << var;
+            const size_t block = half << 1;
+            for (size_t base = 0; base < len; base += block) {
+                for (size_t i = base; i < base + half; ++i) {
+                    sig[i + half] = (sig[i + half] - sig[i]) & mask;
                 }
             }
         }

@@ -20,4 +20,10 @@ namespace cobra {
     std::unique_ptr< Expr >
     SimplifyPatternSubtrees(std::unique_ptr< Expr > expr, uint32_t bitwidth);
 
+    // Recursively cancel XOR operands that appear an even number of times
+    // (T ^ T == 0), flattening nested XOR chains. This is an exact algebraic
+    // identity (no full-width approximation), so the result is provably
+    // equivalent to the input at every bit width.
+    std::unique_ptr< Expr > SimplifyXorChains(std::unique_ptr< Expr > expr, uint32_t bitwidth);
+
 } // namespace cobra

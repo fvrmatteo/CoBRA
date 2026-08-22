@@ -1266,6 +1266,266 @@ namespace cobra {
             return result;
         }
 
+        // ---- Inclusion-exclusion disjunction recovery ----------------------
+        //
+        // Reverses the MBA obfuscation A + B - (A & B) -> A | B for arbitrary
+        // operands (including arithmetic ones such as 10*y+5), where A and B may
+        // be spread across several terms of a flattened additive sum. Operands
+        // are read verbatim from the AND node's children; the rewrite is the
+        // exact inclusion-exclusion identity and is verified with FullWidthCheck.
+
+        struct AdditiveTerm
+        {
+            uint64_t coeff;
+            const Expr *atom; // non-owning; points into the source tree
+        };
+
+        // Flatten `e` (scaled by `coeff`) into signed additive terms plus an
+        // accumulated constant. Constant multipliers fold into the coefficient.
+        void FlattenAdditive(
+            const Expr &e, uint64_t coeff, uint32_t bitwidth,
+            std::vector< AdditiveTerm > &terms, uint64_t &constant
+        ) {
+            switch (e.kind) {
+                case Expr::Kind::kAdd:
+                    for (const auto &child : e.children) {
+                        FlattenAdditive(*child, coeff, bitwidth, terms, constant);
+                    }
+                    return;
+                case Expr::Kind::kNeg:
+                    FlattenAdditive(
+                        *e.children[0], ModNeg(coeff, bitwidth), bitwidth, terms, constant
+                    );
+                    return;
+                case Expr::Kind::kConstant:
+                    constant =
+                        ModAdd(constant, ModMul(coeff, e.constant_val, bitwidth), bitwidth);
+                    return;
+                case Expr::Kind::kMul:
+                    if (e.children.size() == 2 && e.children[0]->kind == Expr::Kind::kConstant)
+                    {
+                        FlattenAdditive(
+                            *e.children[1],
+                            ModMul(coeff, e.children[0]->constant_val, bitwidth), bitwidth,
+                            terms, constant
+                        );
+                        return;
+                    }
+                    if (e.children.size() == 2 && e.children[1]->kind == Expr::Kind::kConstant)
+                    {
+                        FlattenAdditive(
+                            *e.children[0],
+                            ModMul(coeff, e.children[1]->constant_val, bitwidth), bitwidth,
+                            terms, constant
+                        );
+                        return;
+                    }
+                    terms.push_back({ coeff, &e });
+                    return;
+                default:
+                    terms.push_back({ coeff, &e });
+                    return;
+            }
+        }
+
+        // Mark pool terms matching each of `need` (exact coeff + structural
+        // atom) as consumed. Returns false (leaving `consumed` unchanged) when
+        // any needed term is absent.
+        bool ConsumeTerms(
+            const std::vector< AdditiveTerm > &pool, const std::vector< AdditiveTerm > &need,
+            std::vector< bool > &consumed
+        ) {
+            auto trial = consumed;
+            for (const auto &nt : need) {
+                bool found = false;
+                for (size_t i = 0; i < pool.size(); ++i) {
+                    if (trial[i]) { continue; }
+                    if (pool[i].coeff == nt.coeff
+                        && ExprStructurallyEqual(*pool[i].atom, *nt.atom))
+                    {
+                        trial[i] = true;
+                        found    = true;
+                        break;
+                    }
+                }
+                if (!found) { return false; }
+            }
+            consumed = std::move(trial);
+            return true;
+        }
+
+        std::unique_ptr< Expr > RebuildAdditive(
+            const std::vector< AdditiveTerm > &pool, const std::vector< bool > &consumed,
+            uint64_t constant, std::unique_ptr< Expr > extra, uint32_t bitwidth
+        ) {
+            std::unique_ptr< Expr > result;
+            if (constant != 0) { result = Expr::Constant(constant); }
+            for (size_t i = 0; i < pool.size(); ++i) {
+                if (consumed[i]) { continue; }
+                auto term = ApplyCoefficient(CloneExpr(*pool[i].atom), pool[i].coeff, bitwidth);
+                result =
+                    result ? Expr::Add(std::move(result), std::move(term)) : std::move(term);
+            }
+            if (extra) {
+                result =
+                    result ? Expr::Add(std::move(result), std::move(extra)) : std::move(extra);
+            }
+            return result ? std::move(result) : Expr::Constant(0);
+        }
+
+        // Confirm `candidate` matches `original` at random full-width inputs.
+        // candidate reuses original's variable indices, so an identity var_map
+        // over [0, max_index] is sufficient (no densification needed).
+        bool VerifyRecovery(const Expr &original, const Expr &candidate, uint32_t bitwidth) {
+            std::vector< uint32_t > support;
+            CollectSupport(original, support);
+            uint32_t num_vars = 0;
+            for (uint32_t v : support) { num_vars = std::max(num_vars, v + 1); }
+            return FullWidthCheck(original, num_vars, candidate, {}, bitwidth).passed;
+        }
+
+        // Attempt to collapse the inclusion-exclusion pattern anchored at the
+        // AND term `terms[and_idx]`. Returns the rewritten expression on success.
+        std::optional< std::unique_ptr< Expr > > TryRecoverDisjunctionAt(
+            const std::vector< AdditiveTerm > &terms, uint64_t constant, size_t and_idx,
+            const Expr &expr, uint32_t bitwidth
+        ) {
+            const Expr *and_atom = terms[and_idx].atom;
+            if (and_atom->kind != Expr::Kind::kAnd || and_atom->children.size() != 2) {
+                return std::nullopt;
+            }
+            const uint64_t c = ModNeg(terms[and_idx].coeff, bitwidth);
+            if (c == 0) { return std::nullopt; }
+
+            std::vector< AdditiveTerm > a_terms;
+            std::vector< AdditiveTerm > b_terms;
+            uint64_t a_const = 0;
+            uint64_t b_const = 0;
+            FlattenAdditive(*and_atom->children[0], c, bitwidth, a_terms, a_const);
+            FlattenAdditive(*and_atom->children[1], c, bitwidth, b_terms, b_const);
+
+            std::vector< bool > consumed(terms.size(), false);
+            consumed[and_idx] = true;
+            if (!ConsumeTerms(terms, a_terms, consumed)) { return std::nullopt; }
+            if (!ConsumeTerms(terms, b_terms, consumed)) { return std::nullopt; }
+
+            const uint64_t new_constant =
+                ModSub(ModSub(constant, a_const, bitwidth), b_const, bitwidth);
+            auto or_term = ApplyCoefficient(
+                Expr::BitwiseOr(
+                    CloneExpr(*and_atom->children[0]), CloneExpr(*and_atom->children[1])
+                ),
+                c, bitwidth
+            );
+            auto candidate =
+                RebuildAdditive(terms, consumed, new_constant, std::move(or_term), bitwidth);
+
+            if (!IsBetter(ComputeCost(*candidate).cost, ComputeCost(expr).cost)) {
+                return std::nullopt;
+            }
+            if (!VerifyRecovery(expr, *candidate, bitwidth)) { return std::nullopt; }
+            return candidate;
+        }
+
+        // Cheap precondition for TryRecoverInclusionExclusion: does the additive
+        // chain rooted at `e` contain a top-level 2-child AND term? Mirrors
+        // FlattenAdditive's descent (through kAdd / kNeg / constant-scaled kMul)
+        // but allocates nothing, so additive nodes with no AND term skip the
+        // FlattenAdditive + per-term scan entirely.
+        bool AdditiveHasBinaryAnd(const Expr &e) {
+            switch (e.kind) {
+                case Expr::Kind::kAdd:
+                    for (const auto &child : e.children) {
+                        if (AdditiveHasBinaryAnd(*child)) { return true; }
+                    }
+                    return false;
+                case Expr::Kind::kNeg:
+                    return AdditiveHasBinaryAnd(*e.children[0]);
+                case Expr::Kind::kMul:
+                    if (e.children.size() == 2 && e.children[0]->kind == Expr::Kind::kConstant)
+                    {
+                        return AdditiveHasBinaryAnd(*e.children[1]);
+                    }
+                    if (e.children.size() == 2 && e.children[1]->kind == Expr::Kind::kConstant)
+                    {
+                        return AdditiveHasBinaryAnd(*e.children[0]);
+                    }
+                    return false;
+                case Expr::Kind::kAnd:
+                    return e.children.size() == 2;
+                default:
+                    return false;
+            }
+        }
+
+        std::optional< std::unique_ptr< Expr > >
+        TryRecoverInclusionExclusion(const Expr &expr, uint32_t bitwidth) {
+            if (expr.kind != Expr::Kind::kAdd && expr.kind != Expr::Kind::kNeg) {
+                return std::nullopt;
+            }
+            if (!AdditiveHasBinaryAnd(expr)) { return std::nullopt; }
+            std::vector< AdditiveTerm > terms;
+            uint64_t constant = 0;
+            FlattenAdditive(expr, 1, bitwidth, terms, constant);
+
+            for (size_t i = 0; i < terms.size(); ++i) {
+                auto recovered = TryRecoverDisjunctionAt(terms, constant, i, expr, bitwidth);
+                if (recovered.has_value()) { return recovered; }
+            }
+            return std::nullopt;
+        }
+
+        void FlattenXor(const Expr &e, std::vector< const Expr * > &out) {
+            if (e.kind == Expr::Kind::kXor) {
+                for (const auto &child : e.children) { FlattenXor(*child, out); }
+                return;
+            }
+            out.push_back(&e);
+        }
+
+        // Cancel XOR operands appearing an even number of times (T ^ T == 0).
+        // Flattens the XOR chain and keeps each distinct operand that occurs an
+        // odd number of times. Universally sound; a FullWidthCheck backstops the
+        // structural equality. Unlike the signature path, this fires even when
+        // the surviving operand has a degenerate {0,1} signature.
+        std::optional< std::unique_ptr< Expr > >
+        TryXorSelfCancel(const Expr &expr, uint32_t bitwidth) {
+            if (expr.kind != Expr::Kind::kXor) { return std::nullopt; }
+
+            std::vector< const Expr * > operands;
+            FlattenXor(expr, operands);
+
+            std::vector< bool > consumed(operands.size(), false);
+            std::vector< const Expr * > survivors;
+            for (size_t i = 0; i < operands.size(); ++i) {
+                if (consumed[i]) { continue; }
+                size_t count = 1;
+                consumed[i]  = true;
+                for (size_t j = i + 1; j < operands.size(); ++j) {
+                    if (!consumed[j] && ExprStructurallyEqual(*operands[i], *operands[j])) {
+                        consumed[j] = true;
+                        ++count;
+                    }
+                }
+                if (count % 2 == 1) { survivors.push_back(operands[i]); }
+            }
+
+            if (survivors.size() == operands.size()) { return std::nullopt; }
+
+            std::unique_ptr< Expr > result;
+            if (survivors.empty()) {
+                result = Expr::Constant(0);
+            } else {
+                result = CloneExpr(*survivors[0]);
+                for (size_t i = 1; i < survivors.size(); ++i) {
+                    result = Expr::BitwiseXor(std::move(result), CloneExpr(*survivors[i]));
+                }
+            }
+
+            if (!VerifyRecovery(expr, *result, bitwidth)) { return std::nullopt; }
+            return result;
+        }
+
     } // namespace
 
     std::optional< std::unique_ptr< Expr > >
@@ -1314,8 +1574,30 @@ namespace cobra {
         }
 
         auto rewritten = TrySimplifyPatternSubtree(*expr, bitwidth);
-        if (!rewritten.has_value()) { return expr; }
-        return SimplifyPatternSubtrees(std::move(*rewritten), bitwidth);
+        if (rewritten.has_value()) {
+            return SimplifyPatternSubtrees(std::move(*rewritten), bitwidth);
+        }
+
+        auto recovered = TryRecoverInclusionExclusion(*expr, bitwidth);
+        if (recovered.has_value()) {
+            return SimplifyPatternSubtrees(std::move(*recovered), bitwidth);
+        }
+        return expr;
+    }
+
+    std::unique_ptr< Expr > SimplifyXorChains(std::unique_ptr< Expr > expr, uint32_t bitwidth) {
+        // Cancel repeated operands across the full XOR chain rooted here first
+        // (top-down): flattening the whole chain before reducing children avoids
+        // a nested pair collapsing to 0 and stranding an odd third copy.
+        auto cancelled = TryXorSelfCancel(*expr, bitwidth);
+        if (cancelled.has_value()) {
+            return SimplifyXorChains(std::move(*cancelled), bitwidth);
+        }
+        // No cancellation here: recurse into children to handle nested chains.
+        for (auto &child : expr->children) {
+            child = SimplifyXorChains(std::move(child), bitwidth);
+        }
+        return expr;
     }
 
 } // namespace cobra

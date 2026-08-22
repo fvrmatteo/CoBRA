@@ -25,6 +25,11 @@ add_compile_options(
     $<$<CXX_COMPILER_ID:GNU>:-Wno-missing-field-initializers>
     $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-missing-designated-field-initializers>
     $<${_cobra_msvc}:/W4>
+    # C4146 "unary minus applied to unsigned type, result still unsigned" is
+    # exactly what the evaluators intend: (-x) & mask is two's-complement
+    # negation for Expr::Kind::kNeg, well-defined for unsigned types.  /sdl
+    # below promotes C4146 to an error, which breaks the MSVC build outright.
+    $<${_cobra_msvc}:/wd4146>
 )
 
 # Runtime hardening (GCC/Clang)

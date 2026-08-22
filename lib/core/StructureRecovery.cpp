@@ -6,6 +6,7 @@
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/core/Trace.h"
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
@@ -165,9 +166,10 @@ namespace cobra {
                     // with fewer set bits — the resulting m*c is
                     // smaller, and when m*c == 0 the constant vanishes).
                     if (((a.coeff + b.coeff) & kMod) == 0) {
+                        // std::popcount, not __builtin_popcountll: the latter
+                        // is a GCC/Clang extension with no MSVC equivalent.
                         auto &src =
-                            (__builtin_popcountll(a.mask) <= __builtin_popcountll(b.mask)) ? a
-                                                                                           : b;
+                            (std::popcount(a.mask) <= std::popcount(b.mask)) ? a : b;
                         auto &dst = (&src == &a) ? b : a;
 
                         const uint64_t kM = src.coeff;
@@ -360,7 +362,9 @@ namespace cobra {
             // Only flatten single-variable atoms without shifts.
             // Shifts mix bits across positions, breaking the per-bit
             // decomposition f(x) = f(0) + (x & pass) - (x & invert).
-            if (info.key.support.size() != 1 || ContainsShr(*info.original_subtree)) {
+            if (info.key.support.size() != 1
+                || ContainsType(*info.original_subtree, Expr::Kind::kShr))
+            {
                 new_terms.push_back(term);
                 continue;
             }

@@ -166,6 +166,20 @@ namespace cobra {
             std::vector< uint64_t > full_point(total_num_vars, 0);
             std::vector< uint64_t > local_point(kK, 0);
 
+            // Precompute falling factorials over the grid. The matrix build
+            // below would otherwise recompute FallingFactorial(coord, exp) once
+            // per (row, col, dim) for only kGridBase x (kPerVarCap+1) distinct
+            // (coord, exp) pairs.
+            std::vector< std::vector< uint64_t > > falling(
+                kGridBase, std::vector< uint64_t >(static_cast< size_t >(kPerVarCap) + 1, 0)
+            );
+            for (size_t coord = 0; coord < kGridBase; ++coord) {
+                for (uint32_t e = 0; e <= kPerVarCap; ++e) {
+                    falling[coord][e] =
+                        FallingFactorial(coord, static_cast< uint8_t >(e), kMask);
+                }
+            }
+
             for (size_t row = 0; row < num_rows; ++row) {
                 size_t tmp = row;
                 for (uint32_t i = 0; i < kK; ++i) {
@@ -178,9 +192,7 @@ namespace cobra {
                 for (size_t col = 0; col < kNumCols; ++col) {
                     uint64_t phi = 1;
                     for (uint32_t i = 0; i < kK; ++i) {
-                        phi =
-                            (phi * FallingFactorial(local_point[i], basis_exps[col][i], kMask))
-                            & kMask;
+                        phi = (phi * falling[local_point[i]][basis_exps[col][i]]) & kMask;
                     }
                     mat[row][col] = (kWVal * phi) & kMask;
                 }

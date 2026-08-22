@@ -19,6 +19,7 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1037,6 +1038,33 @@ namespace cobra {
             Populate(pool, vmap, num_vars, pts, opts.bitwidth);
         }
         COBRA_PLOT("TemplatePoolSize", static_cast< int64_t >(pool.size()));
+
+        // Seed data-derived constants so masking results like x & M (whose set
+        // bit is invisible to the {0,1} signature) become synthesizable. The
+        // OR-fold of observed outputs recovers the mask; a few distinct output
+        // values cover split masks. Soundness is unchanged: every candidate is
+        // FullWidthCheckEval-gated, so extra constants only widen the search.
+        {
+            uint64_t or_fold = 0;
+            for (size_t i = 0; i < kNProbes; ++i) { or_fold |= target[i]; }
+            // Skip values already seeded: Push dedups the pool by probe-vals, so
+            // re-seeding the same constant only wastes a Probe() call.
+            std::unordered_set< uint64_t > seeded_vals;
+            auto seed_const = [&](uint64_t c) {
+                if (c == 0 || !seeded_vals.insert(c).second) { return; }
+                auto e = Expr::Constant(c);
+                auto v = Probe(*e, pts, opts.bitwidth);
+                Push(pool, vmap, std::move(e), v);
+            };
+            seed_const(or_fold);
+            uint32_t seeded = 0;
+            for (size_t i = 0; i < kNProbes && seeded < 7; ++i) {
+                if (target[i] != 0) {
+                    seed_const(target[i]);
+                    ++seeded;
+                }
+            }
+        }
 
         // Direct atom match.
         {

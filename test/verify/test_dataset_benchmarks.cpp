@@ -358,15 +358,18 @@ TEST(GAMBADataset, QSynthEA) {
     EXPECT_EQ(stats.total, 503);
     EXPECT_EQ(stats.skipped_parse, 3);
     EXPECT_EQ(stats.parsed, 500);
-    EXPECT_EQ(stats.simplified, 466);
-    EXPECT_EQ(stats.unsupported, 34);
+    // +2 vs prior baseline: two cases with structurally-repeated XOR operands
+    // (one previously verify-failed, one search-exhausted) now collapse via the
+    // exact XOR self-cancellation exhaustion fallback (T^T==0).
+    EXPECT_EQ(stats.simplified, 468);
+    EXPECT_EQ(stats.unsupported, 32);
     EXPECT_EQ(stats.failed_simplify, 0);
 
     // Every unsupported result carries a structured reason code.
     EXPECT_EQ(stats.has_structured_reason, stats.unsupported);
-    EXPECT_EQ(stats.by_category[ReasonCategory::kVerifyFailed], 7);
+    EXPECT_EQ(stats.by_category[ReasonCategory::kVerifyFailed], 6);
     EXPECT_EQ(stats.by_category[ReasonCategory::kGuardFailed], 6);
-    EXPECT_EQ(stats.by_category[ReasonCategory::kSearchExhausted], 21);
+    EXPECT_EQ(stats.by_category[ReasonCategory::kSearchExhausted], 20);
 
     // Decomposition cause frames propagated into cause_chain.
     // MixedRewrite unsupported outcomes should carry delegated
