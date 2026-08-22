@@ -1,5 +1,5 @@
 #include "cobra/core/ExprUtils.h"
-
+#include <stdexcept>
 #include <gtest/gtest.h>
 
 namespace cobra {
