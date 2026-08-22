@@ -1122,7 +1122,7 @@ TEST(SimplifierTest, RepairProductShadow_CompoundChildSkipped) {
 // --- Dynamic masking fallback tests ---
 
 TEST(SimplifierTest, DynamicMask_ShrRejectsOptimization) {
-    // 0xFF & (x >> 1): ContainsShr rejects dynamic masking,
+    // 0xFF & (x >> 1): the shift check rejects dynamic masking,
     // falls through to normal pipeline.
     auto inner  = Expr::LogicalShr(Expr::Variable(0), 1);
     auto masked = Expr::BitwiseAnd(Expr::Constant(0xFF), std::move(inner));
@@ -1893,7 +1893,7 @@ TEST(SimplifierTest, RejectsExcessiveInputVarCount) {
     // any allocation.
     std::vector< std::string > vars;
     for (int i = 0; i < 25; ++i) { vars.push_back("x" + std::to_string(i)); }
-    std::vector< uint64_t > sig(2, 0);  // size doesn't matter; rejected first
+    std::vector< uint64_t > sig(2, 0); // size doesn't matter; rejected first
     Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = false };
 
     auto result = Simplify(sig, vars, nullptr, opts);
@@ -1954,4 +1954,192 @@ TEST(SimplifierTest, AcceptsInputVarCountAtCeiling) {
     auto result = Simplify(sig, vars, nullptr, opts);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(Render(*result.value().expr, result.value().real_vars), "7");
+}
+
+namespace {
+    // s(v) = 1 - 2*(v & 1), a +-1 value (s^2 == 1). GAMBA parity sign-flip.
+    std::unique_ptr< Expr > SignFlip(uint32_t var_index) {
+        return Expr::Add(
+            Expr::Constant(1),
+            Expr::Mul(
+                Expr::BitwiseAnd(Expr::Variable(var_index), Expr::Constant(1)),
+                Expr::Constant(static_cast< uint64_t >(-2))
+            )
+        );
+    }
+
+    bool RendersToSum(const SimplifyOutcome &out, const char *a, const char *b) {
+        auto text = Render(*out.expr, out.real_vars);
+        return text == std::string(a) + " + " + b || text == std::string(b) + " + " + a;
+    }
+} // namespace
+
+// GAMBA recon: parity sign-square E*s*s -> E for multi-variable E. The
+// degenerate single-product core (the whole input) used to short-circuit the
+// worklist before the recovery passes ran, leaving the input unchanged.
+TEST(SimplifierTest, SignSquareCollapseMultiVar) {
+    // (x1 + x2) * s(x3) * s(x3)  ==  x1 + x2
+    auto ast = Expr::Mul(
+        Expr::Mul(Expr::Add(Expr::Variable(0), Expr::Variable(1)), SignFlip(2)), SignFlip(2)
+    );
+    std::vector< std::string > vars = { "x1", "x2", "x3" };
+
+    auto sig = EvaluateBooleanSignature(*ast, 3, 64);
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+    opts.evaluator = Evaluator::FromExpr(*ast, 64);
+
+    auto result = Simplify(sig, vars, ast.get(), opts);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->kind, SimplifyOutcome::Kind::kSimplified);
+    EXPECT_TRUE(RendersToSum(result.value(), "x1", "x2"));
+    auto check = FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 3, *result->expr, 64);
+    EXPECT_TRUE(check.passed);
+}
+
+// Full Arnau target: XOR self-cancel of duplicate complex operands plus the
+// sign-square collapse must together reduce to x1 + x2.
+TEST(SimplifierTest, SignSquareWithXorSelfCancel) {
+    // ((((x1+x2)*s3) ^ ((x5+3)*s4) ^ ((x5+3)*s4)) * s3)  ==  x1 + x2
+    auto term_a = Expr::Mul(Expr::Add(Expr::Variable(0), Expr::Variable(1)), SignFlip(2));
+    auto term_b = [&]() {
+        return Expr::Mul(Expr::Add(Expr::Variable(4), Expr::Constant(3)), SignFlip(3));
+    };
+    auto inner = Expr::BitwiseXor(Expr::BitwiseXor(std::move(term_a), term_b()), term_b());
+    auto ast   = Expr::Mul(std::move(inner), SignFlip(2));
+    std::vector< std::string > vars = { "x1", "x2", "x3", "x4", "x5" };
+
+    auto sig = EvaluateBooleanSignature(*ast, 5, 64);
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+    opts.evaluator = Evaluator::FromExpr(*ast, 64);
+
+    auto result = Simplify(sig, vars, ast.get(), opts);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->kind, SimplifyOutcome::Kind::kSimplified);
+    EXPECT_TRUE(RendersToSum(result.value(), "x1", "x2"));
+    auto check = FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 5, *result->expr, 64);
+    EXPECT_TRUE(check.passed);
+}
+
+namespace {
+    bool RendersToAndConst(const SimplifyOutcome &out, const char *v, uint64_t c) {
+        auto text = Render(*out.expr, out.real_vars);
+        auto cs   = std::to_string(c);
+        return text == std::string(v) + " & " + cs || text == cs + " & " + std::string(v);
+    }
+
+    // ((x & m) + (y & ymask)) & outmask
+    std::unique_ptr< Expr > MaskedAdd(uint64_t m, uint64_t ymask, uint64_t outmask) {
+        return Expr::BitwiseAnd(
+            Expr::Add(
+                Expr::BitwiseAnd(Expr::Variable(0), Expr::Constant(m)),
+                Expr::BitwiseAnd(Expr::Variable(1), Expr::Constant(ymask))
+            ),
+            Expr::Constant(outmask)
+        );
+    }
+
+    SimplifyOutcome RunAst(const Expr &ast, std::vector< std::string > vars) {
+        auto nv  = static_cast< uint32_t >(vars.size());
+        auto sig = EvaluateBooleanSignature(ast, nv, 64);
+        Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+        opts.evaluator = Evaluator::FromExpr(ast, 64);
+        auto result    = Simplify(sig, vars, &ast, opts);
+        return std::move(result.value());
+    }
+} // namespace
+
+// GAMBA recon: carry-free masked addition. ((x & 128) + (y & 127)) & 128 == x & 128
+// because y&127 < 128 is disjoint from bit 7, so the add can't carry into it. The
+// {0,1} signature is all-zero (bit 7 invisible); recovered once TemplateDecomposer
+// can synthesize the mask constant 128.
+TEST(SimplifierTest, MaskedCarryFreeAddBit7) {
+    auto ast = MaskedAdd(128, 127, 128);
+    auto out = RunAst(*ast, { "x", "y" });
+    EXPECT_EQ(out.kind, SimplifyOutcome::Kind::kSimplified);
+    EXPECT_TRUE(RendersToAndConst(out, "x", 128));
+    EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 2, *out.expr, 64).passed);
+}
+
+// Whole family across the former bit>=3 threshold: ((x&2^k)+(y&(2^k-1)))&2^k -> x&2^k.
+TEST(SimplifierTest, MaskedCarryFreeAddFamily) {
+    for (uint32_t bit : { 3u, 4u, 5u, 6u, 7u, 8u }) {
+        const uint64_t m = uint64_t{ 1 } << bit;
+        auto ast         = MaskedAdd(m, m - 1, m);
+        auto out         = RunAst(*ast, { "x", "y" });
+        EXPECT_EQ(out.kind, SimplifyOutcome::Kind::kSimplified) << "bit " << bit;
+        EXPECT_TRUE(RendersToAndConst(out, "x", m)) << "bit " << bit;
+        EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 2, *out.expr, 64).passed)
+            << "bit " << bit;
+    }
+}
+
+// End-to-end XOR self-cancel: (A ^ B) ^ B -> A through the full Simplify pipeline,
+// where A = ((x+y)&z)|3 (degenerate {0,1} signature) and B = (x*z | y&85) + w.
+TEST(SimplifierTest, XorSelfCancelEndToEnd) {
+    auto a = []() {
+        return Expr::BitwiseOr(
+            Expr::BitwiseAnd(
+                Expr::Add(Expr::Variable(0), Expr::Variable(1)), Expr::Variable(2)
+            ),
+            Expr::Constant(3)
+        );
+    };
+    auto b = []() {
+        return Expr::Add(
+            Expr::BitwiseOr(
+                Expr::Mul(Expr::Variable(0), Expr::Variable(2)),
+                Expr::BitwiseAnd(Expr::Variable(1), Expr::Constant(85))
+            ),
+            Expr::Variable(3)
+        );
+    };
+    auto ast = Expr::BitwiseXor(Expr::BitwiseXor(a(), b()), b());
+    auto out = RunAst(*ast, { "x", "y", "z", "w" });
+    EXPECT_EQ(out.kind, SimplifyOutcome::Kind::kSimplified);
+    // B ^ B cancels -> no XOR remains in the rendered result.
+    EXPECT_EQ(Render(*out.expr, out.real_vars).find('^'), std::string::npos);
+    EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 4, *out.expr, 64).passed);
+    // The exact-XOR-cancel success must not carry the exhaustion failure
+    // lineage that the fallback path was built atop.
+    EXPECT_FALSE(out.diag.reason_code.has_value());
+    EXPECT_TRUE(out.diag.cause_chain.empty());
+}
+
+// Soundness: a genuine carry ((x & 255) + (y & 255)) & 255 must NOT collapse to
+// x & 255 (it is (x + y) & 255). Whatever is returned must stay full-width-correct.
+TEST(SimplifierTest, MaskedAddWithCarryNotFalselyCollapsed) {
+    auto ast = MaskedAdd(255, 255, 255);
+    auto out = RunAst(*ast, { "x", "y" });
+    EXPECT_TRUE(FullWidthCheckEval(Evaluator::FromExpr(*ast, 64), 2, *out.expr, 64).passed);
+    EXPECT_FALSE(RendersToAndConst(out, "x", 255));
+}
+
+// A change-of-basis blow-up must be rejected. sum(xi) - xor(xi) is CoB-linear,
+// so change-of-basis recovers an exponential AND-basis expansion; the input is
+// already minimal, so the cost gate keeps the input and reports kCostRejected.
+TEST(SimplifierTest, RejectsExponentialBlowup) {
+    auto sum = Expr::Variable(0);
+    auto xr  = Expr::Variable(0);
+    for (uint32_t i = 1; i < 8; ++i) {
+        sum = Expr::Add(std::move(sum), Expr::Variable(i));
+        xr  = Expr::BitwiseXor(std::move(xr), Expr::Variable(i));
+    }
+    auto ast = Expr::Add(std::move(sum), Expr::Negate(std::move(xr)));
+    std::vector< std::string > vars;
+    for (uint32_t i = 0; i < 8; ++i) { vars.push_back("x" + std::to_string(i)); }
+
+    auto input_cost = ComputeCost(*ast).cost;
+    auto sig        = EvaluateBooleanSignature(*ast, 8, 64);
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+    opts.evaluator = Evaluator::FromExpr(*ast, 64);
+    auto result    = Simplify(sig, vars, ast.get(), opts);
+    ASSERT_TRUE(result.has_value());
+    // The blow-up is rejected: the input is kept unchanged...
+    EXPECT_EQ(result->kind, SimplifyOutcome::Kind::kUnchangedUnsupported);
+    EXPECT_TRUE(ExprStructurallyEqual(*result->expr, *ast));
+    // ...and the result must not be strictly more expensive than the input.
+    EXPECT_FALSE(IsBetter(input_cost, ComputeCost(*result->expr).cost));
+    // ...with a kCostRejected structured reason.
+    ASSERT_TRUE(result->diag.reason_code.has_value());
+    EXPECT_EQ(result->diag.reason_code->category, ReasonCategory::kCostRejected);
 }

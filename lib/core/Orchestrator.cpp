@@ -840,12 +840,12 @@ namespace cobra {
 
         SimplifyOutcome ToSimplifyOutcome(
             OrchestratorResult result, const Expr *original_expr,
-            const OrchestratorTelemetry &telemetry, uint32_t bitwidth
+            const OrchestratorTelemetry &telemetry, uint32_t bitwidth,
+            const std::optional< ExprCost > &input_cost
         ) {
             SimplifyOutcome outcome;
 
             if (result.outcome.Succeeded()) {
-                outcome.kind      = SimplifyOutcome::Kind::kSimplified;
                 outcome.real_vars = result.outcome.RealVars();
                 // Read PassOutcome.Verification() instead of the parallel
                 // ItemMetadata.verification field. The two were initialized
@@ -858,6 +858,28 @@ namespace cobra {
                     result.outcome.Verification() == VerificationState::kVerified;
                 outcome.expr       = CleanupFinalExpr(result.outcome.TakeExpr(), bitwidth);
                 outcome.sig_vector = std::move(result.metadata.sig_vector);
+                outcome.kind       = SimplifyOutcome::Kind::kSimplified;
+
+                // Don't return a result that blows up relative to the input. A
+                // CoB-linear function (e.g. sum(xi) - xor(xi)) recovers an
+                // exponential AND-basis expansion that is correct but far larger
+                // than the already-minimal input; keep the input in that case.
+                // See IsCostBlowup for the ratio/floor rationale.
+                if (original_expr != nullptr && input_cost.has_value()) {
+                    const auto out_cost = ComputeCost(*outcome.expr).cost;
+                    if (IsCostBlowup(out_cost, *input_cost)) {
+                        outcome.kind = SimplifyOutcome::Kind::kUnchangedUnsupported;
+                        outcome.expr = CloneExpr(*original_expr);
+                        outcome.real_vars.clear();
+                        outcome.verified = false;
+                        // Stamp a structured reason so the unsupported result
+                        // still satisfies the has_structured_reason invariant
+                        // (set on result.metadata so the copy below propagates).
+                        result.metadata.reason_code =
+                            ReasonCode{ ReasonCategory::kCostRejected,
+                                        ReasonDomain::kOrchestrator, 0 };
+                    }
+                }
             } else {
                 outcome.kind = SimplifyOutcome::Kind::kUnchangedUnsupported;
                 outcome.expr = original_expr != nullptr ? CloneExpr(*original_expr) : nullptr;
@@ -947,7 +969,7 @@ namespace cobra {
         // recurse only a handful of times before reaching 1 bit.
         if (input_expr != nullptr) {
             auto mask = DetectRootLowBitMask(*input_expr, opts.bitwidth);
-            if (mask.has_value() && !ContainsShr(*mask->inner)) {
+            if (mask.has_value() && !ContainsType(*mask->inner, Expr::Kind::kShr)) {
                 auto inner      = CloneExpr(*mask->inner);
                 uint32_t eff_bw = mask->effective_width;
                 auto inner_sig  = EvaluateBooleanSignature(
@@ -1004,13 +1026,21 @@ namespace cobra {
         Worklist worklist;
         OrchestratorTelemetry telemetry;
 
+        // Cost of the raw input, computed once and reused by every return path
+        // (the blow-up gate in ToSimplifyOutcome and the XOR exhaustion
+        // fallback). Absent when there is no input AST (sig-only path).
+        const std::optional< ExprCost > input_cost = input_expr
+            ? std::optional< ExprCost >(ComputeCost(*input_expr).cost)
+            : std::nullopt;
+
         // Seeding
         if (input_expr == nullptr) {
             auto seed_result = SeedNoAst(sig, vars, context, worklist);
             if (!seed_result.has_value()) { return std::unexpected(seed_result.error()); }
             if (seed_result.value().has_value()) {
                 return Ok(ToSimplifyOutcome(
-                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth
+                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth,
+                    input_cost
                 ));
             }
         } else {
@@ -1018,7 +1048,8 @@ namespace cobra {
             if (!seed_result.has_value()) { return std::unexpected(seed_result.error()); }
             if (seed_result.value().has_value()) {
                 return Ok(ToSimplifyOutcome(
-                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth
+                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth,
+                    input_cost
                 ));
             }
         }
@@ -1135,7 +1166,7 @@ namespace cobra {
                             .metadata     = std::move(item.metadata),
                             .run_metadata = context.run_metadata,
                         },
-                        input_expr, telemetry, context.bitwidth
+                        input_expr, telemetry, context.bitwidth, input_cost
                     ));
                 }
             }
@@ -1356,13 +1387,55 @@ namespace cobra {
         }
 
         telemetry.queue_high_water = static_cast< uint32_t >(worklist.HighWaterMark());
+
+        // Exhaustion fallback: cancel structurally-repeated XOR operands in the
+        // raw input (T ^ T == 0, an EXACT identity at every bit width). When the
+        // survivors have a degenerate {0,1} signature, no signature/decomposition
+        // pass re-emits them, so the worklist exhausts even though the input
+        // collapses. Because this is exact (not a full-width approximation) the
+        // result is provably equivalent and sound to return directly. Fire only
+        // when it actually cancelled something and the result is strictly
+        // cheaper; the full-width check is defense in depth, not the proof.
+        if (input_expr != nullptr && context.evaluator
+            && ContainsType(*input_expr, Expr::Kind::kXor))
+        {
+            auto xor_peel = SimplifyXorChains(CloneExpr(*input_expr), context.bitwidth);
+            if (!ExprStructurallyEqual(*xor_peel, *input_expr)
+                && IsBetter(ComputeCost(*xor_peel).cost, *input_cost))
+            {
+                const auto num_vars = static_cast< uint32_t >(vars.size());
+                auto check          = FullWidthCheckEval(
+                    *context.evaluator, num_vars, *xor_peel, context.bitwidth
+                );
+                if (check.passed) {
+                    // This is a genuine (exact) simplification, not the
+                    // exhaustion failure final_meta was built to describe. Drop
+                    // the stale failure lineage so the kSimplified result does
+                    // not report a search-exhausted reason or cause chain.
+                    final_meta.reason_code.reset();
+                    final_meta.cause_chain.clear();
+                    final_meta.candidate_failed_verification = false;
+                    return Ok(ToSimplifyOutcome(
+                        OrchestratorResult{
+                            .outcome = PassOutcome::Success(
+                                std::move(xor_peel), vars, VerificationState::kVerified
+                            ),
+                            .metadata     = std::move(final_meta),
+                            .run_metadata = context.run_metadata,
+                        },
+                        input_expr, telemetry, context.bitwidth, input_cost
+                    ));
+                }
+            }
+        }
+
         return Ok(ToSimplifyOutcome(
             OrchestratorResult{
                 .outcome      = PassOutcome::Blocked(std::move(exhaustion_reason)),
                 .metadata     = std::move(final_meta),
                 .run_metadata = context.run_metadata,
             },
-            input_expr, telemetry, context.bitwidth
+            input_expr, telemetry, context.bitwidth, input_cost
         ));
     }
 

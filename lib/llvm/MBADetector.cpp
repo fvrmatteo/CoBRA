@@ -355,14 +355,10 @@ namespace cobra {
             // Shl with constant shift amount
             if (inst->getOpcode() == llvm::Instruction::Shl) {
                 auto *shift_amt = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
-                if (shift_amt == nullptr) {
-                    return nullptr;
-                }
+                if (shift_amt == nullptr) { return nullptr; }
                 auto child =
                     BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
-                if (child == nullptr) {
-                    return nullptr;
-                }
+                if (child == nullptr) { return nullptr; }
                 uint64_t mul_val = 1ULL << shift_amt->getZExtValue();
                 return Expr::Mul(std::move(child), Expr::Constant(mul_val));
             }

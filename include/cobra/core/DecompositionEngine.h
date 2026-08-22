@@ -40,6 +40,9 @@ namespace cobra {
         std::unique_ptr< Expr > expr;
         ExtractorKind kind;
         uint8_t degree_used = 0;
+        // kProductAST only: true when the whole input is a single product term
+        // (SplitAddTree found no additive split), i.e. the core equals the input.
+        bool single_product = false;
     };
 
     struct DecompositionResult

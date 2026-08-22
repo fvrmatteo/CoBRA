@@ -221,6 +221,45 @@ TEST(CoeffInterpolatorTest, AllZeroSig) {
     // Interaction terms are zero — affine result
 }
 
+// Property: the butterfly equals the naive subset Mobius transform,
+//   coeff[i] = sum_{j subset of i} (-1)^(popcount(i)-popcount(j)) * sig[j],
+// across random signatures, variable counts, and bitwidths.
+TEST(CoeffInterpolatorTest, MatchesNaiveMobius) {
+    uint64_t state = 0xC0B7A1234ULL;
+    auto next      = [&state]() {
+        state      += 0x9E3779B97F4A7C15ULL;
+        uint64_t z  = state;
+        z           = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z           = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+    };
+    for (uint32_t num_vars : { 0u, 1u, 2u, 3u, 4u, 5u, 6u }) {
+        for (uint32_t bitwidth : { 1u, 8u, 16u, 32u, 64u }) {
+            const uint64_t mask = Bitmask(bitwidth);
+            const size_t len    = size_t{ 1 } << num_vars;
+            std::vector< uint64_t > sig(len);
+            for (auto &s : sig) { s = next() & mask; }
+
+            std::vector< uint64_t > expected(len, 0);
+            for (size_t i = 0; i < len; ++i) {
+                // Enumerate submasks j of i; sign by parity of |i| - |j|.
+                for (size_t j = i;; j = (j - 1) & i) {
+                    uint64_t term = sig[j] & mask;
+                    if (((std::popcount(i) - std::popcount(j)) & 1) != 0) {
+                        term = (0 - term) & mask;
+                    }
+                    expected[i] = (expected[i] + term) & mask;
+                    if (j == 0) { break; }
+                }
+            }
+
+            auto got = InterpolateCoefficients(sig, num_vars, bitwidth);
+            EXPECT_EQ(got, expected)
+                << "num_vars=" << num_vars << " bitwidth=" << bitwidth;
+        }
+    }
+}
+
 // Large constant with wrapping at 8-bit
 TEST(CoeffInterpolatorTest, Bitwidth8LargeCoeffs) {
     // 200*x + 100*y at 8-bit: sig = [0, 200, 100, 44]

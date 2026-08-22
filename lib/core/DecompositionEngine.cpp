@@ -157,8 +157,9 @@ namespace cobra {
         }
 
         CoreCandidate core;
-        core.expr = std::move(core_expr);
-        core.kind = ExtractorKind::kProductAST;
+        core.expr           = std::move(core_expr);
+        core.kind           = ExtractorKind::kProductAST;
+        core.single_product = (products.size() == 1);
         return SolverResult< CoreCandidate >::Success(std::move(core));
     }
 
