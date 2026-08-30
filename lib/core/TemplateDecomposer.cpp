@@ -9,6 +9,8 @@
 #include "cobra/core/Simplifier.h"
 #include "cobra/core/Trace.h"
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -45,7 +47,6 @@ namespace cobra {
         {
             using std::array< uint64_t, kNProbes >::array;
         };
-
         namespace hn = hwy::HWY_NAMESPACE;
 
         // Highway tag for uint64_t vectors. ScalableTag picks the widest
@@ -63,29 +64,64 @@ namespace cobra {
         // typical pool sizes) and handled conservatively downstream.
         uint64_t Fingerprint(const ProbeVals &v) {
             // XOR-fold with position-dependent rotation to avoid
-            // commutative cancellation (a^b == b^a).
-            uint64_t h = 0;
-            for (size_t i = 0; i < kNProbes; ++i) { h ^= v[i] * (0x9E3779B97F4A7C15ULL + i); }
-            return h;
+            // commutative cancellation (a^b == b^a). XOR is associative, so
+            // four independent accumulators fold to the same value while
+            // shortening the dependency chain to a quarter of its length.
+            static_assert(kNProbes % 4 == 0);
+            uint64_t h0 = 0;
+            uint64_t h1 = 0;
+            uint64_t h2 = 0;
+            uint64_t h3 = 0;
+            for (size_t i = 0; i < kNProbes; i += 4) {
+                h0 ^= v[i + 0] * (0x9E3779B97F4A7C15ULL + i + 0);
+                h1 ^= v[i + 1] * (0x9E3779B97F4A7C15ULL + i + 1);
+                h2 ^= v[i + 2] * (0x9E3779B97F4A7C15ULL + i + 2);
+                h3 ^= v[i + 3] * (0x9E3779B97F4A7C15ULL + i + 3);
+            }
+            return (h0 ^ h1) ^ (h2 ^ h3);
         }
 
         // Maps 64-bit probe-value fingerprints to pool/inner indices.
         // Uses absl::flat_hash_map for SIMD-accelerated lookup.
+        //
+        // The `_hashed` entry points let a caller that needs several queries
+        // for the same probe values fold them once and reuse the result.
         class ValMap
         {
           public:
+            void reserve(size_t expected) { map_.reserve(expected); }
+
             void insert(const ProbeVals &key, size_t value) {
-                map_.try_emplace(Fingerprint(key), static_cast< uint32_t >(value));
+                insert_hashed(Fingerprint(key), value);
+            }
+
+            void insert_hashed(uint64_t fingerprint, size_t value) {
+                static_cast< void >(try_insert_hashed(fingerprint, value));
+            }
+
+            // Inserts only when the fingerprint is new, and reports whether it
+            // did, so a caller that would otherwise look up and then insert
+            // can touch the map once instead of twice.
+            bool try_insert_hashed(uint64_t fingerprint, size_t value) {
+                return map_.try_emplace(fingerprint, static_cast< uint32_t >(value)).second;
             }
 
             const size_t *find(const ProbeVals &key) const {
-                auto it = map_.find(Fingerprint(key));
+                return find_hashed(Fingerprint(key));
+            }
+
+            const size_t *find_hashed(uint64_t fingerprint) const {
+                auto it = map_.find(fingerprint);
                 if (it == map_.end()) { return nullptr; }
                 idx_buf_ = it->second;
                 return &idx_buf_;
             }
 
             bool contains(const ProbeVals &key) const { return find(key) != nullptr; }
+
+            bool contains_hashed(uint64_t fingerprint) const {
+                return find_hashed(fingerprint) != nullptr;
+            }
 
           private:
             absl::flat_hash_map< uint64_t, uint32_t > map_;
@@ -387,7 +423,10 @@ namespace cobra {
         {
             std::vector< InnerComp > comps;
             ValMap index;
-            absl::flat_hash_map< uint64_t, std::vector< size_t > > mul_probe0_buckets;
+            // Probe-0 value to the composition slots that produce it. Almost
+            // every value is unique, so the inline capacity keeps the common
+            // case free of heap allocations.
+            absl::flat_hash_map< uint64_t, absl::InlinedVector< uint32_t, 2 > > probe0_buckets;
         };
 
         InnerCompositions BuildInnerCompositions(
@@ -395,15 +434,32 @@ namespace cobra {
         ) {
             InnerCompositions inner;
             const size_t pn = pool.size();
+            // Each gate contributes at most one composition per unordered
+            // pair of atoms, so the final size has a tight upper bound.
+            // Reserving up front keeps the growth of these containers from
+            // repeatedly copying the 128-byte probe arrays.
+            const size_t upper_bound = kAllGates.size() * pn * (pn + 1) / 2;
+            inner.comps.reserve(upper_bound);
+            inner.index.reserve(upper_bound);
+            inner.probe0_buckets.reserve(upper_bound);
+
             for (auto g_in : kAllGates) {
                 for (size_t bi = 0; bi < pn; ++bi) {
                     for (size_t ci = bi; ci < pn; ++ci) {
                         auto v = GateApply(pool[bi].vals, pool[ci].vals, g_in, mask);
-                        if (vmap.contains(v)) { continue; }
-                        if (inner.index.contains(v)) { continue; }
+                        // One fold serves the atom-pool test, the duplicate
+                        // test and the insert.
+                        const auto fingerprint = Fingerprint(v);
+                        if (vmap.contains_hashed(fingerprint)) {
+                            continue;
+                        }
+                        // A single probe both rejects duplicates and claims
+                        // the slot for a first sighting.
                         const auto slot = inner.comps.size();
-                        inner.index.insert(v, slot);
-                        inner.mul_probe0_buckets[v[0]].push_back(slot);
+                        if (!inner.index.try_insert_hashed(fingerprint, slot)) {
+                            continue;
+                        }
+                        inner.probe0_buckets[v[0]].push_back(static_cast< uint32_t >(slot));
                         inner.comps.push_back({ .gate = g_in, .bi = bi, .ci = ci, .vals = v });
                     }
                 }
@@ -506,17 +562,42 @@ namespace cobra {
             return hn::AllFalse(d, hn::Ne(acc, hn::Zero(d)));
         }
 
+        // Probe-0 restriction of Compatible. A single scalar test that
+        // rejects nearly every candidate before the 16-probe SIMD scan.
+        bool Compatible0(uint64_t a0, uint64_t target0, Gate g) {
+            switch (g) {
+                case Gate::kAnd:
+                    return (~a0 & target0) == 0;
+                case Gate::kOr:
+                    return (~target0 & a0) == 0;
+                default:
+                    return true;
+            }
+        }
+
+        template< typename T >
+            requires (std::same_as< T, Atom > || std::same_as< T, InnerComp >)
+        void CollectCompatibleIndices(
+            std::span< const T > candidates, const ProbeVals &target, Gate g,
+            std::vector< size_t > &indices
+        ) {
+            indices.clear();
+            const size_t n = candidates.size();
+            for (size_t i = 0; i < n; ++i) {
+                if (!Compatible0(candidates[i].vals[0], target[0], g)) {
+                    continue;
+                }
+                if (Compatible(candidates[i].vals, target, g)) { indices.push_back(i); }
+            }
+        }
+
         template< typename T >
             requires (std::same_as< T, Atom > || std::same_as< T, InnerComp >)
         std::vector< size_t > CollectCompatibleIndices(
             std::span< const T > candidates, const ProbeVals &target, Gate g
         ) {
             std::vector< size_t > indices;
-            const size_t n = candidates.size();
-            indices.reserve(n);
-            for (size_t i = 0; i < n; ++i) {
-                if (Compatible(candidates[i].vals, target, g)) { indices.push_back(i); }
-            }
+            CollectCompatibleIndices(candidates, target, g, indices);
             return indices;
         }
 
@@ -577,34 +658,132 @@ namespace cobra {
             return hn::AllFalse(d, hn::Ne(acc, hn::Zero(d)));
         }
 
+        using Probe0Buckets =
+            absl::flat_hash_map< uint64_t, absl::InlinedVector< uint32_t, 2 > >;
+
+        // For target = G(A, inner) with G in {And, Or}, probe 0 pins inner's
+        // first value to a coset: the bits of A that are set (And) or clear
+        // (Or) force the matching bits of inner, and the remaining bits are
+        // free. When the free set is small the coset can be enumerated, so
+        // only the matching probe-0 buckets need to be visited instead of the
+        // whole composition cache.
+        //
+        // Returns false when the coset is too wide to enumerate, in which
+        // case the caller must fall back to a full scan.
+        bool CollectAndOrProbe0Candidates(
+            const Probe0Buckets &probe0_buckets, uint64_t lhs_probe0, uint64_t target_probe0,
+            Gate g, uint32_t bitwidth, std::vector< size_t > &out
+        ) {
+            constexpr uint32_t kMaxEnumeratedFreeBits = 12;
+
+            out.clear();
+            const uint64_t full_mask  = Bitmask(bitwidth);
+            lhs_probe0               &= full_mask;
+            target_probe0            &= full_mask;
+
+            uint64_t free_mask = 0;
+            uint64_t forced    = 0;
+            switch (g) {
+                case Gate::kAnd:
+                    // (lhs & b) == target is unsatisfiable unless target only
+                    // sets bits that lhs also sets. Elsewhere b is pinned to
+                    // target where lhs is set and free where lhs is clear.
+                    if ((~lhs_probe0 & target_probe0) != 0) {
+                        return true;
+                    }
+                    free_mask = ~lhs_probe0 & full_mask;
+                    forced    = target_probe0 & lhs_probe0;
+                    break;
+                case Gate::kOr:
+                    // (lhs | b) == target is unsatisfiable unless every bit of
+                    // lhs is also set in target. Elsewhere b is pinned to
+                    // target where lhs is clear and free where lhs is set.
+                    if ((~target_probe0 & lhs_probe0) != 0) {
+                        return true;
+                    }
+                    free_mask = lhs_probe0;
+                    forced    = target_probe0 & ~lhs_probe0;
+                    break;
+                default:
+                    return false;
+            }
+
+            if (static_cast< uint32_t >(std::popcount(free_mask)) > kMaxEnumeratedFreeBits) {
+                return false;
+            }
+
+            const auto append_bucket = [&](uint64_t probe0_value) {
+                auto it = probe0_buckets.find(probe0_value);
+                if (it == probe0_buckets.end()) { return; }
+                out.insert(out.end(), it->second.begin(), it->second.end());
+            };
+
+            // Walk every subset of the free bits in ascending order.
+            for (uint64_t subset = 0;; subset = (subset - free_mask) & free_mask) {
+                append_bucket(forced | subset);
+                if (subset == free_mask) {
+                    break;
+                }
+            }
+
+            // Restore ascending composition order so the candidate visited
+            // first does not depend on the bucket layout.
+            std::sort(out.begin(), out.end());
+            return true;
+        }
+
+        // Probe-0 multiplicative structure of one operand: how many factors of
+        // two its first probe value carries, and the inverse of the remaining
+        // odd part. Both depend only on the operand, so a scan that pairs one
+        // operand against many targets computes them once per operand instead
+        // of once per pair.
+        struct MulProbe0Factor
+        {
+            bool zero            = true;
+            uint32_t twos        = 0;
+            uint64_t odd_inverse = 0;
+        };
+
+        MulProbe0Factor MulProbe0FactorOf(uint64_t probe0, uint32_t bitwidth) {
+            MulProbe0Factor factor;
+            probe0 &= Bitmask(bitwidth);
+            if (probe0 == 0) {
+                return factor;
+            }
+            factor.zero = false;
+            factor.twos = std::min(bitwidth, static_cast< uint32_t >(std::countr_zero(probe0)));
+            const uint32_t reduced_bits = bitwidth - factor.twos;
+            if (reduced_bits > 0) {
+                factor.odd_inverse = ModInverseOdd(probe0 >> factor.twos, reduced_bits);
+            }
+            return factor;
+        }
+
         // For target = A * inner (mod 2^bw), use probe 0 to derive the set of
         // admissible inner[0] values and restrict the scan to matching buckets.
         // Falls back to a full scan when probe 0 is too degenerate to be useful.
         bool CollectMulProbe0Candidates(
-            const absl::flat_hash_map< uint64_t, std::vector< size_t > > &probe0_buckets,
-            uint64_t lhs_probe0, uint64_t target_probe0, uint32_t bitwidth,
-            std::vector< size_t > &out
+            const Probe0Buckets &probe0_buckets, const MulProbe0Factor &lhs,
+            uint64_t target_probe0, uint32_t bitwidth, std::vector< size_t > &out
         ) {
             constexpr uint32_t kMaxEnumeratedShift = 8;
 
             out.clear();
-            lhs_probe0    &= Bitmask(bitwidth);
             target_probe0 &= Bitmask(bitwidth);
 
-            if (lhs_probe0 == 0) { return target_probe0 != 0; }
+            if (lhs.zero) {
+                return target_probe0 != 0;
+            }
 
-            const auto twos =
-                std::min(bitwidth, static_cast< uint32_t >(std::countr_zero(lhs_probe0)));
+            const auto twos = lhs.twos;
             if ((target_probe0 & Bitmask(twos)) != 0) { return true; }
             if (twos > kMaxEnumeratedShift) { return false; }
 
             const uint32_t reduced_bits = bitwidth - twos;
             uint64_t base_solution      = 0;
             if (reduced_bits > 0) {
-                const auto odd_part       = lhs_probe0 >> twos;
-                const auto reduced_target = target_probe0 >> twos;
-                base_solution = (ModInverseOdd(odd_part, reduced_bits) * reduced_target)
-                    & Bitmask(reduced_bits);
+                base_solution =
+                    (lhs.odd_inverse * (target_probe0 >> twos)) & Bitmask(reduced_bits);
             }
 
             const auto append_bucket = [&](uint64_t probe0_value) {
@@ -723,8 +902,8 @@ namespace cobra {
 
                 for (const auto &ai : pool) {
                     const bool used_probe0_filter = CollectMulProbe0Candidates(
-                        inner_cache.mul_probe0_buckets, ai.vals[0], target[0], bw,
-                        mul_probe0_candidates
+                        inner_cache.probe0_buckets, MulProbe0FactorOf(ai.vals[0], bw),
+                        target[0], bw, mul_probe0_candidates
                     );
                     if (used_probe0_filter) {
                         ++mul_bucketed_outer;
@@ -782,12 +961,14 @@ namespace cobra {
                         for (size_t bi = 0; bi < pool_n; ++bi) {
                             auto r2 = GateResidual(r1, pool[bi].vals, g2, mask);
                             std::unique_ptr< Expr > r2_expr;
+                            // Both indexes are keyed by the same fingerprint.
+                            const auto fingerprint = Fingerprint(r2);
                             {
-                                const auto *p = vmap.find(r2);
+                                const auto *p = vmap.find_hashed(fingerprint);
                                 if (p != nullptr) { r2_expr = CloneExpr(*pool[*p].expr); }
                             }
                             if (!r2_expr) {
-                                const auto *p = inner_idx.find(r2);
+                                const auto *p = inner_idx.find_hashed(fingerprint);
                                 if (p != nullptr) { r2_expr = make_inner(inner[*p]); }
                             }
                             if (!r2_expr) { continue; }
@@ -837,7 +1018,16 @@ namespace cobra {
                 );
             };
 
+            // The probe-0 multiplicative structure of the atoms is the same for
+            // every residual examined below, so derive it once.
+            std::vector< MulProbe0Factor > pool_mul_factors;
+            pool_mul_factors.reserve(pool_n);
+            for (const auto &atom : pool) {
+                pool_mul_factors.push_back(MulProbe0FactorOf(atom.vals[0], bw));
+            }
+
             std::vector< size_t > mul_candidates;
+            std::vector< size_t > andor_candidates;
             for (auto g1 : kAllGates) {
                 if (!GateInvertible(g1)) { continue; }
                 for (size_t ai = 0; ai < pool_n; ++ai) {
@@ -868,13 +1058,28 @@ namespace cobra {
                         }
 
                         // And/Or scan: lifted = G2(atom_B, inner_C)
-                        // Probe-0 check rejects most (pool, inner) pairs
-                        // with a single integer comparison before touching
-                        // the full 16-probe arrays.
+                        // Probe 0 pins inner_C's first probe value to a
+                        // small coset; enumerating it and visiting only the
+                        // matching buckets replaces a full scan of the
+                        // composition cache for every atom_B.
                         for (auto g2 : { Gate::kAnd, Gate::kOr }) {
                             for (size_t bi = 0; bi < pool_n; ++bi) {
+                                if (!Compatible0(pool[bi].vals[0], lifted[0], g2)) {
+                                    continue;
+                                }
                                 if (!Compatible(pool[bi].vals, lifted, g2)) { continue; }
-                                for (size_t ii = 0; ii < inner_n; ++ii) {
+
+                                const bool filtered = CollectAndOrProbe0Candidates(
+                                    inner_cache.probe0_buckets, pool[bi].vals[0], lifted[0], g2,
+                                    bw, andor_candidates
+                                );
+                                const std::span< const size_t > scan_indices = filtered
+                                    ? std::span< const size_t >(andor_candidates)
+                                    : std::span< const size_t >();
+                                const size_t scan_n = filtered ? scan_indices.size() : inner_n;
+
+                                for (size_t si = 0; si < scan_n; ++si) {
+                                    const size_t ii = filtered ? scan_indices[si] : si;
                                     if (!Probe0Matches(
                                             pool[bi].vals[0], inner[ii].vals[0], lifted[0], g2,
                                             mask
@@ -906,7 +1111,7 @@ namespace cobra {
                         {
                             for (size_t bi = 0; bi < pool_n; ++bi) {
                                 const bool filtered = CollectMulProbe0Candidates(
-                                    inner_cache.mul_probe0_buckets, pool[bi].vals[0], lifted[0],
+                                    inner_cache.probe0_buckets, pool_mul_factors[bi], lifted[0],
                                     bw, mul_candidates
                                 );
                                 if (filtered) {
