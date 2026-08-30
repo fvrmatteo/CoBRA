@@ -482,6 +482,22 @@ namespace cobra {
         // non-invertible gate that produces the target.
         // AndNot(a, b) = a & ~b — maps to NEON BIC / x86 ANDN.
         bool Compatible(const ProbeVals &a, const ProbeVals &target, Gate g) {
+            // Cheap scalar probe-0 rejection. The subset condition must hold at
+            // every probe, so failing already at probe 0 proves the atom cannot
+            // be an operand of this gate. This skips the SIMD scan for the vast
+            // majority of atoms (a superset/subset match at probe 0 is rare).
+            switch (g) {
+                case Gate::kAnd:
+                    // a & b == target  =>  target must be a subset of a
+                    if ((target[0] & ~a[0]) != 0) { return false; }
+                    break;
+                case Gate::kOr:
+                    // a | b == target  =>  a must be a subset of target
+                    if ((a[0] & ~target[0]) != 0) { return false; }
+                    break;
+                default:
+                    return false;
+            }
             const D64 d;
             const size_t kN = hn::Lanes(d);
             auto acc        = hn::Zero(d);
@@ -489,14 +505,14 @@ namespace cobra {
                 case Gate::kAnd:
                     for (size_t i = 0; i < kNProbes; i += kN) {
                         acc = hn::Or(
-                            acc, hn::AndNot(hn::Load(d, &a[i]), hn::Load(d, &target[i]))
+                            acc, hn::AndNot(hn::Load(d, &target[i]), hn::Load(d, &a[i]))
                         );
                     }
                     break;
                 case Gate::kOr:
                     for (size_t i = 0; i < kNProbes; i += kN) {
                         acc = hn::Or(
-                            acc, hn::AndNot(hn::Load(d, &target[i]), hn::Load(d, &a[i]))
+                            acc, hn::AndNot(hn::Load(d, &a[i]), hn::Load(d, &target[i]))
                         );
                     }
                     break;
@@ -868,9 +884,9 @@ namespace cobra {
                         }
 
                         // And/Or scan: lifted = G2(atom_B, inner_C)
-                        // Probe-0 check rejects most (pool, inner) pairs
-                        // with a single integer comparison before touching
-                        // the full 16-probe arrays.
+                        // The pool pre-filter (Compatible) rejects B operands that
+                        // cannot possibly participate; the cheap Probe-0 check then
+                        // rejects most (B, inner) pairs before the full 16-probe check.
                         for (auto g2 : { Gate::kAnd, Gate::kOr }) {
                             for (size_t bi = 0; bi < pool_n; ++bi) {
                                 if (!Compatible(pool[bi].vals, lifted, g2)) { continue; }

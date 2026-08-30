@@ -9,15 +9,21 @@
     #include "cobra/verify/Z3Verifier.h"
 #endif
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Analysis.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,18 +33,91 @@ STATISTIC(NumCandidates, "Number of MBA candidates found");
 STATISTIC(NumSimplified, "Number of MBA expressions simplified");
 STATISTIC(NumSkippedCost, "Number of candidates skipped (cost gate)");
 STATISTIC(NumSkippedUnsupported, "Number of candidates skipped (unsupported)");
+STATISTIC(NumSkippedUnchanged, "Number of candidates skipped (signature unchanged)");
+
+llvm::cl::opt< bool > CobraLogSkips(
+    "cobra-log-skips",
+    llvm::cl::desc("Log CoBRA candidates skipped because their signature is unchanged"),
+    llvm::cl::value_desc("cobra-log-skips"), llvm::cl::init(false), llvm::cl::Optional
+);
+
+namespace {
+
+    // 64-bit FNV-1a hash of a candidate's semantic signature.  Candidates
+    // that agree on bitwidth, variable count and the full truth table are
+    // functionally identical, so re-running the solver on them is wasted.
+    uint64_t CandidateFingerprint(const cobra::MBACandidate &cand) {
+        uint64_t h = 1469598103934665603ULL;  // FNV-1a offset basis
+        auto mix   = [&](uint64_t v) {
+            for (unsigned i = 0; i < 8; ++i) {
+                h ^= static_cast< uint8_t >(v >> (i * 8));
+                h *= 1099511628211ULL;  // FNV-1a prime
+            }
+        };
+        mix(cand.bitwidth);
+        mix(static_cast< uint64_t >(cand.var_names.size()));
+        for (uint64_t s : cand.sig) {
+            mix(s);
+        }
+        return h;
+    }
+
+    // Retrieve the fingerprint previously stamped on an instruction, if any.
+    std::optional< uint64_t > ReadFingerprint(llvm::Instruction *inst, unsigned kind_id) {
+        if (!inst->hasMetadata(kind_id)) {
+            return std::nullopt;
+        }
+        const auto *node = inst->getMetadata(kind_id);
+        if (const auto *cam = llvm::dyn_cast< llvm::ConstantAsMetadata >(node->getOperand(0))) {
+            if (const auto *ci = llvm::dyn_cast< llvm::ConstantInt >(cam->getValue())) {
+                return ci->getLimitedValue();
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Stamp a fingerprint on an instruction.  Survives across pipeline
+    // iterations for any instruction that is not otherwise rewritten.
+    void WriteFingerprint(llvm::Instruction *inst, unsigned kind_id, uint64_t fp) {
+        auto &ctx   = inst->getContext();
+        auto *value = llvm::ConstantInt::get(ctx, llvm::APInt(64, fp));
+        auto *node  = llvm::MDNode::get(ctx, llvm::ConstantAsMetadata::get(value));
+        inst->setMetadata(kind_id, node);
+    }
+
+}  // namespace
 
 namespace cobra {
 
     llvm::PreservedAnalyses
     CobraPass::run(llvm::Function &f, llvm::FunctionAnalysisManager & /*AM*/) {
         bool changed = false;
+        size_t skipped_unchanged = 0;
 
         auto candidates = DetectMbaCandidates(f, options_.min_ast_size, options_.max_vars);
 
         NumCandidates += candidates.size();
 
+        const unsigned kSigKindId = f.getContext().getMDKindID("cobra-sig");
+
         for (auto &cand : candidates) {
+            // Skip candidates whose semantic signature is unchanged since we
+            // last attempted them — the solver would only reproduce the same
+            // (non-)result.
+            const uint64_t fp = CandidateFingerprint(cand);
+            const auto existing = ReadFingerprint(cand.root, kSigKindId);
+            if (existing.has_value() && *existing == fp) {
+                ++NumSkippedUnchanged;
+                ++skipped_unchanged;
+                if (CobraLogSkips) {
+                    llvm::errs() << "CoBRA: skip (signature unchanged): " << *cand.root << "\n";
+                }
+                continue;
+            }
+            // Stamp before solving: if the root survives (no simplification)
+            // this marker makes the next pipeline iteration skip it.
+            WriteFingerprint(cand.root, kSigKindId, fp);
+
             Options opts{ .bitwidth   = cand.bitwidth,
                           .max_vars   = options_.max_vars,
                           .spot_check = true,
@@ -185,6 +264,11 @@ namespace cobra {
                     }
                 }
             }
+        }
+
+        if (CobraLogSkips && skipped_unchanged > 0) {
+            llvm::errs() << "CoBRA: " << f.getName() << " skipped " << skipped_unchanged << "/"
+                         << candidates.size() << " candidates (signature unchanged)\n";
         }
 
         return changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all();
