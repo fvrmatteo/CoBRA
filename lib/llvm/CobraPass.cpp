@@ -18,7 +18,12 @@
 #include "llvm/Support/Debug.h"
 
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #define DEBUG_TYPE "cobra"
@@ -27,20 +32,127 @@ STATISTIC(NumCandidates, "Number of MBA candidates found");
 STATISTIC(NumSimplified, "Number of MBA expressions simplified");
 STATISTIC(NumSkippedCost, "Number of candidates skipped (cost gate)");
 STATISTIC(NumSkippedUnsupported, "Number of candidates skipped (unsupported)");
+STATISTIC(NumOutcomeCacheHits, "Number of candidates served from the outcome cache");
 
 namespace cobra {
 
-    llvm::PreservedAnalyses
-    CobraPass::run(llvm::Function &f, llvm::FunctionAnalysisManager & /*AM*/) {
-        bool changed = false;
+    namespace {
 
-        auto candidates = DetectMbaCandidates(f, options_.min_ast_size, options_.max_vars);
+        // What solving a candidate produced: either a replacement expression
+        // that cleared every verification and cost gate, or nothing.
+        struct CandidateOutcome
+        {
+            std::unique_ptr< Expr > expr;
+            std::vector< std::string > real_vars;
+        };
 
-        NumCandidates += candidates.size();
+        void AppendExprKey(const Expr &expr, std::string &out) {
+            out += static_cast< char >('a' + static_cast< int >(expr.kind));
+            switch (expr.kind) {
+                case Expr::Kind::kConstant:
+                case Expr::Kind::kShr: // constant_val carries the shift amount
+                    out += std::to_string(expr.constant_val);
+                    break;
+                case Expr::Kind::kVariable:
+                    out += std::to_string(expr.var_index);
+                    break;
+                default:
+                    break;
+            }
+            out += '(';
+            for (const auto &child : expr.children) {
+                AppendExprKey(*child, out);
+            }
+            out += ')';
+        }
 
-        for (auto &cand : candidates) {
+        // Everything the solve below observes about a candidate. The
+        // serialization is structural rather than a hash so that distinct
+        // candidates can never collide onto a shared outcome.
+        //
+        // cand.evaluator is deliberately absent: it evaluates the same LLVM
+        // tree that cand.expr was built from, so the AST already pins its
+        // behaviour. cand.leaf_values is absent for the same reason the cache
+        // is useful at all — the leaves differ between rediscoveries of the
+        // same tree, and the outcome refers to them only by index.
+        std::string CandidateKey(const MBACandidate &cand, const CobraPassOptions &options) {
+            std::string key;
+            key += std::to_string(cand.bitwidth);
+            key += '|';
+            key += std::to_string(options.max_vars);
+            key += options.z3_verify ? "|z" : "|-";
+            key += std::to_string(options.z3_settings.timeout_ms);
+            key += std::to_string(static_cast< int >(options.z3_settings.unknown_result_mode));
+            key += '|';
+            for (const auto &name : cand.var_names) {
+                key += name;
+                key += ',';
+            }
+            key += '|';
+            for (uint64_t v : cand.sig) {
+                key += std::to_string(v);
+                key += ',';
+            }
+            key += '|';
+            if (cand.expr != nullptr) {
+                AppendExprKey(*cand.expr, key);
+            }
+            return key;
+        }
+
+        // CobraPass is constructed fresh for every pass-manager build, and
+        // hosts commonly re-optimize overlapping IR many times per lifting
+        // session, so the same MBA trees are rediscovered and re-solved over
+        // and over. The cache therefore outlives individual pass instances.
+        // Entries are keyed purely on candidate content, which makes them
+        // valid across functions and modules alike.
+        class OutcomeCache
+        {
+          public:
+            // A null entry records a candidate that every gate rejected; a
+            // missing entry means the candidate has not been solved yet.
+            // Entries are handed out as shared_ptr so a hit stays valid even
+            // if the cache is trimmed afterwards.
+            using Entry = std::shared_ptr< const CandidateOutcome >;
+
+            std::optional< Entry > Find(const std::string &key) const {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                auto it = entries_.find(key);
+                if (it == entries_.end()) {
+                    return std::nullopt;
+                }
+                return it->second;
+            }
+
+            Entry Insert(const std::string &key, Entry entry) {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                if (entries_.size() >= kMaxEntries) {
+                    entries_.clear();
+                }
+                entries_.insert_or_assign(key, entry);
+                return entry;
+            }
+
+          private:
+            // Bound the footprint on very large modules; the working set for a
+            // single function is orders of magnitude smaller than this.
+            static constexpr size_t kMaxEntries = 8192;
+
+            mutable std::mutex mutex_;
+            std::unordered_map< std::string, Entry > entries_;
+        };
+
+        OutcomeCache &SharedOutcomeCache() {
+            static OutcomeCache cache;
+            return cache;
+        }
+
+        // Run the full solve-and-verify pipeline for one candidate. Returns
+        // null when any gate rejects it.
+        OutcomeCache::Entry
+        SolveCandidate(const MBACandidate &cand, const CobraPassOptions &options) {
             Options opts{ .bitwidth   = cand.bitwidth,
-                          .max_vars   = options_.max_vars,
+                          .max_vars   = options.max_vars,
                           .spot_check = true,
                           .evaluator  = cand.evaluator };
 
@@ -55,7 +167,7 @@ namespace cobra {
                     llvm::dbgs() << "CoBRA: skipping candidate: " << result.error().message
                                  << "\n"
                 );
-                continue;
+                return nullptr;
             }
 
             if (result.value().kind != SimplifyOutcome::Kind::kSimplified) {
@@ -64,18 +176,18 @@ namespace cobra {
                     llvm::dbgs() << "CoBRA: not simplified: " << result.value().diag.reason
                                  << "\n"
                 );
-                continue;
+                return nullptr;
             }
 
 #ifdef COBRA_HAS_Z3
-            if (options_.z3_verify) {
+            if (options.z3_verify) {
                 if (ast == nullptr) {
                     ++NumSkippedUnsupported;
                     LLVM_DEBUG(
                         llvm::dbgs() << "CoBRA: skipping — Z3 verification requested but "
                                         "candidate AST is unavailable\n"
                     );
-                    continue;
+                    return nullptr;
                 }
 
                 auto z3_expr = CloneExpr(*result.value().expr);
@@ -86,14 +198,14 @@ namespace cobra {
                         llvm::dbgs() << "CoBRA: skipping — real_vars not contained in "
                                         "candidate variable set\n"
                     );
-                    continue;
+                    return nullptr;
                 }
                 if (!idx_map->empty()) {
                     RemapVarIndices(*z3_expr, *idx_map);
                 }
 
                 auto z3_result = Z3VerifyExprs(
-                    *ast, *z3_expr, cand.var_names, cand.bitwidth, options_.z3_settings
+                    *ast, *z3_expr, cand.var_names, cand.bitwidth, options.z3_settings
                 );
                 if (!z3_result.equivalent) {
                     ++NumSkippedUnsupported;
@@ -101,17 +213,17 @@ namespace cobra {
                         llvm::dbgs() << "CoBRA: skipping — Z3 verification failed: "
                                      << z3_result.counterexample << "\n"
                     );
-                    continue;
+                    return nullptr;
                 }
             }
 #else
-            if (options_.z3_verify) {
+            if (options.z3_verify) {
                 ++NumSkippedUnsupported;
                 LLVM_DEBUG(
                     llvm::dbgs() << "CoBRA: skipping — built without Z3 support but Z3 "
                                     "verification requested\n"
                 );
-                continue;
+                return nullptr;
             }
 #endif
 
@@ -127,15 +239,47 @@ namespace cobra {
                     LLVM_DEBUG(
                         llvm::dbgs() << "CoBRA: skipping — simplified form is not smaller\n"
                     );
-                    continue;
+                    return nullptr;
                 }
+            }
+
+            return std::make_shared< const CandidateOutcome >(
+                CandidateOutcome{ .expr      = std::move(result.value().expr),
+                                  .real_vars = std::move(result.value().real_vars) }
+            );
+        }
+
+    } // namespace
+
+    llvm::PreservedAnalyses
+    CobraPass::run(llvm::Function &f, llvm::FunctionAnalysisManager & /*AM*/) {
+        bool changed = false;
+
+        auto candidates = DetectMbaCandidates(f, options_.min_ast_size, options_.max_vars);
+
+        NumCandidates += candidates.size();
+
+        auto &cache = SharedOutcomeCache();
+
+        for (auto &cand : candidates) {
+            const std::string key = CandidateKey(cand, options_);
+
+            OutcomeCache::Entry outcome;
+            if (auto cached = cache.Find(key)) {
+                ++NumOutcomeCacheHits;
+                outcome = std::move(*cached);
+            } else {
+                outcome = cache.Insert(key, SolveCandidate(cand, options_));
+            }
+            if (outcome == nullptr) {
+                continue;
             }
 
             // Build variable index map for aux var elimination.
             // real_vars may be a subset of var_names with
             // reindexed positions.
             std::vector< uint32_t > var_map;
-            const auto &real_vars = result.value().real_vars;
+            const auto &real_vars = outcome->real_vars;
             if (!real_vars.empty() && real_vars.size() != cand.var_names.size()) {
                 auto checked_var_map = TryBuildVarSupport(cand.var_names, real_vars);
                 if (!checked_var_map.has_value()) {
@@ -150,16 +294,15 @@ namespace cobra {
             }
 
             llvm::IRBuilder<> builder(cand.root);
-            auto *new_val = ReconstructIr(*result.value().expr, cand, builder, var_map);
+            auto *new_val = ReconstructIr(*outcome->expr, cand, builder, var_map);
 
             cand.root->replaceAllUsesWith(new_val);
             ++NumSimplified;
             changed = true;
 
             LLVM_DEBUG(
-                llvm::dbgs()
-                << "CoBRA: simplified to "
-                << Render(*result.value().expr, result.value().real_vars, cand.bitwidth) << "\n"
+                llvm::dbgs() << "CoBRA: simplified to "
+                             << Render(*outcome->expr, real_vars, cand.bitwidth) << "\n"
             );
         }
 

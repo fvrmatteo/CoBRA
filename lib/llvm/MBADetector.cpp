@@ -120,104 +120,227 @@ namespace cobra {
             }
         }
 
-        uint64_t EvaluateTree(
-            llvm::Instruction *root,
-            const llvm::DenseMap< llvm::Value *, uint64_t > &assignments, uint32_t bitwidth,
-            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
-        ) {
-            llvm::DenseMap< llvm::Value *, uint64_t > cache;
-            llvm::DenseSet< llvm::Value * > in_progress;
-            uint64_t mask = Bitmask(bitwidth);
+        // Flattened, topologically ordered form of an MBA tree.
+        //
+        // Probe-based verification evaluates the same tree hundreds of
+        // thousands of times, so the operand walk is lowered to a slot vector
+        // once and each evaluation becomes a linear pass with no hashing and
+        // no allocation.
+        //
+        // Lowering follows operands depth-first, which is what makes the
+        // cycle rule below well defined: partially reconstructed trees can
+        // still contain operand or phi cycles, so a back edge onto a node
+        // that is still being lowered resolves to zero, while references
+        // discovered after that node completes see its real value.
+        class TreeEvalPlan
+        {
+          public:
+            static TreeEvalPlan Build(
+                llvm::Instruction *root, const std::vector< llvm::Value * > &leaves,
+                uint32_t bitwidth,
+                const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
+            ) {
+                TreeEvalPlan plan;
+                plan.mask_ = Bitmask(bitwidth);
 
-            std::function< uint64_t(llvm::Value *) > eval = [&](llvm::Value *v) -> uint64_t {
-                auto it = cache.find(v);
-                if (it != cache.end()) {
-                    return it->second;
+                llvm::DenseMap< llvm::Value *, uint32_t > leaf_index;
+                for (size_t i = 0; i < leaves.size(); ++i) {
+                    leaf_index.try_emplace(leaves[i], static_cast< uint32_t >(i));
                 }
 
-                auto ait = assignments.find(v);
-                if (ait != assignments.end()) {
-                    cache[v] = ait->second;
-                    return ait->second;
+                // Slot 0 holds a literal zero. It backs both cycle back edges
+                // and unsupported opcodes, which fold to zero.
+                plan.consts_.push_back(0);
+                plan.nodes_.push_back(Node{ .op = Op::kConst, .a = 0, .b = 0 });
+
+                llvm::DenseMap< llvm::Value *, uint32_t > slot_of;
+                llvm::DenseSet< llvm::Value * > in_progress;
+                plan.Lower(root, leaf_index, phi_redirects, slot_of, in_progress);
+                plan.root_ = slot_of.lookup(root);
+                return plan;
+            }
+
+            size_t SlotCount() const { return nodes_.size(); }
+
+            uint64_t Evaluate(
+                const uint64_t *inputs, size_t num_inputs, std::vector< uint64_t > &slots
+            ) const {
+                if (slots.size() < nodes_.size()) {
+                    slots.resize(nodes_.size());
+                }
+                const uint64_t mask = mask_;
+                for (size_t i = 0; i < nodes_.size(); ++i) {
+                    const Node &n = nodes_[i];
+                    switch (n.op) {
+                        case Op::kConst:
+                            slots[i] = consts_[n.a];
+                            break;
+                        case Op::kInput:
+                            slots[i] = n.a < num_inputs ? inputs[n.a] : 0;
+                            break;
+                        case Op::kMask:
+                            slots[i] = slots[n.a] & mask;
+                            break;
+                        case Op::kAdd:
+                            slots[i] = (slots[n.a] + slots[n.b]) & mask;
+                            break;
+                        case Op::kSub:
+                            slots[i] = (slots[n.a] - slots[n.b]) & mask;
+                            break;
+                        case Op::kMul:
+                            slots[i] = (slots[n.a] * slots[n.b]) & mask;
+                            break;
+                        case Op::kAnd:
+                            slots[i] = (slots[n.a] & slots[n.b]) & mask;
+                            break;
+                        case Op::kOr:
+                            slots[i] = (slots[n.a] | slots[n.b]) & mask;
+                            break;
+                        case Op::kXor:
+                            slots[i] = (slots[n.a] ^ slots[n.b]) & mask;
+                            break;
+                        case Op::kShl:
+                            slots[i] = ShiftLeft(slots[n.a], slots[n.b]) & mask;
+                            break;
+                        case Op::kLShr:
+                            slots[i] = ShiftRight(slots[n.a], slots[n.b]) & mask;
+                            break;
+                    }
+                }
+                return slots[root_];
+            }
+
+          private:
+            enum class Op : uint8_t {
+                kConst,
+                kInput,
+                kMask,
+                kAdd,
+                kSub,
+                kMul,
+                kAnd,
+                kOr,
+                kXor,
+                kShl,
+                kLShr,
+            };
+
+            struct Node
+            {
+                Op op;
+                uint32_t a;
+                uint32_t b;
+            };
+
+            // Shift amounts come from an evaluated operand, so they are not
+            // bounded by the type width. Saturate instead of shifting out of
+            // range, matching ModShr's treatment of oversized amounts.
+            static uint64_t ShiftLeft(uint64_t v, uint64_t amount) {
+                return amount >= 64 ? 0 : v << amount;
+            }
+
+            static uint64_t ShiftRight(uint64_t v, uint64_t amount) {
+                return amount >= 64 ? 0 : v >> amount;
+            }
+
+            uint32_t Emit(Op op, uint32_t a, uint32_t b) {
+                auto slot = static_cast< uint32_t >(nodes_.size());
+                nodes_.push_back(Node{ .op = op, .a = a, .b = b });
+                return slot;
+            }
+
+            uint32_t Lower(
+                llvm::Value *v, const llvm::DenseMap< llvm::Value *, uint32_t > &leaf_index,
+                const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+                llvm::DenseMap< llvm::Value *, uint32_t > &slot_of,
+                llvm::DenseSet< llvm::Value * > &in_progress
+            ) {
+                auto known = slot_of.find(v);
+                if (known != slot_of.end()) {
+                    return known->second;
+                }
+
+                auto leaf = leaf_index.find(v);
+                if (leaf != leaf_index.end()) {
+                    const uint32_t slot = Emit(Op::kInput, leaf->second, 0);
+                    slot_of[v]          = slot;
+                    return slot;
                 }
 
                 if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(v)) {
-                    const uint64_t val = ci->getZExtValue() & mask;
-                    cache[v]           = val;
-                    return val;
+                    const auto index = static_cast< uint32_t >(consts_.size());
+                    consts_.push_back(ci->getZExtValue() & mask_);
+                    const uint32_t slot = Emit(Op::kConst, index, 0);
+                    slot_of[v]          = slot;
+                    return slot;
                 }
 
-                // Some partially reconstructed MBA trees can still contain
-                // operand/phi cycles. Those are unsupported for constant
-                // evaluation, so stop recursion and conservatively fold the
-                // cyclic sub-expression to zero instead of recursing forever.
                 if (!in_progress.insert(v).second) {
-                    cache[v] = 0;
-                    return 0;
+                    slot_of[v] = kZeroSlot;
+                    return kZeroSlot;
                 }
 
-                uint64_t result = 0;
+                const uint32_t slot =
+                    LowerOperands(v, leaf_index, phi_redirects, slot_of, in_progress);
+                slot_of[v] = slot;
+                in_progress.erase(v);
+                return slot;
+            }
 
-                // Phi redirect: follow the chosen arm.
-                auto pit = phi_redirects.find(v);
-                if (pit != phi_redirects.end()) {
-                    result   = eval(pit->second);
-                    cache[v] = result;
-                    in_progress.erase(v);
-                    return result;
+            uint32_t LowerOperands(
+                llvm::Value *v, const llvm::DenseMap< llvm::Value *, uint32_t > &leaf_index,
+                const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+                llvm::DenseMap< llvm::Value *, uint32_t > &slot_of,
+                llvm::DenseSet< llvm::Value * > &in_progress
+            ) {
+                auto lower = [&](llvm::Value *operand) {
+                    return Lower(operand, leaf_index, phi_redirects, slot_of, in_progress);
+                };
+
+                auto redirect = phi_redirects.find(v);
+                if (redirect != phi_redirects.end()) {
+                    return lower(redirect->second);
                 }
 
                 auto *inst = llvm::cast< llvm::Instruction >(v);
-
                 if (inst->getOpcode() == llvm::Instruction::ZExt
                     || inst->getOpcode() == llvm::Instruction::SExt)
                 {
-                    result   = eval(inst->getOperand(0)) & mask;
-                    cache[v] = result;
-                    in_progress.erase(v);
-                    return result;
+                    return Emit(Op::kMask, lower(inst->getOperand(0)), 0);
                 }
 
-                const uint64_t lhs = eval(inst->getOperand(0));
-                const uint64_t rhs = eval(inst->getOperand(1));
+                const uint32_t lhs = lower(inst->getOperand(0));
+                const uint32_t rhs = lower(inst->getOperand(1));
 
                 switch (inst->getOpcode()) {
                     case llvm::Instruction::Add:
-                        result = ModAdd(lhs, rhs, bitwidth);
-                        break;
+                        return Emit(Op::kAdd, lhs, rhs);
                     case llvm::Instruction::Sub:
-                        result = ModSub(lhs, rhs, bitwidth);
-                        break;
+                        return Emit(Op::kSub, lhs, rhs);
                     case llvm::Instruction::Mul:
-                        result = ModMul(lhs, rhs, bitwidth);
-                        break;
+                        return Emit(Op::kMul, lhs, rhs);
                     case llvm::Instruction::And:
-                        result = (lhs & rhs) & mask;
-                        break;
+                        return Emit(Op::kAnd, lhs, rhs);
                     case llvm::Instruction::Or:
-                        result = (lhs | rhs) & mask;
-                        break;
+                        return Emit(Op::kOr, lhs, rhs);
                     case llvm::Instruction::Xor:
-                        result = (lhs ^ rhs) & mask;
-                        break;
+                        return Emit(Op::kXor, lhs, rhs);
                     case llvm::Instruction::LShr:
-                        result = (lhs >> rhs) & mask;
-                        break;
+                        return Emit(Op::kLShr, lhs, rhs);
                     case llvm::Instruction::Shl:
-                        result = (lhs << rhs) & mask;
-                        break;
+                        return Emit(Op::kShl, lhs, rhs);
                     default:
-                        result = 0;
-                        break;
+                        return kZeroSlot;
                 }
+            }
 
-                cache[v] = result;
-                in_progress.erase(v);
-                return result;
-            };
+            static constexpr uint32_t kZeroSlot = 0;
 
-            return eval(root);
-        }
+            std::vector< Node > nodes_;
+            std::vector< uint64_t > consts_;
+            uint32_t root_ = kZeroSlot;
+            uint64_t mask_ = UINT64_MAX;
+        };
 
         bool HasPolynomialMul(
             llvm::Instruction *root, const llvm::DenseSet< llvm::Value * > &visited_tree
@@ -469,16 +592,30 @@ namespace cobra {
                 leaf_set.insert(lv);
             }
 
+            // Arms recur across probes and across phis, so each one is
+            // lowered at most once.
+            llvm::DenseMap< llvm::Value *, TreeEvalPlan > arm_plans;
+            auto plan_for = [&](llvm::Value *arm) -> const TreeEvalPlan & {
+                auto [it, inserted] = arm_plans.try_emplace(arm);
+                if (inserted) {
+                    it->second = TreeEvalPlan::Build(
+                        llvm::cast< llvm::Instruction >(arm), leaves, bitwidth, phi_redirects
+                    );
+                }
+                return it->second;
+            };
+
             // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp)
             std::mt19937_64 rng(0xC0B7A);
+            std::vector< uint64_t > inputs(leaves.size());
+            std::vector< uint64_t > slots;
 
             for (const auto &[phi_val, chosen] : phi_redirects) {
                 auto *phi = llvm::cast< llvm::PHINode >(phi_val);
 
                 for (uint32_t probe = 0; probe < kNumProbes; ++probe) {
-                    llvm::DenseMap< llvm::Value *, uint64_t > assignments;
-                    for (auto *leaf : leaves) {
-                        assignments[leaf] = rng() & mask;
+                    for (uint64_t &input : inputs) {
+                        input = rng() & mask;
                     }
 
                     // Evaluate chosen arm.
@@ -486,10 +623,8 @@ namespace cobra {
                     if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(chosen)) {
                         chosen_val = ci->getZExtValue() & mask;
                     } else {
-                        chosen_val = EvaluateTree(
-                            llvm::cast< llvm::Instruction >(chosen), assignments, bitwidth,
-                            phi_redirects
-                        );
+                        chosen_val =
+                            plan_for(chosen).Evaluate(inputs.data(), inputs.size(), slots);
                     }
 
                     // Check every other arm.
@@ -508,10 +643,8 @@ namespace cobra {
                         if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(inc)) {
                             inc_val = ci->getZExtValue() & mask;
                         } else {
-                            inc_val = EvaluateTree(
-                                llvm::cast< llvm::Instruction >(inc), assignments, bitwidth,
-                                phi_redirects
-                            );
+                            inc_val =
+                                plan_for(inc).Evaluate(inputs.data(), inputs.size(), slots);
                         }
 
                         if (inc_val != chosen_val) {
@@ -599,12 +732,17 @@ namespace cobra {
                 const size_t sig_len = 1ULL << num_vars;
                 std::vector< uint64_t > sig(sig_len);
 
+                auto plan = std::make_shared< const TreeEvalPlan >(
+                    TreeEvalPlan::Build(&inst, leaves, bw, phi_redirects)
+                );
+
+                std::vector< uint64_t > inputs(num_vars);
+                std::vector< uint64_t > slots(plan->SlotCount());
                 for (size_t i = 0; i < sig_len; ++i) {
-                    llvm::DenseMap< llvm::Value *, uint64_t > assignments;
                     for (uint32_t v = 0; v < num_vars; ++v) {
-                        assignments[leaves[v]] = (i >> v) & 1;
+                        inputs[v] = (i >> v) & 1;
                     }
-                    sig[i] = EvaluateTree(&inst, assignments, bw, phi_redirects);
+                    sig[i] = plan->Evaluate(inputs.data(), num_vars, slots);
                 }
 
                 std::vector< std::string > var_names;
@@ -619,20 +757,17 @@ namespace cobra {
                 const uint64_t mask = Bitmask(bw);
                 auto expr = BuildExprFromIR(&inst, leaves, tree_set, mask, phi_redirects);
 
-                // Build evaluator lambda for full-width verification.
-                // Captures raw pointers to LLVM Values which remain valid
-                // for the lifetime of the function being processed.
+                // Build evaluator lambda for full-width verification.  The
+                // plan is shared rather than captured by value so that copying
+                // the Evaluator stays cheap; the per-call slot buffer is
+                // mutable state owned by the closure, matching the Evaluator
+                // thread-safety contract.
                 Evaluator evaluator;
                 if (expr != nullptr) {
-                    evaluator = [root_inst = &inst, leaf_vals = leaves, bitwidth = bw,
-                                 redirects = phi_redirects](
+                    evaluator = [plan, scratch = std::vector< uint64_t >(plan->SlotCount())](
                                     const std::vector< uint64_t > &vals
-                                ) -> uint64_t {
-                        llvm::DenseMap< llvm::Value *, uint64_t > assignments;
-                        for (size_t i = 0; i < leaf_vals.size(); ++i) {
-                            assignments[leaf_vals[i]] = vals[i];
-                        }
-                        return EvaluateTree(root_inst, assignments, bitwidth, redirects);
+                                ) mutable -> uint64_t {
+                        return plan->Evaluate(vals.data(), vals.size(), scratch);
                     };
                 }
 
