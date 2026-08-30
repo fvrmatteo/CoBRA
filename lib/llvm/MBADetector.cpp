@@ -725,9 +725,9 @@ namespace cobra {
         }
 
         // 2. Context targets: pointer offsets of loads/stores, store value
-        // operands, return operands and icmp operands.
+        // operands, return operands, icmp operands and inttoptr sources.
         const uint32_t context_mask = kMbaCtxLoadPtr | kMbaCtxStorePtr | kMbaCtxStoreValue
-                                      | kMbaCtxReturn | kMbaCtxICmp;
+                                      | kMbaCtxReturn | kMbaCtxICmp | kMbaCtxIntToPtr;
         if ((contexts & context_mask) != 0u) {
             for (auto &bb : f) {
                 for (auto &inst : bb) {
@@ -767,6 +767,14 @@ namespace cobra {
                                 if (auto *op_inst = llvm::dyn_cast< llvm::Instruction >(op)) {
                                     emit(op_inst);
                                 }
+                            }
+                        }
+                    } else if (auto *I2P = llvm::dyn_cast< llvm::IntToPtrInst >(&inst)) {
+                        if ((contexts & kMbaCtxIntToPtr) != 0u) {
+                            if (auto *op =
+                                    llvm::dyn_cast< llvm::Instruction >(I2P->getOperand(0)))
+                            {
+                                emit(op);
                             }
                         }
                     }

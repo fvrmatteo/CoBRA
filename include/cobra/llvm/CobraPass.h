@@ -18,6 +18,7 @@ namespace cobra {
         kMbaCtxStoreValue = 1u << 3, // Integer value operand of a store.
         kMbaCtxReturn     = 1u << 4, // Integer operand of a return.
         kMbaCtxICmp       = 1u << 5, // Integer operands of an icmp.
+        kMbaCtxIntToPtr   = 1u << 6, // Integer source of an inttoptr.
     };
 
     struct CobraPassOptions

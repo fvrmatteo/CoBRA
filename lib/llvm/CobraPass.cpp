@@ -56,8 +56,8 @@ llvm::cl::list< std::string > CobraTargetContexts(
     "cobra-target-context",
     llvm::cl::desc(
         "Additional roots to run CoBRA on: binaryop, loadptr, storeptr, storevalue, return, "
-        "icmp. Repeatable or comma-separated. Defaults to binaryop (plus whatever is set "
-        "programmatically in CobraPassOptions)."
+        "icmp, inttoptr. Repeatable or comma-separated. Defaults to binaryop (plus whatever is "
+        "set programmatically in CobraPassOptions)."
     ),
     llvm::cl::value_desc("context"), llvm::cl::CommaSeparated
 );
@@ -93,6 +93,7 @@ namespace {
             .Case("storevalue", cobra::kMbaCtxStoreValue)
             .Case("return", cobra::kMbaCtxReturn)
             .Case("icmp", cobra::kMbaCtxICmp)
+            .Case("inttoptr", cobra::kMbaCtxIntToPtr)
             .Default(0);
     }
 
