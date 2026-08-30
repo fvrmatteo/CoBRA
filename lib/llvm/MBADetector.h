@@ -2,8 +2,10 @@
 
 #include "cobra/core/Expr.h"
 #include "cobra/core/Simplifier.h"
+#include "cobra/llvm/CobraPass.h"
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -30,7 +32,13 @@ namespace cobra {
     // PHI nodes are treated as transparent when all incoming values
     // are MBA opcodes and evaluate identically; otherwise the PHI
     // becomes a leaf.
+    //
+    // `opcodes` restricts which MBA opcodes produce roots (empty = all
+    // supported MBA opcodes). `contexts` is an MbaTargetContext bitmask
+    // selecting which additional roots to collect.
     std::vector< MBACandidate >
-    DetectMbaCandidates(llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars);
+    DetectMbaCandidates(llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars,
+                        const std::set< unsigned > &opcodes = {},
+                        uint32_t contexts = kMbaCtxBinaryOp);
 
 } // namespace cobra

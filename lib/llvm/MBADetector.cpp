@@ -13,6 +13,7 @@
 #include "llvm/Support/Casting.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -37,8 +38,10 @@ namespace cobra {
                 case llvm::Instruction::Xor:
                 case llvm::Instruction::Shl:
                 case llvm::Instruction::LShr:
+                case llvm::Instruction::AShr:
                 case llvm::Instruction::ZExt:
                 case llvm::Instruction::SExt:
+                case llvm::Instruction::Trunc:
                     return true;
                 default:
                     return false;
@@ -69,9 +72,10 @@ namespace cobra {
 
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
                 if ((inst != nullptr) && IsMbaOpcode(inst->getOpcode())) {
-                    // LShr with variable shift amount is unsupported —
+                    // LShr/AShr with a variable shift amount is unsupported —
                     // treat the whole instruction as a leaf.
-                    if (inst->getOpcode() == llvm::Instruction::LShr
+                    const auto opcode = inst->getOpcode();
+                    if ((opcode == llvm::Instruction::LShr || opcode == llvm::Instruction::AShr)
                         && !llvm::isa< llvm::ConstantInt >(inst->getOperand(1)))
                     {
                         if (std::find(leaves.begin(), leaves.end(), v) == leaves.end()) {
@@ -178,6 +182,15 @@ namespace cobra {
                     return result;
                 }
 
+                // Truncation keeps only the low bits of the operand.
+                if (inst->getOpcode() == llvm::Instruction::Trunc) {
+                    const uint32_t dest_bw = inst->getType()->getIntegerBitWidth();
+                    result                 = eval(inst->getOperand(0)) & Bitmask(dest_bw);
+                    cache[v]               = result;
+                    in_progress.erase(v);
+                    return result;
+                }
+
                 const uint64_t lhs = eval(inst->getOperand(0));
                 const uint64_t rhs = eval(inst->getOperand(1));
 
@@ -203,6 +216,15 @@ namespace cobra {
                     case llvm::Instruction::LShr:
                         result = (lhs >> rhs) & mask;
                         break;
+                    case llvm::Instruction::AShr: {
+                        // Arithmetic shift right: logical shift plus sign-fill.
+                        result = (lhs >> rhs) & mask;
+                        const uint64_t sign_bit = 1ULL << (bitwidth - 1);
+                        if (rhs != 0 && (lhs & sign_bit) != 0) {
+                            result |= (~0ULL << (bitwidth - rhs)) & mask;
+                        }
+                        break;
+                    }
                     case llvm::Instruction::Shl:
                         result = (lhs << rhs) & mask;
                         break;
@@ -338,6 +360,15 @@ namespace cobra {
                 );
             }
 
+            // Trunc — keep only the low `dest_bw` bits.
+            if (inst->getOpcode() == llvm::Instruction::Trunc) {
+                const uint32_t dest_bw = inst->getType()->getIntegerBitWidth();
+                auto child =
+                    BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
+                if (child == nullptr) { return nullptr; }
+                return Expr::BitwiseAnd(std::move(child), Expr::Constant(Bitmask(dest_bw)));
+            }
+
             // LShr with constant shift amount
             if (inst->getOpcode() == llvm::Instruction::LShr) {
                 auto *shift_amt = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
@@ -361,6 +392,26 @@ namespace cobra {
                 if (child == nullptr) { return nullptr; }
                 uint64_t mul_val = 1ULL << shift_amt->getZExtValue();
                 return Expr::Mul(std::move(child), Expr::Constant(mul_val));
+            }
+
+            // AShr with constant shift amount: arithmetic shift = logical
+            // shift plus a sign-fill of the vacated high bits.
+            if (inst->getOpcode() == llvm::Instruction::AShr) {
+                auto *shift_amt = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
+                if (shift_amt == nullptr) { return nullptr; }
+                const uint64_t k = shift_amt->getZExtValue();
+                auto child =
+                    BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
+                if (child == nullptr) { return nullptr; }
+
+                const uint32_t bw = static_cast< uint32_t >(std::bit_width(mask));
+                // mask & ~Bitmask(bw-k) = bits [bw-k, bw) set.
+                const uint64_t sign_fill = mask & ~Bitmask(bw - k);
+                auto logical  = Expr::LogicalShr(CloneExpr(*child), k);
+                auto sign     = Expr::LogicalShr(CloneExpr(*child), bw - 1);
+                auto neg_sign = Expr::Negate(std::move(sign));
+                auto masked   = Expr::BitwiseAnd(std::move(neg_sign), Expr::Constant(sign_fill));
+                return Expr::BitwiseOr(std::move(logical), std::move(masked));
             }
 
             // Binary operations
@@ -525,126 +576,201 @@ namespace cobra {
 
     } // namespace
 
-    std::vector< MBACandidate >
-    DetectMbaCandidates(llvm::Function &f, uint32_t min_ast_size, uint32_t /*max_vars*/) {
+    std::vector< MBACandidate > DetectMbaCandidates(
+        llvm::Function &f, uint32_t min_ast_size, uint32_t /*max_vars*/,
+        const std::set< unsigned > &opcodes, uint32_t contexts
+    ) {
         std::vector< MBACandidate > candidates;
         llvm::DenseSet< llvm::Instruction * > already_in_tree;
 
-        // Post-order: process uses before defs across blocks.
-        // Within each block, reverse iteration hits outermost roots
-        // first, so the largest MBA tree claims inner nodes before
-        // they can be emitted as standalone candidates.
-        for (auto *bb : post_order(&f)) {
-            for (auto &inst : llvm::reverse(*bb)) {
-                if (!IsMbaOpcode(inst.getOpcode())) {
-                    continue;
-                }
-                if (already_in_tree.contains(&inst) != 0u) {
-                    continue;
-                }
+        constexpr uint32_t kPreElimCap = 20;
 
-                if (!inst.getType()->isIntegerTy()) {
-                    continue;
-                }
-                const uint32_t bw = inst.getType()->getIntegerBitWidth();
-                if (bw > 64) {
-                    continue;
-                }
+        // Build and append a candidate rooted at `root` (an integer
+        // instruction). Claims the whole collected subtree so it is not
+        // emitted again as a standalone candidate.
+        auto emit = [&](llvm::Instruction *root) {
+            if (already_in_tree.contains(root) != 0u) {
+                return;
+            }
+            if (!root->getType()->isIntegerTy()) {
+                return;
+            }
+            const uint32_t bw = root->getType()->getIntegerBitWidth();
+            if (bw > 64) {
+                return;
+            }
 
-                llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
-                std::vector< llvm::Value * > leaves;
-                llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
-                CollectTree(&inst, tree_insts, leaves, phi_redirects);
+            llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
+            std::vector< llvm::Value * > leaves;
+            llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
+            CollectTree(root, tree_insts, leaves, phi_redirects);
+
+            if (tree_insts.size() < min_ast_size) {
+                return;
+            }
+            if (leaves.size() > kPreElimCap) {
+                return;
+            }
+
+            const llvm::DenseSet< llvm::Value * > tree_set(tree_insts.begin(), tree_insts.end());
+            if (HasPolynomialMul(root, tree_set)) {
+                return;
+            }
+
+            // Verify transparent phis — if any arm diverges, re-collect
+            // without phi transparency.
+            if (!phi_redirects.empty() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
+                tree_insts.clear();
+                leaves.clear();
+                phi_redirects.clear();
+                CollectTree(
+                    root, tree_insts, leaves, phi_redirects, /*try_phi_transparency=*/false
+                );
 
                 if (tree_insts.size() < min_ast_size) {
-                    continue;
+                    return;
                 }
-
-                constexpr uint32_t kPreElimCap = 20;
                 if (leaves.size() > kPreElimCap) {
-                    continue;
+                    return;
                 }
+            }
 
-                const llvm::DenseSet< llvm::Value * > tree_set(
-                    tree_insts.begin(), tree_insts.end()
-                );
-                if (HasPolynomialMul(&inst, tree_set)) {
-                    continue;
-                }
+            for (auto *ti : tree_insts) {
+                already_in_tree.insert(ti);
+            }
 
-                // Verify transparent phis — if any arm diverges,
-                // re-collect without phi transparency.
-                if (!phi_redirects.empty() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
-                    tree_insts.clear();
-                    leaves.clear();
-                    phi_redirects.clear();
-                    CollectTree(
-                        &inst, tree_insts, leaves, phi_redirects,
-                        /*try_phi_transparency=*/false
-                    );
+            const auto num_vars  = static_cast< uint32_t >(leaves.size());
+            const size_t sig_len = 1ULL << num_vars;
+            std::vector< uint64_t > sig(sig_len);
 
-                    if (tree_insts.size() < min_ast_size) {
-                        continue;
-                    }
-                    if (leaves.size() > kPreElimCap) {
-                        continue;
-                    }
-                }
-
-                for (auto *ti : tree_insts) {
-                    already_in_tree.insert(ti);
-                }
-
-                const auto num_vars  = static_cast< uint32_t >(leaves.size());
-                const size_t sig_len = 1ULL << num_vars;
-                std::vector< uint64_t > sig(sig_len);
-
-                for (size_t i = 0; i < sig_len; ++i) {
-                    llvm::DenseMap< llvm::Value *, uint64_t > assignments;
-                    for (uint32_t v = 0; v < num_vars; ++v) {
-                        assignments[leaves[v]] = (i >> v) & 1;
-                    }
-                    sig[i] = EvaluateTree(&inst, assignments, bw, phi_redirects);
-                }
-
-                std::vector< std::string > var_names;
+            for (size_t i = 0; i < sig_len; ++i) {
+                llvm::DenseMap< llvm::Value *, uint64_t > assignments;
                 for (uint32_t v = 0; v < num_vars; ++v) {
-                    if (leaves[v]->hasName()) {
-                        var_names.push_back(leaves[v]->getName().str());
-                    } else {
-                        var_names.push_back("v" + std::to_string(v));
+                    assignments[leaves[v]] = (i >> v) & 1;
+                }
+                sig[i] = EvaluateTree(root, assignments, bw, phi_redirects);
+            }
+
+            std::vector< std::string > var_names;
+            for (uint32_t v = 0; v < num_vars; ++v) {
+                if (leaves[v]->hasName()) {
+                    var_names.push_back(leaves[v]->getName().str());
+                } else {
+                    var_names.push_back("v" + std::to_string(v));
+                }
+            }
+
+            const uint64_t mask = Bitmask(bw);
+            auto expr           = BuildExprFromIR(root, leaves, tree_set, mask, phi_redirects);
+
+            // Build evaluator lambda for full-width verification.
+            // Captures raw pointers to LLVM Values which remain valid
+            // for the lifetime of the function being processed.
+            Evaluator evaluator;
+            if (expr != nullptr) {
+                evaluator = [root_inst = root, leaf_vals = leaves, bitwidth = bw,
+                             redirects = phi_redirects](
+                                const std::vector< uint64_t > &vals
+                            ) -> uint64_t {
+                    llvm::DenseMap< llvm::Value *, uint64_t > assignments;
+                    for (size_t i = 0; i < leaf_vals.size(); ++i) {
+                        assignments[leaf_vals[i]] = vals[i];
+                    }
+                    return EvaluateTree(root_inst, assignments, bitwidth, redirects);
+                };
+            }
+
+            candidates.push_back(
+                MBACandidate{ .root        = root,
+                              .leaf_values = std::move(leaves),
+                              .var_names   = std::move(var_names),
+                              .sig         = std::move(sig),
+                              .bitwidth    = bw,
+                              .expr        = std::move(expr),
+                              .evaluator   = std::move(evaluator) }
+            );
+        };
+
+        // Integer offset of a load/store pointer: the single index of a
+        // getelementptr (the decompiler's "ptradd" form) or the source of an
+        // inttoptr. Returns nullptr for constants and unsupported pointers.
+        auto get_pointer_offset = [](llvm::Value *ptr) -> llvm::Value * {
+            if (auto *G = llvm::dyn_cast< llvm::GetElementPtrInst >(ptr)) {
+                if (G->getNumIndices() != 1) {
+                    return nullptr;
+                }
+                return G->getOperand(1);
+            }
+            if (auto *I2P = llvm::dyn_cast< llvm::IntToPtrInst >(ptr)) {
+                return I2P->getOperand(0);
+            }
+            return nullptr;
+        };
+
+        // 1. MBA opcode roots. Post-order + reverse iteration hits the
+        // outermost roots first, so the largest tree claims inner nodes
+        // before they can be emitted as standalone candidates.
+        if ((contexts & kMbaCtxBinaryOp) != 0u) {
+            for (auto *bb : post_order(&f)) {
+                for (auto &inst : llvm::reverse(*bb)) {
+                    if (!IsMbaOpcode(inst.getOpcode())) {
+                        continue;
+                    }
+                    if (!opcodes.empty() && !opcodes.contains(inst.getOpcode())) {
+                        continue;
+                    }
+                    emit(&inst);
+                }
+            }
+        }
+
+        // 2. Context targets: pointer offsets of loads/stores, store value
+        // operands, return operands and icmp operands.
+        const uint32_t context_mask = kMbaCtxLoadPtr | kMbaCtxStorePtr | kMbaCtxStoreValue
+                                      | kMbaCtxReturn | kMbaCtxICmp;
+        if ((contexts & context_mask) != 0u) {
+            for (auto &bb : f) {
+                for (auto &inst : bb) {
+                    if (auto *L = llvm::dyn_cast< llvm::LoadInst >(&inst)) {
+                        if ((contexts & kMbaCtxLoadPtr) != 0u) {
+                            if (auto *off = get_pointer_offset(L->getPointerOperand())) {
+                                if (auto *off_inst = llvm::dyn_cast< llvm::Instruction >(off)) {
+                                    emit(off_inst);
+                                }
+                            }
+                        }
+                    } else if (auto *S = llvm::dyn_cast< llvm::StoreInst >(&inst)) {
+                        if ((contexts & kMbaCtxStorePtr) != 0u) {
+                            if (auto *off = get_pointer_offset(S->getPointerOperand())) {
+                                if (auto *off_inst = llvm::dyn_cast< llvm::Instruction >(off)) {
+                                    emit(off_inst);
+                                }
+                            }
+                        }
+                        if ((contexts & kMbaCtxStoreValue) != 0u) {
+                            if (auto *val =
+                                    llvm::dyn_cast< llvm::Instruction >(S->getValueOperand()))
+                            {
+                                emit(val);
+                            }
+                        }
+                    } else if (auto *R = llvm::dyn_cast< llvm::ReturnInst >(&inst)) {
+                        if ((contexts & kMbaCtxReturn) != 0u) {
+                            if (auto *op = llvm::dyn_cast< llvm::Instruction >(R->getReturnValue()))
+                            {
+                                emit(op);
+                            }
+                        }
+                    } else if (auto *C = llvm::dyn_cast< llvm::ICmpInst >(&inst)) {
+                        if ((contexts & kMbaCtxICmp) != 0u) {
+                            for (auto *op : { C->getOperand(0), C->getOperand(1) }) {
+                                if (auto *op_inst = llvm::dyn_cast< llvm::Instruction >(op)) {
+                                    emit(op_inst);
+                                }
+                            }
+                        }
                     }
                 }
-
-                const uint64_t mask = Bitmask(bw);
-                auto expr = BuildExprFromIR(&inst, leaves, tree_set, mask, phi_redirects);
-
-                // Build evaluator lambda for full-width verification.
-                // Captures raw pointers to LLVM Values which remain valid
-                // for the lifetime of the function being processed.
-                Evaluator evaluator;
-                if (expr != nullptr) {
-                    evaluator = [root_inst = &inst, leaf_vals = leaves, bitwidth = bw,
-                                 redirects = phi_redirects](
-                                    const std::vector< uint64_t > &vals
-                                ) -> uint64_t {
-                        llvm::DenseMap< llvm::Value *, uint64_t > assignments;
-                        for (size_t i = 0; i < leaf_vals.size(); ++i) {
-                            assignments[leaf_vals[i]] = vals[i];
-                        }
-                        return EvaluateTree(root_inst, assignments, bitwidth, redirects);
-                    };
-                }
-
-                candidates.push_back(
-                    MBACandidate{ .root        = &inst,
-                                  .leaf_values = std::move(leaves),
-                                  .var_names   = std::move(var_names),
-                                  .sig         = std::move(sig),
-                                  .bitwidth    = bw,
-                                  .expr        = std::move(expr),
-                                  .evaluator   = std::move(evaluator) }
-                );
             }
         }
 

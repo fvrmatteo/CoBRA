@@ -12,6 +12,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/IR/Analysis.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -24,6 +25,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -41,7 +43,58 @@ llvm::cl::opt< bool > CobraLogSkips(
     llvm::cl::value_desc("cobra-log-skips"), llvm::cl::init(false), llvm::cl::Optional
 );
 
+llvm::cl::list< std::string > CobraTargetOpcodes(
+    "cobra-target-opcode",
+    llvm::cl::desc(
+        "Only run CoBRA on these opcodes (add, sub, mul, and, or, xor, shl, lshr, ashr, zext, "
+        "sext, trunc). Repeatable or comma-separated. Empty means all supported opcodes."
+    ),
+    llvm::cl::value_desc("opcode"), llvm::cl::CommaSeparated
+);
+
+llvm::cl::list< std::string > CobraTargetContexts(
+    "cobra-target-context",
+    llvm::cl::desc(
+        "Additional roots to run CoBRA on: binaryop, loadptr, storeptr, storevalue, return, "
+        "icmp. Repeatable or comma-separated. Defaults to binaryop (plus whatever is set "
+        "programmatically in CobraPassOptions)."
+    ),
+    llvm::cl::value_desc("context"), llvm::cl::CommaSeparated
+);
+
 namespace {
+
+    // Map a lower-case LLVM opcode name to its numeric opcode. Returns 0 for
+    // unknown names, mirroring the MBA opcodes accepted by DetectMbaCandidates.
+    unsigned OpcodeFromName(llvm::StringRef name) {
+        return llvm::StringSwitch< unsigned >(name)
+            .Case("add", llvm::Instruction::Add)
+            .Case("sub", llvm::Instruction::Sub)
+            .Case("mul", llvm::Instruction::Mul)
+            .Case("and", llvm::Instruction::And)
+            .Case("or", llvm::Instruction::Or)
+            .Case("xor", llvm::Instruction::Xor)
+            .Case("shl", llvm::Instruction::Shl)
+            .Case("lshr", llvm::Instruction::LShr)
+            .Case("ashr", llvm::Instruction::AShr)
+            .Case("zext", llvm::Instruction::ZExt)
+            .Case("sext", llvm::Instruction::SExt)
+            .Case("trunc", llvm::Instruction::Trunc)
+            .Default(0);
+    }
+
+    // Map a context name to its MbaTargetContext flag. Returns 0 for unknown
+    // names.
+    uint32_t ContextFromName(llvm::StringRef name) {
+        return llvm::StringSwitch< uint32_t >(name)
+            .Case("binaryop", cobra::kMbaCtxBinaryOp)
+            .Case("loadptr", cobra::kMbaCtxLoadPtr)
+            .Case("storeptr", cobra::kMbaCtxStorePtr)
+            .Case("storevalue", cobra::kMbaCtxStoreValue)
+            .Case("return", cobra::kMbaCtxReturn)
+            .Case("icmp", cobra::kMbaCtxICmp)
+            .Default(0);
+    }
 
     // 64-bit FNV-1a hash of a candidate's semantic signature.  Candidates
     // that agree on bitwidth, variable count and the full truth table are
@@ -94,7 +147,32 @@ namespace cobra {
         bool changed = false;
         size_t skipped_unchanged = 0;
 
-        auto candidates = DetectMbaCandidates(f, options_.min_ast_size, options_.max_vars);
+        // Resolve the set of opcodes CoBRA is allowed to simplify: the union of
+        // the programmatic options and the command-line flag. An empty set means
+        // "all supported MBA opcodes".
+        std::set< unsigned > target_opcodes = options_.target_opcodes;
+        for (const auto &name : CobraTargetOpcodes) {
+            if (const unsigned op = OpcodeFromName(name); op != 0) {
+                target_opcodes.insert(op);
+            } else {
+                llvm::errs() << "CoBRA: unknown target opcode '" << name << "'\n";
+            }
+        }
+
+        // Resolve the target contexts: the union of the programmatic options and
+        // the command-line flag.
+        uint32_t target_contexts = options_.target_contexts;
+        for (const auto &name : CobraTargetContexts) {
+            if (const uint32_t ctx = ContextFromName(name); ctx != 0) {
+                target_contexts |= ctx;
+            } else {
+                llvm::errs() << "CoBRA: unknown target context '" << name << "'\n";
+            }
+        }
+
+        auto candidates = DetectMbaCandidates(
+            f, options_.min_ast_size, options_.max_vars, target_opcodes, target_contexts
+        );
 
         NumCandidates += candidates.size();
 
