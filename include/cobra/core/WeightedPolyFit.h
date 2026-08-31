@@ -35,11 +35,31 @@ namespace cobra {
     // The returned NormalizedPoly uses original-space variable indices
     // (mapped via support_vars) with num_vars = total_num_vars.
     //
+    // target sampled over the interpolation grid, in the row order the fit
+    // consumes. Which points get sampled is fixed by support_vars,
+    // total_num_vars and grid_degree alone — the weight never enters — so a
+    // caller that fits many weights against one target can sample it once
+    // and hand the same grid to every fit.
+    using WeightedFitGrid = std::vector< uint64_t >;
+
+    // Sample target over the grid RecoverWeightedPoly would use. Returns an
+    // empty grid for inputs RecoverWeightedPoly would reject anyway, which
+    // callers can pass through untouched: the fit re-checks its guards and
+    // resamples if the grid does not fit.
+    WeightedFitGrid EvaluateWeightedFitGrid(
+        const Evaluator &target, const std::vector< uint32_t > &support_vars,
+        uint32_t total_num_vars, uint32_t bitwidth, uint8_t grid_degree = 2
+    );
+
     // Does NOT verify beyond the grid.
+    //
+    // Pass `grid` to reuse a sampling from EvaluateWeightedFitGrid taken
+    // against the same target and grid parameters; it is ignored unless its
+    // size matches the grid this call needs.
     SolverResult< WeightedFitResult > RecoverWeightedPoly(
         const Evaluator &target, const WeightFn &weight,
         const std::vector< uint32_t > &support_vars, uint32_t total_num_vars, uint32_t bitwidth,
-        uint8_t max_degree = 2, uint8_t grid_degree = 2
+        uint8_t max_degree = 2, uint8_t grid_degree = 2, const WeightedFitGrid *grid = nullptr
     );
 
 } // namespace cobra

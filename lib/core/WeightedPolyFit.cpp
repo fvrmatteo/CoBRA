@@ -7,6 +7,7 @@
 #include <bit>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -142,10 +143,25 @@ namespace cobra {
             return h_raw;
         }
 
+        // Number of grid rows for a support of size k at the given degree,
+        // or nullopt when the count would overflow a size_t.
+        std::optional< size_t > GridRowCount(uint32_t k, uint8_t grid_deg) {
+            const auto kGridBase = static_cast< size_t >(grid_deg) + 1;
+            size_t rows          = 1;
+            for (uint32_t i = 0; i < k; ++i) {
+                if (rows > std::numeric_limits< size_t >::max() / kGridBase) {
+                    return std::nullopt;
+                }
+                rows *= kGridBase;
+            }
+            return rows;
+        }
+
         std::optional< WeightedFitResult > TrySolve(
             const Evaluator &target, const WeightFn &weight,
             const std::vector< uint32_t > &support_vars, uint32_t total_num_vars,
-            uint32_t bitwidth, uint8_t max_degree, uint8_t grid_deg
+            uint32_t bitwidth, uint8_t max_degree, uint8_t grid_deg,
+            const WeightedFitGrid *precomputed
         ) {
             const auto kK        = static_cast< uint32_t >(support_vars.size());
             const uint64_t kMask = Bitmask(bitwidth);
@@ -180,6 +196,11 @@ namespace cobra {
                 }
             }
 
+            // Sampling the target is by far the most expensive part of the
+            // fit, and it is exactly what a caller sweeping many weights over
+            // one target already holds.
+            const bool reuse_grid = precomputed != nullptr && precomputed->size() == num_rows;
+
             for (size_t row = 0; row < num_rows; ++row) {
                 size_t tmp = row;
                 for (uint32_t i = 0; i < kK; ++i) {
@@ -187,7 +208,7 @@ namespace cobra {
                     full_point[support_vars[i]]  = tmp % kGridBase;
                     tmp                         /= kGridBase;
                 }
-                rhs[row]             = target(full_point) & kMask;
+                rhs[row] = reuse_grid ? (*precomputed)[row] : (target(full_point) & kMask);
                 const uint64_t kWVal = weight(local_point, bitwidth);
                 for (size_t col = 0; col < kNumCols; ++col) {
                     uint64_t phi = 1;
@@ -236,10 +257,48 @@ namespace cobra {
 
     } // namespace
 
+    WeightedFitGrid EvaluateWeightedFitGrid(
+        const Evaluator &target, const std::vector< uint32_t > &support_vars,
+        uint32_t total_num_vars, uint32_t bitwidth, uint8_t grid_degree
+    ) {
+        // Mirror the guards RecoverWeightedPoly applies. Returning an empty
+        // grid on a rejected shape keeps this safe to call speculatively:
+        // the fit rejects the same input, and a size mismatch would make it
+        // resample regardless.
+        if (support_vars.empty() || total_num_vars > kMaxPolyVars || bitwidth < 2
+            || bitwidth > 64)
+        {
+            return {};
+        }
+        for (auto idx : support_vars) {
+            if (idx >= total_num_vars) { return {}; }
+        }
+
+        const auto kK       = static_cast< uint32_t >(support_vars.size());
+        const auto num_rows = GridRowCount(kK, grid_degree);
+        if (!num_rows.has_value()) { return {}; }
+
+        const uint64_t kMask = Bitmask(bitwidth);
+        const auto kGridBase = static_cast< size_t >(grid_degree) + 1;
+
+        WeightedFitGrid grid(*num_rows, 0);
+        std::vector< uint64_t > full_point(total_num_vars, 0);
+        for (size_t row = 0; row < *num_rows; ++row) {
+            size_t tmp = row;
+            for (uint32_t i = 0; i < kK; ++i) {
+                full_point[support_vars[i]]  = tmp % kGridBase;
+                tmp                         /= kGridBase;
+            }
+            grid[row] = target(full_point) & kMask;
+            for (uint32_t i = 0; i < kK; ++i) { full_point[support_vars[i]] = 0; }
+        }
+        return grid;
+    }
+
     SolverResult< WeightedFitResult > RecoverWeightedPoly(
         const Evaluator &target, const WeightFn &weight,
         const std::vector< uint32_t > &support_vars, uint32_t total_num_vars, uint32_t bitwidth,
-        uint8_t max_degree, uint8_t grid_degree
+        uint8_t max_degree, uint8_t grid_degree, const WeightedFitGrid *grid
     ) {
         if (support_vars.empty()) {
             ReasonDetail reason{
@@ -278,7 +337,7 @@ namespace cobra {
         }
 
         auto fit = TrySolve(
-            target, weight, support_vars, total_num_vars, bitwidth, max_degree, grid_degree
+            target, weight, support_vars, total_num_vars, bitwidth, max_degree, grid_degree, grid
         );
         if (!fit.has_value()) {
             ReasonDetail reason{
