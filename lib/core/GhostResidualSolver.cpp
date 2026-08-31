@@ -231,6 +231,12 @@ namespace cobra {
         const auto kSupportSize = static_cast< uint32_t >(support.size());
         const auto &basis       = GetGhostBasis();
 
+        // Every fit below samples the residual over the same grid — only the
+        // ghost weight differs between primitives and tuples — and sampling
+        // dominates the fit. Take it once for the whole sweep.
+        const WeightedFitGrid grid =
+            EvaluateWeightedFitGrid(residual_eval, support, num_vars, bitwidth, grid_degree);
+
         for (const auto &prim : basis) {
             if (prim.arity > kSupportSize || prim.arity > kMaxResidualSupport) { continue; }
 
@@ -255,7 +261,8 @@ namespace cobra {
                 };
 
                 auto fit = RecoverWeightedPoly(
-                    residual_eval, weight, support, num_vars, bitwidth, max_degree, grid_degree
+                    residual_eval, weight, support, num_vars, bitwidth, max_degree, grid_degree,
+                    &grid
                 );
                 if (!fit.Succeeded()) { continue; }
 
