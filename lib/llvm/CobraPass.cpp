@@ -147,6 +147,25 @@ namespace cobra {
             return cache;
         }
 
+        // Fingerprints recorded in the IR outlive the pass instance that wrote
+        // them, so they have to say which configuration produced them. Folding
+        // every setting that can change a candidate's fate into one tag lets a
+        // reconfigured run ignore records it must not trust, without having to
+        // walk the module to erase them.
+        uint64_t OptionsTag(const CobraPassOptions &options) {
+            const auto mix = [](uint64_t hash, uint64_t value) {
+                constexpr uint64_t kGoldenRatio = 0x9E3779B97F4A7C15ULL;
+                return hash ^ (value + kGoldenRatio + (hash << 6) + (hash >> 2));
+            };
+
+            uint64_t tag = mix(0, options.max_vars);
+            tag          = mix(tag, options.min_ast_size);
+            tag          = mix(tag, options.z3_verify ? 1 : 0);
+            tag          = mix(tag, options.z3_settings.timeout_ms);
+            tag = mix(tag, static_cast< uint64_t >(options.z3_settings.unknown_result_mode));
+            return tag;
+        }
+
         // Run the full solve-and-verify pipeline for one candidate. Returns
         // null when any gate rejects it.
         OutcomeCache::Entry
@@ -255,7 +274,10 @@ namespace cobra {
     CobraPass::run(llvm::Function &f, llvm::FunctionAnalysisManager & /*AM*/) {
         bool changed = false;
 
-        auto candidates = DetectMbaCandidates(f, options_.min_ast_size, options_.max_vars);
+        const uint64_t options_tag = OptionsTag(options_);
+
+        auto candidates =
+            DetectMbaCandidates(f, options_.min_ast_size, options_.max_vars, options_tag);
 
         NumCandidates += candidates.size();
 
@@ -272,6 +294,11 @@ namespace cobra {
                 outcome = cache.Insert(key, SolveCandidate(cand, options_));
             }
             if (outcome == nullptr) {
+                // Nothing to rewrite here. Leaving the tree unmarked would have
+                // the next run rediscover and re-solve it from scratch, which
+                // is the dominant cost when a function is re-optimized, so the
+                // shape that led nowhere is recorded on the root.
+                RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
                 continue;
             }
 
@@ -288,6 +315,7 @@ namespace cobra {
                         llvm::dbgs() << "CoBRA: skipping — real_vars not contained in "
                                         "candidate variable set\n"
                     );
+                    RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
                     continue;
                 }
                 var_map = std::move(*checked_var_map);
@@ -299,6 +327,17 @@ namespace cobra {
             cand.root->replaceAllUsesWith(new_val);
             ++NumSimplified;
             changed = true;
+
+            // The replacement is itself an MBA tree the detector will find next
+            // run, and re-solving it almost always just reproves that CoBRA's
+            // own output cannot shrink further. Fingerprinting it now turns
+            // that into a lookup; if a later pass reshapes it the recorded
+            // shape stops matching and it is examined again.
+            if (auto *new_inst = llvm::dyn_cast< llvm::Instruction >(new_val)) {
+                if (auto new_fp = ComputeMbaFingerprint(new_inst)) {
+                    RecordMbaFingerprint(new_inst, *new_fp, options_tag);
+                }
+            }
 
             LLVM_DEBUG(
                 llvm::dbgs() << "CoBRA: simplified to "

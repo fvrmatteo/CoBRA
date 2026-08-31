@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+
 namespace cobra {
 
     namespace template_decomposer {
@@ -427,6 +428,14 @@ namespace cobra {
             // every value is unique, so the inline capacity keeps the common
             // case free of heap allocations.
             absl::flat_hash_map< uint64_t, absl::InlinedVector< uint32_t, 2 > > probe0_buckets;
+            // Probe-1 value of each composition, packed apart from comps.
+            // A candidate drawn from a probe-0 bucket is rejected on probe 1
+            // almost every time, and an InnerComp is over 150 bytes, so
+            // reading probe 1 out of the full record turns each rejection
+            // into a miss on an array far larger than the cache. Holding
+            // just this column keeps the rejection scan inside a region
+            // one order of magnitude smaller.
+            std::vector< uint64_t > probe1;
         };
 
         InnerCompositions BuildInnerCompositions(
@@ -442,6 +451,7 @@ namespace cobra {
             inner.comps.reserve(upper_bound);
             inner.index.reserve(upper_bound);
             inner.probe0_buckets.reserve(upper_bound);
+            inner.probe1.reserve(upper_bound);
 
             for (auto g_in : kAllGates) {
                 for (size_t bi = 0; bi < pn; ++bi) {
@@ -460,6 +470,7 @@ namespace cobra {
                             continue;
                         }
                         inner.probe0_buckets[v[0]].push_back(static_cast< uint32_t >(slot));
+                        inner.probe1.push_back(v[1]);
                         inner.comps.push_back({ .gate = g_in, .bi = bi, .ci = ci, .vals = v });
                     }
                 }
@@ -658,6 +669,35 @@ namespace cobra {
             return hn::AllFalse(d, hn::Ne(acc, hn::Zero(d)));
         }
 
+        // Probe-wise necessary condition for target = A * X to be solvable.
+        // A_i * X_i spans exactly the multiples of 2^ctz(A_i) modulo 2^bw, so a
+        // target probe that carries a lower power of two rules the pair out for
+        // every X. A & -A isolates the lowest set bit and subtracting one turns
+        // it into the mask of bits the product can never reach, which makes the
+        // test branch-free; A_i == 0 folds in on its own, yielding an all-ones
+        // mask that admits only target_i == 0.
+        //
+        // The And/Or scans already reject on all kNProbes probes via Compatible
+        // before they touch the composition cache. Without the same width here
+        // the multiplication scan filters on probe 0 alone, which leaves roughly
+        // two thirds of the pairs alive and makes the cost of the layer the cost
+        // of walking the cache once per surviving atom.
+        bool MulCompatible(const ProbeVals &a, const ProbeVals &target, uint64_t mask) {
+            const D64 d;
+            const size_t kN = hn::Lanes(d);
+            const auto vm   = hn::Set(d, mask);
+            const auto one  = hn::Set(d, 1);
+            auto acc        = hn::Zero(d);
+            for (size_t i = 0; i < kNProbes; i += kN) {
+                const auto va      = hn::And(hn::Load(d, &a[i]), vm);
+                const auto vt      = hn::And(hn::Load(d, &target[i]), vm);
+                const auto lowbit  = hn::And(va, hn::Sub(hn::Zero(d), va));
+                const auto lowmask = hn::Sub(lowbit, one);
+                acc                = hn::Or(acc, hn::And(vt, lowmask));
+            }
+            return hn::AllFalse(d, hn::Ne(acc, hn::Zero(d)));
+        }
+
         using Probe0Buckets =
             absl::flat_hash_map< uint64_t, absl::InlinedVector< uint32_t, 2 > >;
 
@@ -725,6 +765,7 @@ namespace cobra {
                     break;
                 }
             }
+
 
             // Restore ascending composition order so the candidate visited
             // first does not depend on the bucket layout.
@@ -901,6 +942,7 @@ namespace cobra {
                 [[maybe_unused]] size_t mul_fallback_outer = 0;
 
                 for (const auto &ai : pool) {
+                    if (!MulCompatible(ai.vals, target, mask)) { continue; }
                     const bool used_probe0_filter = CollectMulProbe0Candidates(
                         inner_cache.probe0_buckets, MulProbe0FactorOf(ai.vals[0], bw),
                         target[0], bw, mul_probe0_candidates
@@ -908,6 +950,13 @@ namespace cobra {
                     if (used_probe0_filter) {
                         ++mul_bucketed_outer;
                         for (size_t ii_idx : mul_probe0_candidates) {
+                            if (!Probe0Matches(
+                                    ai.vals[1], inner_cache.probe1[ii_idx], target[1],
+                                    Gate::kMul, mask
+                                ))
+                            {
+                                continue;
+                            }
                             const auto &ii = inner[ii_idx];
                             if (!MulMatches(ai.vals, ii.vals, target, mask, 1)) { continue; }
                             auto e = GateExpr(Gate::kMul, CloneExpr(*ai.expr), make_inner(ii));
@@ -1008,6 +1057,7 @@ namespace cobra {
         ) {
             std::span< const InnerComp > inner = inner_cache.comps;
             const auto &inner_idx              = inner_cache.index;
+            const auto &inner_probe1           = inner_cache.probe1;
             std::optional< SignaturePayload > best;
             const size_t pool_n  = pool.size();
             const size_t inner_n = inner.size();
@@ -1028,6 +1078,7 @@ namespace cobra {
 
             std::vector< size_t > mul_candidates;
             std::vector< size_t > andor_candidates;
+            std::vector< size_t > compat_inner;
             for (auto g1 : kAllGates) {
                 if (!GateInvertible(g1)) { continue; }
                 for (size_t ai = 0; ai < pool_n; ++ai) {
@@ -1063,6 +1114,16 @@ namespace cobra {
                         // matching buckets replaces a full scan of the
                         // composition cache for every atom_B.
                         for (auto g2 : { Gate::kAnd, Gate::kOr }) {
+                            // A coset too wide to enumerate falls back to the
+                            // whole composition cache, once per atom_B. Any
+                            // match needs inner_C compatible with the lifted
+                            // target on its own — And forces inner_C to cover
+                            // it, Or forces inner_C to stay inside it — and
+                            // that test does not involve atom_B, so one shared
+                            // pass replaces a full pass per atom. It is built
+                            // on first use so a group whose cosets all
+                            // enumerate never pays for it.
+                            bool compat_inner_built = false;
                             for (size_t bi = 0; bi < pool_n; ++bi) {
                                 if (!Compatible0(pool[bi].vals[0], lifted[0], g2)) {
                                     continue;
@@ -1073,13 +1134,27 @@ namespace cobra {
                                     inner_cache.probe0_buckets, pool[bi].vals[0], lifted[0], g2,
                                     bw, andor_candidates
                                 );
+                                if (!filtered && !compat_inner_built) {
+                                    CollectCompatibleIndices(inner, lifted, g2, compat_inner);
+                                    compat_inner_built = true;
+                                }
                                 const std::span< const size_t > scan_indices = filtered
                                     ? std::span< const size_t >(andor_candidates)
-                                    : std::span< const size_t >();
-                                const size_t scan_n = filtered ? scan_indices.size() : inner_n;
+                                    : std::span< const size_t >(compat_inner);
+                                const size_t scan_n = scan_indices.size();
 
                                 for (size_t si = 0; si < scan_n; ++si) {
-                                    const size_t ii = filtered ? scan_indices[si] : si;
+                                    const size_t ii = scan_indices[si];
+                                    // Probe 1 first, out of the packed column:
+                                    // it rejects as well as probe 0 and does
+                                    // not fault in the composition record.
+                                    if (!Probe0Matches(
+                                            pool[bi].vals[1], inner_probe1[ii], lifted[1], g2,
+                                            mask
+                                        ))
+                                    {
+                                        continue;
+                                    }
                                     if (!Probe0Matches(
                                             pool[bi].vals[0], inner[ii].vals[0], lifted[0], g2,
                                             mask
@@ -1107,15 +1182,29 @@ namespace cobra {
                             }
                         }
 
+
                         // Mul scan: lifted = Mul(atom_B, inner_C)
                         {
                             for (size_t bi = 0; bi < pool_n; ++bi) {
+                                if (!MulCompatible(pool[bi].vals, lifted, mask)) { continue; }
                                 const bool filtered = CollectMulProbe0Candidates(
                                     inner_cache.probe0_buckets, pool_mul_factors[bi], lifted[0],
                                     bw, mul_candidates
                                 );
                                 if (filtered) {
                                     for (size_t ii_idx : mul_candidates) {
+                                        // Probe 0 is already implied by the
+                                        // bucket, so probe 1 is the first real
+                                        // discriminator; taking it from the
+                                        // packed column keeps the rejection off
+                                        // the wide composition array.
+                                        if (!Probe0Matches(
+                                                pool[bi].vals[1], inner_probe1[ii_idx],
+                                                lifted[1], Gate::kMul, mask
+                                            ))
+                                        {
+                                            continue;
+                                        }
                                         if (!MulMatches(
                                                 pool[bi].vals, inner[ii_idx].vals, lifted, mask,
                                                 1
@@ -1308,7 +1397,7 @@ namespace cobra {
         {
             COBRA_ZONE_N("TemplateLayer2");
             auto inner = BuildInnerCompositions(pool, vmap, kMask);
-            auto r2    = Layer2(
+            auto r2 = Layer2(
                 target, pool, inner, kMask, *ctx.eval, num_vars, opts.bitwidth, baseline_cost
             );
             if (r2.has_value()) {

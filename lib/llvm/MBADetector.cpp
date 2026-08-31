@@ -6,10 +6,14 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Type.h"
 #include "llvm/Support/Casting.h"
 
 #include <algorithm>
@@ -17,15 +21,134 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <random>
 #include <string>
 #include <utility>
 #include <vector>
 
+#define DEBUG_TYPE "cobra"
+
+STATISTIC(
+    NumFingerprintSkips, "Number of MBA trees skipped (unchanged since last examined)"
+);
+
 namespace cobra {
 
     namespace {
+
+        // Metadata kind holding an MbaFingerprint plus the options tag it was
+        // recorded under. Unknown metadata is dropped rather than rewritten
+        // when a pass rebuilds an instruction, so a lost record only costs a
+        // redundant examination — never a missed simplification.
+        constexpr const char *kFingerprintMD = "cobra.mba";
+
+        uint64_t MixFingerprint(uint64_t hash, uint64_t value) {
+            constexpr uint64_t kGoldenRatio = 0x9E3779B97F4A7C15ULL;
+            return hash ^ (value + kGoldenRatio + (hash << 6) + (hash >> 2));
+        }
+
+        // Hash and height of the subtree at `v`, memoized so a shared operand
+        // is folded once no matter how many parents reach it.
+        std::pair< uint64_t, uint32_t > FingerprintNode(
+            llvm::Value *v, const llvm::DenseMap< llvm::Value *, uint32_t > &leaf_index,
+            const llvm::DenseSet< llvm::Value * > &tree_set,
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+            llvm::DenseMap< llvm::Value *, std::pair< uint64_t, uint32_t > > &memo
+        ) {
+            if (auto it = memo.find(v); it != memo.end()) { return it->second; }
+
+            // Leaves are checked before the redirect map so that a phi kept as
+            // a leaf hashes by position, matching how it is later evaluated.
+            if (auto it = leaf_index.find(v); it != leaf_index.end()) {
+                const std::pair< uint64_t, uint32_t > leaf{ MixFingerprint(1, it->second), 0 };
+                memo[v] = leaf;
+                return leaf;
+            }
+            if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(v)) {
+                const std::pair< uint64_t, uint32_t > c{ MixFingerprint(2, ci->getZExtValue()),
+                                                         0 };
+                memo[v] = c;
+                return c;
+            }
+            if (auto it = phi_redirects.find(v); it != phi_redirects.end()) {
+                auto through = FingerprintNode(
+                    it->second, leaf_index, tree_set, phi_redirects, memo
+                );
+                memo[v] = through;
+                return through;
+            }
+
+            auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
+            if (inst == nullptr || !tree_set.contains(v)) {
+                // Anything the detector would not descend through is opaque;
+                // its identity is irrelevant because it cannot be rewritten.
+                const std::pair< uint64_t, uint32_t > opaque{ 3, 0 };
+                memo[v] = opaque;
+                return opaque;
+            }
+
+            // Guard against a cycle through an unverified phi by claiming the
+            // slot before descending. A revisit then folds this placeholder,
+            // which keeps the hash deterministic instead of recursing forever.
+            memo[v] = { 4, 0 };
+
+            uint64_t hash     = MixFingerprint(5, inst->getOpcode());
+            uint32_t children = 0;
+            for (llvm::Use &use : inst->operands()) {
+                auto child =
+                    FingerprintNode(use.get(), leaf_index, tree_set, phi_redirects, memo);
+                hash     = MixFingerprint(hash, child.first);
+                children = std::max(children, child.second);
+            }
+
+            const std::pair< uint64_t, uint32_t > result{ hash, children + 1 };
+            memo[v] = result;
+            return result;
+        }
+
+        MbaFingerprint FingerprintTree(
+            llvm::Instruction *root, const std::vector< llvm::Value * > &leaves,
+            const llvm::DenseSet< llvm::Value * > &tree_set,
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
+        ) {
+            llvm::DenseMap< llvm::Value *, uint32_t > leaf_index;
+            for (uint32_t i = 0; i < leaves.size(); ++i) { leaf_index[leaves[i]] = i; }
+
+            llvm::DenseMap< llvm::Value *, std::pair< uint64_t, uint32_t > > memo;
+            auto walked = FingerprintNode(root, leaf_index, tree_set, phi_redirects, memo);
+
+            return MbaFingerprint{ .structure = walked.first,
+                                   .depth     = walked.second,
+                                   .num_vars  = static_cast< uint32_t >(leaves.size()) };
+        }
+
+        // True when `inst` already carries exactly this fingerprint under the
+        // same options tag, meaning a previous run reached the same tree.
+        bool FingerprintUnchanged(
+            const llvm::Instruction &inst, const MbaFingerprint &fp, uint64_t options_tag
+        ) {
+            auto *node = inst.getMetadata(kFingerprintMD);
+            if (node == nullptr || node->getNumOperands() != 4) { return false; }
+
+            const auto read = [node](unsigned i) -> std::optional< uint64_t > {
+                auto *as_const = llvm::dyn_cast< llvm::ConstantAsMetadata >(node->getOperand(i));
+                if (as_const == nullptr) { return std::nullopt; }
+                auto *as_int = llvm::dyn_cast< llvm::ConstantInt >(as_const->getValue());
+                if (as_int == nullptr) { return std::nullopt; }
+                return as_int->getZExtValue();
+            };
+
+            auto structure = read(0);
+            auto depth     = read(1);
+            auto num_vars  = read(2);
+            auto tag       = read(3);
+            if (!structure || !depth || !num_vars || !tag) { return false; }
+
+            return *structure == fp.structure && *depth == fp.depth
+                && *num_vars == fp.num_vars && *tag == options_tag;
+        }
 
         bool IsMbaOpcode(unsigned opcode) {
             switch (opcode) { // NOLINT(hicpp-multiway-paths-covered)
@@ -659,7 +782,9 @@ namespace cobra {
     } // namespace
 
     std::vector< MBACandidate >
-    DetectMbaCandidates(llvm::Function &f, uint32_t min_ast_size, uint32_t /*max_vars*/) {
+    DetectMbaCandidates(
+        llvm::Function &f, uint32_t min_ast_size, uint32_t /*max_vars*/, uint64_t options_tag
+    ) {
         std::vector< MBACandidate > candidates;
         llvm::DenseSet< llvm::Instruction * > already_in_tree;
 
@@ -702,6 +827,23 @@ namespace cobra {
                     tree_insts.begin(), tree_insts.end()
                 );
                 if (HasPolynomialMul(&inst, tree_set)) {
+                    continue;
+                }
+
+                // Everything past this point — phi arm verification, the
+                // 2^leaves signature sweep, the AST build and the solve in the
+                // caller — is decided entirely by the tree just collected. If a
+                // previous run already reached this exact tree there is nothing
+                // new to learn, so claim its instructions and move on. The tree
+                // is still claimed because the enclosing root must keep winning
+                // over its inner nodes whether or not it gets re-examined.
+                const MbaFingerprint fingerprint =
+                    FingerprintTree(&inst, leaves, tree_set, phi_redirects);
+                if (FingerprintUnchanged(inst, fingerprint, options_tag)) {
+                    ++NumFingerprintSkips;
+                    for (auto *ti : tree_insts) {
+                        already_in_tree.insert(ti);
+                    }
                     continue;
                 }
 
@@ -778,12 +920,53 @@ namespace cobra {
                                   .sig         = std::move(sig),
                                   .bitwidth    = bw,
                                   .expr        = std::move(expr),
-                                  .evaluator   = std::move(evaluator) }
+                                  .evaluator   = std::move(evaluator),
+                                  .fingerprint = fingerprint }
                 );
             }
         }
 
         return candidates;
+    }
+
+    void RecordMbaFingerprint(
+        llvm::Instruction *inst, const MbaFingerprint &fp, uint64_t options_tag
+    ) {
+        if (inst == nullptr) { return; }
+
+        auto &ctx      = inst->getContext();
+        auto *i64_type = llvm::Type::getInt64Ty(ctx);
+        auto *i32_type = llvm::Type::getInt32Ty(ctx);
+
+        const auto u64 = [&](uint64_t v) -> llvm::Metadata * {
+            return llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64_type, v));
+        };
+        const auto u32 = [&](uint32_t v) -> llvm::Metadata * {
+            return llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32_type, v));
+        };
+
+        inst->setMetadata(
+            kFingerprintMD,
+            llvm::MDNode::get(
+                ctx, { u64(fp.structure), u32(fp.depth), u32(fp.num_vars), u64(options_tag) }
+            )
+        );
+    }
+
+    std::optional< MbaFingerprint > ComputeMbaFingerprint(llvm::Instruction *inst) {
+        if (inst == nullptr || !IsMbaOpcode(inst->getOpcode())
+            || !inst->getType()->isIntegerTy() || inst->getType()->getIntegerBitWidth() > 64)
+        {
+            return std::nullopt;
+        }
+
+        llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
+        std::vector< llvm::Value * > leaves;
+        llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
+        CollectTree(inst, tree_insts, leaves, phi_redirects);
+
+        const llvm::DenseSet< llvm::Value * > tree_set(tree_insts.begin(), tree_insts.end());
+        return FingerprintTree(inst, leaves, tree_set, phi_redirects);
     }
 
 } // namespace cobra
