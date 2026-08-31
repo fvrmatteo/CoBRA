@@ -3,6 +3,7 @@
 #include "MBADetector.h"
 #include "cobra/core/ExprCost.h"
 #include "cobra/core/ExprUtils.h"
+#include "cobra/core/SignatureChecker.h"
 #include "cobra/core/Simplifier.h"
 
 #ifdef COBRA_HAS_Z3
@@ -75,6 +76,14 @@ namespace cobra {
         // behaviour. cand.leaf_values is absent for the same reason the cache
         // is useful at all — the leaves differ between rediscoveries of the
         // same tree, and the outcome refers to them only by index.
+        //
+        // Only the arity of cand.var_names is included, not the names. A
+        // solve reads variables as the indices cand.expr carries and reports
+        // real_vars as indices too, so the names cannot change the outcome —
+        // but they are LLVM value names, which differ every time the same
+        // shape is rediscovered on different SSA values. Keying on them made
+        // each rediscovery a miss, which is precisely the case the cache
+        // exists to catch.
         std::string CandidateKey(const MBACandidate &cand, const CobraPassOptions &options) {
             std::string key;
             key += std::to_string(cand.bitwidth);
@@ -84,10 +93,7 @@ namespace cobra {
             key += std::to_string(options.z3_settings.timeout_ms);
             key += std::to_string(static_cast< int >(options.z3_settings.unknown_result_mode));
             key += '|';
-            for (const auto &name : cand.var_names) {
-                key += name;
-                key += ',';
-            }
+            key += std::to_string(cand.var_names.size());
             key += '|';
             for (uint64_t v : cand.sig) {
                 key += std::to_string(v);

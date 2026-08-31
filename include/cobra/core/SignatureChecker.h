@@ -60,6 +60,33 @@ namespace cobra {
         uint32_t bitwidth, uint32_t num_samples = 8
     );
 
+    // Opens a reuse window for FullWidthCheckEval's candidate-independent
+    // probes. A search that checks many candidates against one fixed
+    // evaluator otherwise re-evaluates that evaluator at the same adversarial
+    // inputs once per candidate; inside this scope those values are computed
+    // once and shared. Purely an optimization: results are identical either
+    // way, and calls whose evaluator, arity, or bitwidth do not match the
+    // scope are unaffected.
+    //
+    // The scope must not outlive `eval`. Scopes nest (the previous one is
+    // restored on destruction) and are thread-local, so a scope on one thread
+    // never serves calls on another.
+    class FullWidthProbeScope
+    {
+      public:
+        FullWidthProbeScope(const Evaluator &eval, uint32_t num_vars, uint32_t bitwidth);
+        ~FullWidthProbeScope();
+
+        FullWidthProbeScope(const FullWidthProbeScope &)            = delete;
+        FullWidthProbeScope &operator=(const FullWidthProbeScope &) = delete;
+        FullWidthProbeScope(FullWidthProbeScope &&)                 = delete;
+        FullWidthProbeScope &operator=(FullWidthProbeScope &&)      = delete;
+
+      private:
+        void *state_;
+        void *previous_;
+    };
+
     // Evaluate an Expr tree at given variable values.
     uint64_t
     EvalExpr(const Expr &expr, const std::vector< uint64_t > &var_values, uint32_t bitwidth);

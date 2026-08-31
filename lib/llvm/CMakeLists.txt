@@ -32,7 +32,7 @@ if(cobra_llvm_compile_definitions)
     target_compile_definitions(cobra-llvm-obj PRIVATE ${cobra_llvm_compile_definitions})
 endif()
 
-if(Z3_FOUND)
+if(COBRA_VERIFY_BACKEND)
     target_compile_definitions(cobra-llvm-obj PRIVATE COBRA_HAS_Z3=1)
 endif()
 
@@ -55,7 +55,7 @@ target_link_libraries(cobra-llvm PUBLIC
     ${cobra_llvm_llvm_libs}
 )
 
-if(Z3_FOUND)
+if(COBRA_VERIFY_BACKEND)
     target_link_libraries(cobra-llvm PRIVATE cobra-verify)
 endif()
 
@@ -105,7 +105,7 @@ if(COBRA_BUILD_LLVM_PASS)
         target_link_options(CobraPass PRIVATE -undefined dynamic_lookup)
     endif()
 
-    if(Z3_FOUND)
+    if(COBRA_VERIFY_BACKEND)
         target_link_libraries(CobraPass PRIVATE cobra-verify)
         target_compile_definitions(CobraPass PRIVATE COBRA_HAS_Z3=1)
     endif()

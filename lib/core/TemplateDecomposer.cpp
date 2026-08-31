@@ -1312,6 +1312,12 @@ namespace cobra {
         const uint64_t kMask =
             (opts.bitwidth >= 64) ? UINT64_MAX : ((1ULL << opts.bitwidth) - 1);
 
+        // Every candidate this search emits is verified against the same
+        // evaluator at the same arity and bitwidth, so let the verifier reuse
+        // the evaluator's values at the candidate-independent probes rather
+        // than recomputing them once per candidate.
+        const FullWidthProbeScope probe_scope(*ctx.eval, num_vars, opts.bitwidth);
+
         // Generate reproducible probe points.
         std::mt19937_64 rng(0xC0B4A);
         std::vector< std::vector< uint64_t > > pts(kNProbes);
