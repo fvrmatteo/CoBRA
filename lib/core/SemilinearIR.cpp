@@ -53,6 +53,11 @@ namespace cobra {
                 case Expr::Kind::kAdd:
                 case Expr::Kind::kMul:
                 case Expr::Kind::kNeg:
+                // Atoms are only registered for purely bitwise subtrees, and
+                // IsPurelyBitwise rejects comparisons, so none reaches here.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt:
                     std::unreachable();
             }
             std::unreachable();

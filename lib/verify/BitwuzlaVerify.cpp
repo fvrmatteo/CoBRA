@@ -54,7 +54,28 @@ namespace cobra {
                     return kUnary(bitwuzla::Kind::BV_NOT);
                 case Expr::Kind::kNeg:
                     return kUnary(bitwuzla::Kind::BV_NEG);
-                case Expr::Kind::kShr: {
+                    // Comparisons are 0/1 valued, so the boolean result is
+                    // widened back to the expression's bitvector sort.
+                    case Expr::Kind::kCmpEq:
+                    case Expr::Kind::kCmpUlt:
+                    case Expr::Kind::kCmpSlt: {
+                        const auto kKind = expr.kind == Expr::Kind::kCmpEq
+                            ? bitwuzla::Kind::EQUAL
+                            : (expr.kind == Expr::Kind::kCmpUlt ? bitwuzla::Kind::BV_ULT
+                                                                : bitwuzla::Kind::BV_SLT);
+                        auto cmp         = tm.mk_term(
+                            kKind,
+                            { BuildSmtExpr(tm, *expr.children[0], var_terms, bitwidth),
+                                      BuildSmtExpr(tm, *expr.children[1], var_terms, bitwidth) }
+                        );
+                        const auto kSort = tm.mk_bv_sort(bitwidth);
+                        return tm.mk_term(
+                            bitwuzla::Kind::ITE,
+                            { cmp, tm.mk_bv_value_uint64(kSort, 1),
+                              tm.mk_bv_value_uint64(kSort, 0) }
+                        );
+                    }
+                    case Expr::Kind::kShr: {
                     // For kShr, constant_val carries the shift amount.
                     auto operand = BuildSmtExpr(tm, *expr.children[0], var_terms, bitwidth);
                     auto amount =

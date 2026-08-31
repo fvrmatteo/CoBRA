@@ -118,6 +118,33 @@ namespace cobra {
                     pool.Release(std::move(right));
                     return left;
                 }
+                case Expr::Kind::kCmpEq: {
+                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
+                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
+                    for (size_t i = 0; i < len; ++i) {
+                        left[i] = ModCmpEq(left[i], right[i], bitwidth);
+                    }
+                    pool.Release(std::move(right));
+                    return left;
+                }
+                case Expr::Kind::kCmpUlt: {
+                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
+                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
+                    for (size_t i = 0; i < len; ++i) {
+                        left[i] = ModCmpUlt(left[i], right[i], bitwidth);
+                    }
+                    pool.Release(std::move(right));
+                    return left;
+                }
+                case Expr::Kind::kCmpSlt: {
+                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
+                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
+                    for (size_t i = 0; i < len; ++i) {
+                        left[i] = ModCmpSlt(left[i], right[i], bitwidth);
+                    }
+                    pool.Release(std::move(right));
+                    return left;
+                }
             }
             return std::vector< uint64_t >(len, 0);
         }

@@ -429,6 +429,21 @@ namespace cobra {
                     EvalExpr(*expr.children[0], var_values, bitwidth), expr.constant_val,
                     bitwidth
                 );
+            case Expr::Kind::kCmpEq:
+                return ModCmpEq(
+                    EvalExpr(*expr.children[0], var_values, bitwidth),
+                    EvalExpr(*expr.children[1], var_values, bitwidth), bitwidth
+                );
+            case Expr::Kind::kCmpUlt:
+                return ModCmpUlt(
+                    EvalExpr(*expr.children[0], var_values, bitwidth),
+                    EvalExpr(*expr.children[1], var_values, bitwidth), bitwidth
+                );
+            case Expr::Kind::kCmpSlt:
+                return ModCmpSlt(
+                    EvalExpr(*expr.children[0], var_values, bitwidth),
+                    EvalExpr(*expr.children[1], var_values, bitwidth), bitwidth
+                );
         }
         return 0; // unreachable
     }

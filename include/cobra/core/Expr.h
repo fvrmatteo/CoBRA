@@ -21,6 +21,19 @@ namespace cobra {
             kNot,
             kNeg,
             kShr,
+            // Comparisons, each yielding 0 or 1 like the i1 they come from.
+            // Only these three are needed: the remaining seven predicates are
+            // built by swapping operands and negating logically with
+            // `Xor(c, 1)` — note that kNot is bitwise and so cannot serve as a
+            // logical negation of a 0/1 value.
+            //
+            // `select` needs no kind of its own. With a 0/1 condition it is
+            // `B ^ ((A ^ B) & Neg(c))`, since Neg turns 1 into all-ones and 0
+            // into 0. Keeping every comparison binary means no pass has to
+            // learn about a three-child node.
+            kCmpEq,
+            kCmpUlt,
+            kCmpSlt,
         };
 
         Kind kind;
@@ -44,7 +57,25 @@ namespace cobra {
         static std::unique_ptr< Expr > Negate(std::unique_ptr< Expr > operand);
         static std::unique_ptr< Expr >
         LogicalShr(std::unique_ptr< Expr > operand, uint64_t amount);
+        static std::unique_ptr< Expr >
+        CmpEq(std::unique_ptr< Expr > lhs, std::unique_ptr< Expr > rhs);
+        static std::unique_ptr< Expr >
+        CmpUlt(std::unique_ptr< Expr > lhs, std::unique_ptr< Expr > rhs);
+        static std::unique_ptr< Expr >
+        CmpSlt(std::unique_ptr< Expr > lhs, std::unique_ptr< Expr > rhs);
     };
+
+    // True for the comparison kinds, whose value is confined to 0 or 1 and
+    // whose operands are compared as whole words rather than bit by bit. The
+    // bitwise and semilinear machinery does not model either property, so
+    // passes built on those models treat such a node as opaque.
+    inline bool IsComparison(Expr::Kind kind) {
+        return kind == Expr::Kind::kCmpEq || kind == Expr::Kind::kCmpUlt
+            || kind == Expr::Kind::kCmpSlt;
+    }
+
+    // True when `expr` or any node beneath it is a comparison.
+    bool ContainsComparison(const Expr &expr);
 
     std::unique_ptr< Expr > CloneExpr(const Expr &expr);
 

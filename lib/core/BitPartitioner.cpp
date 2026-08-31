@@ -83,6 +83,11 @@ namespace cobra {
                 case Expr::Kind::kAdd:
                 case Expr::Kind::kMul:
                 case Expr::Kind::kNeg:
+                // A comparison has no single-bit reading at all, and atoms are
+                // only built from purely bitwise subtrees, so none arrives here.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt:
                     std::unreachable();
             }
             std::unreachable();

@@ -96,6 +96,22 @@ namespace cobra {
                     );
                     return Z3_mk_bvlshr(ctx, o, k);
                 }
+                // Comparisons are 0/1 valued, so the boolean result is widened
+                // back to the expression's bitvector sort.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt: {
+                    auto *l = BuildZ3Expr(ctx, *expr.children[0], var_asts, bitwidth);
+                    auto *r = BuildZ3Expr(ctx, *expr.children[1], var_asts, bitwidth);
+                    auto *cmp = expr.kind == Expr::Kind::kCmpEq ? Z3_mk_eq(ctx, l, r)
+                        : (expr.kind == Expr::Kind::kCmpUlt ? Z3_mk_bvult(ctx, l, r)
+                                                           : Z3_mk_bvslt(ctx, l, r));
+                    auto *sort = Z3_mk_bv_sort(ctx, bitwidth);
+                    return Z3_mk_ite(
+                        ctx, cmp, Z3_mk_unsigned_int64(ctx, 1, sort),
+                        Z3_mk_unsigned_int64(ctx, 0, sort)
+                    );
+                }
             }
             return nullptr; // unreachable
         }
