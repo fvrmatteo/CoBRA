@@ -6,7 +6,7 @@ add_executable(cobra-cli
 target_link_libraries(cobra-cli PRIVATE cobra-core)
 target_include_directories(cobra-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-if(Z3_FOUND)
+if(COBRA_VERIFY_BACKEND)
     target_link_libraries(cobra-cli PRIVATE cobra-verify)
     target_compile_definitions(cobra-cli PRIVATE COBRA_HAS_Z3=1)
 endif()

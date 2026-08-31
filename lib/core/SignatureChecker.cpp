@@ -24,7 +24,20 @@ namespace cobra {
             return z ^ (z >> 31);
         }
 
-        std::vector< uint64_t > BuildAdversarialValues(uint32_t bitwidth) {
+        // The probe set depends only on the bitwidth, and there are at most 64 of
+        // those, so build each one once and hand out a reference. Rebuilding it
+        // per call put the sort and dedup below among the hottest code in CoBRA.
+        const std::vector< uint64_t > &BuildAdversarialValues(uint32_t bitwidth) {
+            struct Cache
+            {
+                std::vector< uint64_t > values[65];
+                bool built[65]{};
+            };
+            static thread_local Cache cache;
+
+            const uint32_t kIndex = bitwidth <= 64 ? bitwidth : 64;
+            if (cache.built[kIndex]) { return cache.values[kIndex]; }
+
             const uint64_t kMask = Bitmask(bitwidth);
             std::vector< uint64_t > vals;
             vals.reserve(4 * bitwidth);
@@ -54,7 +67,9 @@ namespace cobra {
             std::sort(vals.begin(), vals.end());
             vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
 
-            return vals;
+            cache.values[kIndex] = std::move(vals);
+            cache.built[kIndex]  = true;
+            return cache.values[kIndex];
         }
 
         void CollectConstantsAndShifts(
@@ -128,7 +143,7 @@ namespace cobra {
             ProbeFn &&probe_fn
         ) {
             const uint64_t kMask = Bitmask(bitwidth);
-            auto adv             = BuildAdversarialValues(bitwidth);
+            const auto &adv      = BuildAdversarialValues(bitwidth);
             size_t probe_index   = 0;
 
             auto zero_inputs = [&]() { std::fill(inputs.begin(), inputs.end(), 0); };
@@ -203,7 +218,38 @@ namespace cobra {
             return true;
         }
 
+        // Backing store for FullWidthProbeScope. Phases 1 and 2 of
+        // ForEachFullWidthProbe depend only on arity and bitwidth, so an
+        // evaluator's values there are the same for every candidate checked
+        // against it. `values` accumulates them in probe order, extended
+        // lazily as checks probe deeper.
+        struct ProbeBaseline
+        {
+            const Evaluator *eval = nullptr;
+            uint32_t num_vars     = 0;
+            uint32_t bitwidth     = 0;
+            std::vector< uint64_t > values;
+        };
+
+        ProbeBaseline *&ActiveBaseline() {
+            static thread_local ProbeBaseline *active = nullptr;
+            return active;
+        }
+
     } // namespace
+
+    FullWidthProbeScope::FullWidthProbeScope(
+        const Evaluator &eval, uint32_t num_vars, uint32_t bitwidth
+    )
+        : state_(new ProbeBaseline{ .eval = &eval, .num_vars = num_vars, .bitwidth = bitwidth }),
+          previous_(ActiveBaseline()) {
+        ActiveBaseline() = static_cast< ProbeBaseline * >(state_);
+    }
+
+    FullWidthProbeScope::~FullWidthProbeScope() {
+        ActiveBaseline() = static_cast< ProbeBaseline * >(previous_);
+        delete static_cast< ProbeBaseline * >(state_);
+    }
 
     CheckResult FullWidthCheck(
         const Expr &original, uint32_t original_num_vars, const Expr &simplified,
@@ -293,12 +339,37 @@ namespace cobra {
         std::vector< uint64_t > simplified_stack(simplified_eval.stack_size);
         EvaluatorWorkspace original_workspace;
 
+        // Probes 0 .. kIndepProbes-1 are the adversarial phases, whose inputs
+        // are fixed by arity and bitwidth. When the caller has opened a scope
+        // for this evaluator, its values there are reused across candidates
+        // instead of being recomputed for each one.
+        auto *baseline = ActiveBaseline();
+        if (baseline != nullptr
+            && (baseline->eval != &eval_original || baseline->num_vars != num_vars
+                || baseline->bitwidth != bitwidth))
+        {
+            baseline = nullptr;
+        }
+        const size_t kIndepProbes =
+            baseline == nullptr ? 0 : BuildAdversarialValues(bitwidth).size() * (1 + num_vars);
+
         std::vector< uint64_t > failing_input;
         const bool passed = ForEachFullWidthProbe(
-            num_vars, bitwidth, num_samples, inputs, expr_constants, [&](size_t) -> bool {
-                const uint64_t original_val = eval_original.HasCompiledExpr()
-                    ? (eval_original.EvaluateWithWorkspace(inputs, original_workspace) & kMask)
-                    : (eval_original(inputs) & kMask);
+            num_vars, bitwidth, num_samples, inputs, expr_constants, [&](size_t idx) -> bool {
+                uint64_t original_val = 0;
+                if (idx < kIndepProbes && idx < baseline->values.size()) {
+                    original_val = baseline->values[idx];
+                } else {
+                    original_val = eval_original.HasCompiledExpr()
+                        ? (eval_original.EvaluateWithWorkspace(inputs, original_workspace) & kMask)
+                        : (eval_original(inputs) & kMask);
+                    // Probes run in index order, so the cached prefix extends
+                    // by exactly one entry whenever a check probes deeper than
+                    // every previous one.
+                    if (idx < kIndepProbes && idx == baseline->values.size()) {
+                        baseline->values.push_back(original_val);
+                    }
+                }
                 const uint64_t simplified_val =
                     EvalCompiledExpr(simplified_eval, inputs, simplified_stack);
                 if (original_val != simplified_val) {

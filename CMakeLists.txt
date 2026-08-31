@@ -87,8 +87,32 @@ endif()
 find_package(Z3 QUIET CONFIG)
 if(Z3_FOUND)
     message(STATUS "Found Z3 ${Z3_VERSION}")
+endif()
+
+# Bitwuzla is optional and preferred when present: it discharges cobra-verify's
+# bitvector queries faster than Z3. Z3 stays the fallback.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH TRUE)
+    # Search the install prefix ahead of the system so we pick up the Bitwuzla
+    # the superbuild installed rather than a host copy.
+    foreach(_prefix IN LISTS CMAKE_PREFIX_PATH)
+        if(EXISTS "${_prefix}/lib/pkgconfig/bitwuzla.pc")
+            set(ENV{PKG_CONFIG_PATH} "${_prefix}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+        endif()
+    endforeach()
+    pkg_check_modules(BITWUZLA QUIET IMPORTED_TARGET bitwuzla)
+endif()
+
+if(BITWUZLA_FOUND)
+    set(COBRA_VERIFY_BACKEND "Bitwuzla")
+    message(STATUS "Found Bitwuzla ${BITWUZLA_VERSION} — cobra-verify will use it")
+elseif(Z3_FOUND)
+    set(COBRA_VERIFY_BACKEND "Z3")
+    message(STATUS "Bitwuzla not found — cobra-verify will use Z3")
 else()
-    message(STATUS "Z3 not found — cobra-verify will not be built")
+    set(COBRA_VERIFY_BACKEND "")
+    message(STATUS "No SMT solver found — cobra-verify will not be built")
 endif()
 
 add_subdirectory(lib/core)
@@ -108,7 +132,7 @@ if(COBRA_ENABLE_TRACY)
     target_link_libraries(cobra-core PUBLIC TracyClient)
 endif()
 
-if(Z3_FOUND)
+if(COBRA_VERIFY_BACKEND)
     add_subdirectory(lib/verify)
 endif()
 
@@ -131,7 +155,7 @@ install(DIRECTORY include/cobra
 
 # Collect installed targets for the package config export set
 set(_cobra_install_targets cobra-core cobra-cli)
-if(Z3_FOUND)
+if(COBRA_VERIFY_BACKEND)
     list(APPEND _cobra_install_targets cobra-verify)
 endif()
 set(COBRA_HAS_LLVM_TARGET OFF)

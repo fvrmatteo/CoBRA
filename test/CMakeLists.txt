@@ -84,13 +84,13 @@ target_include_directories(test_lifting_passes PRIVATE ${PROJECT_SOURCE_DIR}/lib
 
 cobra_add_test(test_semilinear_integration core/test_semilinear_integration.cpp)
 target_include_directories(test_semilinear_integration PRIVATE ${PROJECT_SOURCE_DIR}/lib/core)
-if(Z3_FOUND)
+if(COBRA_VERIFY_BACKEND)
     target_link_libraries(test_semilinear_integration PRIVATE cobra-verify)
     target_compile_definitions(test_semilinear_integration PRIVATE COBRA_HAS_Z3=1)
 endif()
 
 # Z3 verification tests (only when Z3 is available)
-if(Z3_FOUND)
+if(COBRA_VERIFY_BACKEND)
     add_executable(test_z3_verifier verify/test_z3_verifier.cpp)
     target_link_libraries(test_z3_verifier PRIVATE cobra-verify GTest::gtest_main)
     gtest_discover_tests(test_z3_verifier)
@@ -111,7 +111,7 @@ gtest_discover_tests(test_dataset_benchmarks)
 # Compares original MBA AST against simplified AST via Z3 bitvector solver.
 # Slow (~minutes per dataset) — run locally, not in CI:
 #   ./test/test_dataset_z3
-if(Z3_FOUND)
+if(COBRA_VERIFY_BACKEND)
     add_executable(test_dataset_z3 verify/test_dataset_z3.cpp
                    ${PROJECT_SOURCE_DIR}/tools/cobra-cli/ExprParser.cpp)
     target_link_libraries(test_dataset_z3 PRIVATE
