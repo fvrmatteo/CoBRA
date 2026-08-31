@@ -1159,22 +1159,20 @@ namespace cobra {
 
     } // namespace
 
-    std::vector< MBACandidate >
-    DetectMbaCandidates(
-        llvm::Function &f, uint32_t min_ast_size, uint32_t /*max_vars*/, uint64_t options_tag
-    ) {
-        std::vector< MBACandidate > candidates;
-        llvm::DenseSet< llvm::Instruction * > already_in_tree;
+    namespace {
 
-        // Post-order: process uses before defs across blocks.
-        // Within each block, reverse iteration hits outermost roots
-        // first, so the largest MBA tree claims inner nodes before
-        // they can be emitted as standalone candidates.
-        for (auto *bb : post_order(&f)) {
-            for (auto &inst : llvm::reverse(*bb)) {
-                if (!IsMbaRootOpcode(inst.getOpcode())) {
-                    continue;
-                }
+        // One sweep of the candidate builder over `roots`, in the order given.
+        // A root whose tree swallows a later root wins: the inner one is only
+        // reconsidered if the outer candidate goes on to fail, which the caller
+        // arranges by feeding `MBACandidate::inner_roots` back in.
+        void BuildCandidates(
+            llvm::ArrayRef< llvm::Instruction * > roots, uint32_t min_ast_size,
+            uint64_t options_tag, std::vector< MBACandidate > &candidates
+        ) {
+            llvm::DenseSet< llvm::Instruction * > already_in_tree;
+
+            for (auto *root : roots) {
+                auto &inst = *root;
                 if (already_in_tree.contains(&inst) != 0u) {
                     continue;
                 }
@@ -1244,8 +1242,48 @@ namespace cobra {
                     }
                 }
 
-                for (auto *ti : tree_insts) {
+                // Which of the tree's instructions actually disappear if the root
+                // is replaced. The root always does; anything else only follows
+                // once every one of its readers has gone. A node that is also
+                // stored, or feeds a sibling computation, therefore survives and
+                // keeps its own operands alive with it.
+                //
+                // This is both the honest measure of what a rewrite buys and the
+                // right rule for claiming: a surviving node is not subsumed by
+                // the root, so it stays eligible to be simplified in its own
+                // right.
+                llvm::DenseSet< llvm::Instruction * > dying{ &inst };
+                for (bool growing = true; growing;) {
+                    growing = false;
+                    for (auto *ti : tree_insts) {
+                        if (dying.contains(ti)) {
+                            continue;
+                        }
+                        const bool kConsumed =
+                            llvm::all_of(ti->users(), [&](const llvm::User *u) {
+                                auto *ui = llvm::dyn_cast< llvm::Instruction >(u);
+                                return ui != nullptr && dying.contains(ui);
+                            });
+                        if (kConsumed) {
+                            dying.insert(ti);
+                            growing = true;
+                        }
+                    }
+                }
+
+                for (auto *ti : dying) {
                     already_in_tree.insert(ti);
+                }
+
+                // `min_ast_size` is meant to keep the solver away from
+                // expressions too small to be worth its time. Measured on the
+                // collected tree it says the wrong thing about a root that reads
+                // values the rest of the block also needs: the tree is large,
+                // but replacing the root removes one instruction, so no rewrite
+                // can repay the search. What has to clear the bar is the number
+                // of instructions actually at stake.
+                if (dying.size() < min_ast_size) {
+                    continue;
                 }
 
                 const auto num_vars  = static_cast< uint32_t >(leaves.size());
@@ -1295,6 +1333,19 @@ namespace cobra {
                     return plan->Evaluate(vals.data(), vals.size(), scratch);
                 };
 
+                // Everything the tree covers apart from the root itself. If the
+                // root turns out to be irreducible these are where a smaller,
+                // reducible expression can still be hiding.
+                std::vector< llvm::Instruction * > inner_roots;
+                for (auto *ti : tree_insts) {
+                    if (ti != &inst && IsMbaRootOpcode(ti->getOpcode())
+                        && ti->getType()->isIntegerTy()
+                        && ti->getType()->getIntegerBitWidth() <= 64)
+                    {
+                        inner_roots.push_back(ti);
+                    }
+                }
+
                 candidates.push_back(
                     MBACandidate{ .root        = &inst,
                                   .leaf_values = std::move(leaves),
@@ -1303,11 +1354,41 @@ namespace cobra {
                                   .bitwidth    = bw,
                                   .expr        = std::move(expr),
                                   .evaluator   = std::move(evaluator),
-                                  .fingerprint = fingerprint }
+                                  .fingerprint = fingerprint,
+                                  .inner_roots = std::move(inner_roots),
+                                  .dying_count = static_cast< uint32_t >(dying.size()) }
                 );
             }
         }
 
+    } // namespace
+
+    std::vector< MBACandidate >
+    DetectMbaCandidates(
+        llvm::Function &f, uint32_t min_ast_size, uint32_t /*max_vars*/, uint64_t options_tag
+    ) {
+        // Post-order: process uses before defs across blocks. Within each block,
+        // reverse iteration hits outermost roots first, so the largest MBA tree
+        // claims inner nodes before they can be emitted as standalone candidates.
+        std::vector< llvm::Instruction * > roots;
+        for (auto *bb : post_order(&f)) {
+            for (auto &inst : llvm::reverse(*bb)) {
+                if (IsMbaRootOpcode(inst.getOpcode())) {
+                    roots.push_back(&inst);
+                }
+            }
+        }
+
+        std::vector< MBACandidate > candidates;
+        BuildCandidates(roots, min_ast_size, options_tag, candidates);
+        return candidates;
+    }
+
+    std::vector< MBACandidate > ExpandMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint64_t options_tag
+    ) {
+        std::vector< MBACandidate > candidates;
+        BuildCandidates(cand.inner_roots, min_ast_size, options_tag, candidates);
         return candidates;
     }
 

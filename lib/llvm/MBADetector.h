@@ -43,6 +43,20 @@ namespace cobra {
         std::unique_ptr< Expr > expr;
         Evaluator evaluator;
         MbaFingerprint fingerprint;
+
+        // The MBA roots this tree covers, root excluded. A tree is claimed by
+        // its outermost root, which is the right default: the bigger expression
+        // is the one worth simplifying. But an irreducible outer node would
+        // otherwise bury every reducible expression underneath it, so when a
+        // candidate fails these are handed back for a second look.
+        std::vector< llvm::Instruction * > inner_roots;
+
+        // How many instructions replacing the root would actually remove. The
+        // Expr the candidate carries is a tree, so a value the IR computes once
+        // and reads several times appears in it once per reader; costing a
+        // rewrite against that inflated shape is how a chain of shared adds ends
+        // up "simplified" into a wider polynomial. This is the count to beat.
+        uint32_t dying_count = 0;
     };
 
     // Find MBA candidates across a function.  Blocks are scanned in
@@ -59,6 +73,14 @@ namespace cobra {
     // invalidates every record without needing to rewrite the IR.
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag
+    );
+
+    // Candidates for the roots inside `cand`, to be used once `cand` itself has
+    // been rejected. Descending only on failure keeps the common case at one
+    // candidate per tree while still reaching expressions an irreducible outer
+    // node would otherwise hide.
+    std::vector< MBACandidate > ExpandMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint64_t options_tag
     );
 
     // Record `fp` on `inst` so a later run can skip the tree rooted there.

@@ -289,7 +289,16 @@ namespace cobra {
 
         auto &cache = SharedOutcomeCache();
 
-        for (auto &cand : candidates) {
+        // Rejected candidates put their inner roots back on the queue, so an
+        // expression stays reachable even when the tree enclosing it is not
+        // something CoBRA can do anything with. Each descent strictly shrinks
+        // the tree and `attempted` bars repeats, so the queue always drains.
+        llvm::DenseSet< llvm::Instruction * > attempted;
+        for (size_t index = 0; index < candidates.size(); ++index) {
+            auto &cand = candidates[index];
+            if (!attempted.insert(cand.root).second) {
+                continue;
+            }
             const std::string key = CandidateKey(cand, options_);
 
             OutcomeCache::Entry outcome;
@@ -305,6 +314,12 @@ namespace cobra {
                 // is the dominant cost when a function is re-optimized, so the
                 // shape that led nowhere is recorded on the root.
                 RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
+
+                for (auto &inner :
+                     ExpandMbaCandidate(cand, options_.min_ast_size, options_tag))
+                {
+                    candidates.push_back(std::move(inner));
+                }
                 continue;
             }
 
@@ -327,8 +342,48 @@ namespace cobra {
                 var_map = std::move(*checked_var_map);
             }
 
+            // Everything the builder emits lands between `mark` and the root, so
+            // the replacement can be priced in the only currency that matters —
+            // instructions — before anything commits to it.
+            auto *block          = cand.root->getParent();
+            const bool kAtFront  = cand.root->getIterator() == block->begin();
+            const auto kMark     = kAtFront ? block->end() : std::prev(cand.root->getIterator());
+
             llvm::IRBuilder<> builder(cand.root);
             auto *new_val = ReconstructIr(*outcome->expr, cand, builder, var_map);
+
+            llvm::SmallVector< llvm::Instruction *, 16 > emitted;
+            for (auto it = kAtFront ? block->begin() : std::next(kMark);
+                 &*it != cand.root; ++it)
+            {
+                emitted.push_back(&*it);
+            }
+
+            // CoBRA measures its own output against the candidate's Expr, which
+            // has already lost the sharing the IR had. Held to that yardstick a
+            // single add reading two values computed elsewhere looks like the
+            // whole cone beneath it, and expanding it into a polynomial reads as
+            // progress. Comparing emitted instructions against removed ones is
+            // what the rewrite is really worth.
+            if (emitted.size() >= cand.dying_count) {
+                for (auto *dead : llvm::reverse(emitted)) {
+                    if (dead->use_empty()) {
+                        dead->eraseFromParent();
+                    }
+                }
+                ++NumSkippedCost;
+                LLVM_DEBUG(
+                    llvm::dbgs() << "CoBRA: skipping — rewrite emits " << emitted.size()
+                                 << " instructions to remove " << cand.dying_count << "\n"
+                );
+                RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
+                for (auto &inner :
+                     ExpandMbaCandidate(cand, options_.min_ast_size, options_tag))
+                {
+                    candidates.push_back(std::move(inner));
+                }
+                continue;
+            }
 
             cand.root->replaceAllUsesWith(new_val);
             ++NumSimplified;

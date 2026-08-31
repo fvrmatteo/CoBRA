@@ -18,6 +18,16 @@ namespace cobra {
 
     namespace {
 
+        // Expr keeps every literal in a uint64_t regardless of the width it is
+        // interpreted at, so a negative constant reaches us sign-extended to 64
+        // bits. Z3 truncates such a value silently; Bitwuzla rejects it outright,
+        // so the wrap has to be made explicit here.
+        bitwuzla::Term BvValue(bitwuzla::TermManager &tm, uint32_t bitwidth, uint64_t value) {
+            const uint64_t kMask =
+                bitwidth >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << bitwidth) - 1);
+            return tm.mk_bv_value_uint64(tm.mk_bv_sort(bitwidth), value & kMask);
+        }
+
         bitwuzla::Term BuildSmtExpr(
             bitwuzla::TermManager &tm, const Expr &expr,
             const std::vector< bitwuzla::Term > &var_terms, uint32_t bitwidth
@@ -37,7 +47,7 @@ namespace cobra {
 
             switch (expr.kind) {
                 case Expr::Kind::kConstant:
-                    return tm.mk_bv_value_uint64(tm.mk_bv_sort(bitwidth), expr.constant_val);
+                    return BvValue(tm, bitwidth, expr.constant_val);
                 case Expr::Kind::kVariable:
                     return var_terms[expr.var_index];
                 case Expr::Kind::kAdd:
@@ -68,22 +78,21 @@ namespace cobra {
                             { BuildSmtExpr(tm, *expr.children[0], var_terms, bitwidth),
                                       BuildSmtExpr(tm, *expr.children[1], var_terms, bitwidth) }
                         );
-                        const auto kSort = tm.mk_bv_sort(bitwidth);
                         return tm.mk_term(
                             bitwuzla::Kind::ITE,
-                            { cmp, tm.mk_bv_value_uint64(kSort, 1),
-                              tm.mk_bv_value_uint64(kSort, 0) }
+                            { cmp, BvValue(tm, bitwidth, 1),
+                              BvValue(tm, bitwidth, 0) }
                         );
                     }
                     case Expr::Kind::kShr: {
                     // For kShr, constant_val carries the shift amount.
                     auto operand = BuildSmtExpr(tm, *expr.children[0], var_terms, bitwidth);
                     auto amount =
-                        tm.mk_bv_value_uint64(tm.mk_bv_sort(bitwidth), expr.constant_val);
+                        BvValue(tm, bitwidth, expr.constant_val);
                     return tm.mk_term(bitwuzla::Kind::BV_SHR, { operand, amount });
                 }
             }
-            return tm.mk_bv_value_uint64(tm.mk_bv_sort(bitwidth), 0); // unreachable
+            return BvValue(tm, bitwidth, 0); // unreachable
         }
 
         // Build the expression from CoB coefficients: sum over all subsets S of
@@ -95,7 +104,7 @@ namespace cobra {
             const std::vector< bitwuzla::Term > &var_terms, uint32_t num_vars, uint32_t bitwidth
         ) {
             const auto kSort = tm.mk_bv_sort(bitwidth);
-            auto result      = tm.mk_bv_value_uint64(kSort, coeffs[0]);
+            auto result      = BvValue(tm, bitwidth, coeffs[0]);
 
             const size_t kLen = 1ULL << num_vars;
             for (size_t i = 1; i < kLen; ++i) {
@@ -118,7 +127,7 @@ namespace cobra {
                     }
                 }
 
-                auto coeff = tm.mk_bv_value_uint64(kSort, coeffs[i]);
+                auto coeff = BvValue(tm, bitwidth, coeffs[i]);
                 auto term  = tm.mk_term(bitwuzla::Kind::BV_MUL, { coeff, product });
                 result     = tm.mk_term(bitwuzla::Kind::BV_ADD, { result, term });
             }
