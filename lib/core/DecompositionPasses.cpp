@@ -721,6 +721,32 @@ namespace cobra {
         const auto &target_vars =
             residual.target.vars.empty() ? ctx.original_vars : residual.target.vars;
 
+        // An empty `target.vars` means "the original space", but a remainder can
+        // span fewer variables than the space it came from — a constant
+        // remainder carries a single entry. EliminateAuxVars indexes the
+        // signature across all 2^|vars| entries, so a disagreement here would
+        // read past the end. Report no solution instead; a remainder that does
+        // not describe the target space cannot be recombined against it.
+        const size_t kTargetVarCount = target_vars.size();
+        if (kTargetVarCount >= 64
+            || residual.remainder_sig.size() != (1ULL << kTargetVarCount))
+        {
+            return Ok(
+                PassResult{
+                    .decision    = PassDecision::kBlocked,
+                    .disposition = ItemDisposition::kRetainCurrent,
+                    .reason =
+                        ReasonDetail{
+                                     .top = { .code    = { ReasonCategory::kNoSolution,
+                                                  ReasonDomain::kDecomposition,
+                                                  decomposition::kResidualFailed },
+                                     .message = "residual signature does not span the "
+                                                        "target variable space" },
+                                     },
+            }
+            );
+        }
+
         // Aux-var elimination on residual signature in the target space.
         auto elim                 = EliminateAuxVars(residual.remainder_sig, target_vars);
         const auto real_var_count = static_cast< uint32_t >(elim.real_vars.size());

@@ -162,10 +162,134 @@ namespace cobra {
                 case llvm::Instruction::LShr:
                 case llvm::Instruction::ZExt:
                 case llvm::Instruction::SExt:
+                case llvm::Instruction::Select:
+                case llvm::Instruction::ICmp:
                     return true;
                 default:
                     return false;
             }
+        }
+
+        // `icmp` produces i1, which is useless as a candidate root: it is only
+        // worth following as the condition feeding a `select` in a wider tree.
+        bool IsMbaRootOpcode(unsigned opcode) {
+            return opcode != llvm::Instruction::ICmp && IsMbaOpcode(opcode);
+        }
+
+        // Predicates the evaluator can reproduce from a value masked to the
+        // tree width. Ordered comparisons are normalised to lt/le by swapping
+        // operands, so gt/ge need no separate handling.
+        bool IsSupportedPredicate(llvm::CmpInst::Predicate pred) {
+            switch (pred) { // NOLINT(hicpp-multiway-paths-covered)
+                case llvm::CmpInst::ICMP_EQ:
+                case llvm::CmpInst::ICMP_NE:
+                case llvm::CmpInst::ICMP_ULT:
+                case llvm::CmpInst::ICMP_ULE:
+                case llvm::CmpInst::ICMP_UGT:
+                case llvm::CmpInst::ICMP_UGE:
+                case llvm::CmpInst::ICMP_SLT:
+                case llvm::CmpInst::ICMP_SLE:
+                case llvm::CmpInst::ICMP_SGT:
+                case llvm::CmpInst::ICMP_SGE:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        bool IsTreeWidthInt(const llvm::Value *v, uint32_t bw) {
+            auto *ty = v->getType();
+            return ty->isIntegerTy() && ty->getIntegerBitWidth() == bw;
+        }
+
+        // Every slot in a tree is evaluated under one mask, so a node whose
+        // operands are narrower than the root could be handed values it cannot
+        // hold in the IR. `select` and `icmp` therefore only join the tree when
+        // they work entirely at the tree width; otherwise they stay leaves, the
+        // behaviour that predates their support.
+        //
+        // A `select` additionally needs its condition to come from an `icmp` of
+        // the same width or an i1 constant. Any other condition would enter the
+        // tree as an i1 leaf, and leaves are probed across the full width, so it
+        // would be fed values a one-bit value can never take.
+        bool FitsTreeWidth(const llvm::Instruction *inst, uint32_t bw) {
+            if (const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
+                return IsTreeWidthInt(cmp->getOperand(0), bw)
+                    && IsSupportedPredicate(cmp->getPredicate());
+            }
+
+            if (inst->getOpcode() == llvm::Instruction::Select) {
+                if (!IsTreeWidthInt(inst, bw)) {
+                    return false;
+                }
+                const auto *cond = inst->getOperand(0);
+                if (llvm::isa< llvm::ConstantInt >(cond)) {
+                    return true;
+                }
+                const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(cond);
+                return cmp != nullptr && IsTreeWidthInt(cmp->getOperand(0), bw)
+                    && IsSupportedPredicate(cmp->getPredicate());
+            }
+
+            // A widening cast is modelled as a no-op, so the operand subtree is
+            // evaluated under the tree's mask rather than the narrower source
+            // one. That is only faithful when nothing is discarded: either the
+            // cast changes no bits, or the source is an i1 whose 0/1 value the
+            // model already reproduces exactly. A genuine widening (i8 -> i32,
+            // say) would drop the source's wrap-around, so it stays a leaf.
+            if (inst->getOpcode() == llvm::Instruction::ZExt
+                || inst->getOpcode() == llvm::Instruction::SExt)
+            {
+                if (!IsTreeWidthInt(inst, bw)) {
+                    return false;
+                }
+                const auto *src = inst->getOperand(0)->getType();
+                return src->isIntegerTy(1) || src->isIntegerTy(bw);
+            }
+
+            return true;
+        }
+
+        // True when an incoming value of `phi` leads back to `phi`, i.e. it
+        // carries a value around a loop.
+        //
+        // Such a phi must not be treated as transparent. Following the arm would
+        // re-enter the phi, and the recursion guards downstream break that cycle
+        // by substituting literal zero -- so a counter like
+        // `phi [1, entry], [iv + 1, body]` gets modelled as the constant `0 + 1`.
+        // That is not a conservative approximation but a different function, and
+        // both the evaluator and the AST agree on it, so the solver confirms a
+        // rewrite of an expression the program never computes. Worse, the arm
+        // divergence check then compares the folded `1` against the entry arm's
+        // literal `1`, finds them equal, and ratifies the transparency.
+        bool PhiIsLoopCarried(llvm::PHINode *phi) {
+            // Cap the walk so a wide operand graph cannot make detection
+            // quadratic in the size of the surrounding function.
+            constexpr unsigned kMaxVisited = 512;
+
+            llvm::DenseSet< llvm::Value * > seen;
+            llvm::SmallVector< llvm::Value *, 16 > work;
+            for (llvm::Value *inc : phi->incoming_values()) {
+                work.push_back(inc);
+            }
+
+            while (!work.empty()) {
+                llvm::Value *v = work.pop_back_val();
+                if (v == phi) {
+                    return true;
+                }
+                if (!seen.insert(v).second || seen.size() > kMaxVisited) {
+                    continue;
+                }
+                auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
+                if (inst == nullptr) {
+                    continue;
+                }
+                for (llvm::Use &use : inst->operands()) {
+                    work.push_back(use.get());
+                }
+            }
+            return false;
         }
 
         // BFS from root following operands.  MBA-opcode instructions
@@ -174,7 +298,8 @@ namespace cobra {
         // values are MBA opcodes — the first arm is followed and a
         // redirect entry is recorded for evaluation / expr building.
         void CollectTree(
-            llvm::Instruction *root, llvm::SmallVector< llvm::Instruction *, 16 > &tree_insts,
+            llvm::Instruction *root, uint32_t bw,
+            llvm::SmallVector< llvm::Instruction *, 16 > &tree_insts,
             std::vector< llvm::Value * > &leaves,
             llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
             bool try_phi_transparency = true
@@ -191,7 +316,9 @@ namespace cobra {
                 }
 
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
-                if ((inst != nullptr) && IsMbaOpcode(inst->getOpcode())) {
+                if ((inst != nullptr) && IsMbaOpcode(inst->getOpcode())
+                    && FitsTreeWidth(inst, bw))
+                {
                     // LShr with variable shift amount is unsupported —
                     // treat the whole instruction as a leaf.
                     if (inst->getOpcode() == llvm::Instruction::LShr
@@ -218,13 +345,15 @@ namespace cobra {
                             continue;
                         }
                         auto *inc_inst = llvm::dyn_cast< llvm::Instruction >(inc);
-                        if ((inc_inst == nullptr) || !IsMbaOpcode(inc_inst->getOpcode())) {
+                        if ((inc_inst == nullptr) || !IsMbaOpcode(inc_inst->getOpcode())
+                            || !FitsTreeWidth(inc_inst, bw))
+                        {
                             all_mba = false;
                             break;
                         }
                     }
 
-                    if (all_mba && try_phi_transparency) {
+                    if (all_mba && try_phi_transparency && !PhiIsLoopCarried(phi)) {
                         auto *chosen       = phi->getIncomingValue(0);
                         phi_redirects[phi] = chosen;
                         work.push(chosen);
@@ -265,6 +394,7 @@ namespace cobra {
             ) {
                 TreeEvalPlan plan;
                 plan.mask_ = Bitmask(bitwidth);
+                plan.bits_ = bitwidth;
 
                 llvm::DenseMap< llvm::Value *, uint32_t > leaf_index;
                 for (size_t i = 0; i < leaves.size(); ++i) {
@@ -328,6 +458,37 @@ namespace cobra {
                         case Op::kLShr:
                             slots[i] = ShiftRight(slots[n.a], slots[n.b]) & mask;
                             break;
+                        // Conditions are held as 0/1, so a plain test against
+                        // zero matches the i1 the IR would have produced.
+                        case Op::kSelect:
+                            slots[i] = slots[n.a] != 0 ? slots[n.b] : slots[n.c];
+                            break;
+                        case Op::kCmpEq:
+                            slots[i] = slots[n.a] == slots[n.b] ? 1 : 0;
+                            break;
+                        case Op::kCmpNe:
+                            slots[i] = slots[n.a] != slots[n.b] ? 1 : 0;
+                            break;
+                        case Op::kCmpUlt:
+                            slots[i] = slots[n.a] < slots[n.b] ? 1 : 0;
+                            break;
+                        case Op::kCmpUle:
+                            slots[i] = slots[n.a] <= slots[n.b] ? 1 : 0;
+                            break;
+                        // Operands are masked to the tree width, so the sign
+                        // bit has to be re-extended before comparing.
+                        case Op::kCmpSlt:
+                            slots[i] = SignExtend(slots[n.a], bits_)
+                                    < SignExtend(slots[n.b], bits_)
+                                ? 1
+                                : 0;
+                            break;
+                        case Op::kCmpSle:
+                            slots[i] = SignExtend(slots[n.a], bits_)
+                                    <= SignExtend(slots[n.b], bits_)
+                                ? 1
+                                : 0;
+                            break;
                     }
                 }
                 return slots[root_];
@@ -346,6 +507,13 @@ namespace cobra {
                 kXor,
                 kShl,
                 kLShr,
+                kSelect,
+                kCmpEq,
+                kCmpNe,
+                kCmpUlt,
+                kCmpUle,
+                kCmpSlt,
+                kCmpSle,
             };
 
             struct Node
@@ -353,7 +521,17 @@ namespace cobra {
                 Op op;
                 uint32_t a;
                 uint32_t b;
+                // Third operand, used only by kSelect.
+                uint32_t c = 0;
             };
+
+            static int64_t SignExtend(uint64_t v, uint32_t bits) {
+                if (bits >= 64) {
+                    return static_cast< int64_t >(v);
+                }
+                const uint64_t sign = 1ULL << (bits - 1);
+                return static_cast< int64_t >((v ^ sign) - sign);
+            }
 
             // Shift amounts come from an evaluated operand, so they are not
             // bounded by the type width. Saturate instead of shifting out of
@@ -370,6 +548,47 @@ namespace cobra {
                 auto slot = static_cast< uint32_t >(nodes_.size());
                 nodes_.push_back(Node{ .op = op, .a = a, .b = b });
                 return slot;
+            }
+
+            uint32_t Emit3(Op op, uint32_t a, uint32_t b, uint32_t c) {
+                auto slot = static_cast< uint32_t >(nodes_.size());
+                nodes_.push_back(Node{ .op = op, .a = a, .b = b, .c = c });
+                return slot;
+            }
+
+            // Arithmetic ops mask their own result, but inputs are held raw, so
+            // a comparison has to mask its operands itself: an out-of-range
+            // probe value would otherwise order differently than the IR does.
+            // gt/ge become lt/le with the operands swapped.
+            template < typename LowerFn >
+            uint32_t LowerCompare(llvm::ICmpInst &cmp, LowerFn &&lower) {
+                const uint32_t a = Emit(Op::kMask, lower(cmp.getOperand(0)), 0);
+                const uint32_t b = Emit(Op::kMask, lower(cmp.getOperand(1)), 0);
+
+                switch (cmp.getPredicate()) { // NOLINT(hicpp-multiway-paths-covered)
+                    case llvm::CmpInst::ICMP_EQ:
+                        return Emit(Op::kCmpEq, a, b);
+                    case llvm::CmpInst::ICMP_NE:
+                        return Emit(Op::kCmpNe, a, b);
+                    case llvm::CmpInst::ICMP_ULT:
+                        return Emit(Op::kCmpUlt, a, b);
+                    case llvm::CmpInst::ICMP_ULE:
+                        return Emit(Op::kCmpUle, a, b);
+                    case llvm::CmpInst::ICMP_UGT:
+                        return Emit(Op::kCmpUlt, b, a);
+                    case llvm::CmpInst::ICMP_UGE:
+                        return Emit(Op::kCmpUle, b, a);
+                    case llvm::CmpInst::ICMP_SLT:
+                        return Emit(Op::kCmpSlt, a, b);
+                    case llvm::CmpInst::ICMP_SLE:
+                        return Emit(Op::kCmpSle, a, b);
+                    case llvm::CmpInst::ICMP_SGT:
+                        return Emit(Op::kCmpSlt, b, a);
+                    case llvm::CmpInst::ICMP_SGE:
+                        return Emit(Op::kCmpSle, b, a);
+                    default:
+                        return kZeroSlot;
+                }
             }
 
             uint32_t Lower(
@@ -429,7 +648,28 @@ namespace cobra {
                 if (inst->getOpcode() == llvm::Instruction::ZExt
                     || inst->getOpcode() == llvm::Instruction::SExt)
                 {
-                    return Emit(Op::kMask, lower(inst->getOperand(0)), 0);
+                    const uint32_t child = lower(inst->getOperand(0));
+                    // Sign-extending an i1 gives 0 or all-ones. Masking would
+                    // leave 0/1, disagreeing with the Expr the verifier builds.
+                    if (inst->getOpcode() == llvm::Instruction::SExt
+                        && inst->getOperand(0)->getType()->isIntegerTy(1))
+                    {
+                        return Emit(Op::kSub, kZeroSlot, child);
+                    }
+                    return Emit(Op::kMask, child, 0);
+                }
+
+                if (inst->getOpcode() == llvm::Instruction::Select) {
+                    const uint32_t cond = lower(inst->getOperand(0));
+                    const uint32_t t    = lower(inst->getOperand(1));
+                    const uint32_t e    = lower(inst->getOperand(2));
+                    // An arm may be a raw input slot, so mask the chosen value
+                    // rather than relying on a later op to do it.
+                    return Emit(Op::kMask, Emit3(Op::kSelect, cond, t, e), 0);
+                }
+
+                if (auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
+                    return LowerCompare(*cmp, lower);
                 }
 
                 const uint32_t lhs = lower(inst->getOperand(0));
@@ -463,6 +703,7 @@ namespace cobra {
             std::vector< uint64_t > consts_;
             uint32_t root_ = kZeroSlot;
             uint64_t mask_ = UINT64_MAX;
+            uint32_t bits_ = 64;
         };
 
         bool HasPolynomialMul(
@@ -547,15 +788,85 @@ namespace cobra {
             return false;
         }
 
-        std::unique_ptr< Expr > BuildExprFromIR(
+        // Logical negation of a 0/1 value. Expr::BitwiseNot is bitwise, so it
+        // would map 1 to all-ones-but-the-low-bit rather than to 0.
+        std::unique_ptr< Expr > LogicalNot(std::unique_ptr< Expr > cond) {
+            return Expr::BitwiseXor(std::move(cond), Expr::Constant(1));
+        }
+
+        // Expr carries only equality, unsigned-less-than and signed-less-than.
+        // The greater-than forms swap operands and the or-equal forms negate the
+        // strict comparison with the operands swapped.
+        std::unique_ptr< Expr > BuildComparison(
+            llvm::CmpInst::Predicate pred, std::unique_ptr< Expr > lhs,
+            std::unique_ptr< Expr > rhs
+        ) {
+            switch (pred) { // NOLINT(hicpp-multiway-paths-covered)
+                case llvm::CmpInst::ICMP_EQ:
+                    return Expr::CmpEq(std::move(lhs), std::move(rhs));
+                case llvm::CmpInst::ICMP_NE:
+                    return LogicalNot(Expr::CmpEq(std::move(lhs), std::move(rhs)));
+                case llvm::CmpInst::ICMP_ULT:
+                    return Expr::CmpUlt(std::move(lhs), std::move(rhs));
+                case llvm::CmpInst::ICMP_UGT:
+                    return Expr::CmpUlt(std::move(rhs), std::move(lhs));
+                case llvm::CmpInst::ICMP_ULE:
+                    return LogicalNot(Expr::CmpUlt(std::move(rhs), std::move(lhs)));
+                case llvm::CmpInst::ICMP_UGE:
+                    return LogicalNot(Expr::CmpUlt(std::move(lhs), std::move(rhs)));
+                case llvm::CmpInst::ICMP_SLT:
+                    return Expr::CmpSlt(std::move(lhs), std::move(rhs));
+                case llvm::CmpInst::ICMP_SGT:
+                    return Expr::CmpSlt(std::move(rhs), std::move(lhs));
+                case llvm::CmpInst::ICMP_SLE:
+                    return LogicalNot(Expr::CmpSlt(std::move(rhs), std::move(lhs)));
+                case llvm::CmpInst::ICMP_SGE:
+                    return LogicalNot(Expr::CmpSlt(std::move(lhs), std::move(rhs)));
+                default:
+                    return nullptr;
+            }
+        }
+
+        // Removes a value from the in-progress path on the way back out, so a
+        // node shared by sibling operands is still expanded for each of them.
+        class PathScope
+        {
+          public:
+            PathScope(llvm::DenseSet< llvm::Value * > &set, llvm::Value *key)
+                : set_(set), key_(key) {}
+
+            ~PathScope() { set_.erase(key_); }
+
+            PathScope(const PathScope &)            = delete;
+            PathScope &operator=(const PathScope &) = delete;
+            PathScope(PathScope &&)                 = delete;
+            PathScope &operator=(PathScope &&)      = delete;
+
+          private:
+            llvm::DenseSet< llvm::Value * > &set_;
+            llvm::Value *key_;
+        };
+
+        std::unique_ptr< Expr > BuildExprFromIRImpl(
             llvm::Value *v, const std::vector< llvm::Value * > &leaves,
             const llvm::DenseSet< llvm::Value * > &tree_set, uint64_t mask,
-            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+            llvm::DenseSet< llvm::Value * > &in_progress
         ) {
+            // Following a transparent phi can lead back to a value already on
+            // the current path, so the operand graph is not necessarily a tree.
+            // TreeEvalPlan folds such a back edge to literal zero; do the same
+            // here, because the Expr has to describe the function the evaluator
+            // probes or verification would compare against a different original.
+            if (!in_progress.insert(v).second) {
+                return Expr::Constant(0);
+            }
+            const PathScope kPathScope{ in_progress, v };
+
             // Phi redirect: build from the chosen arm.
             auto pit = phi_redirects.find(v);
             if (pit != phi_redirects.end()) {
-                return BuildExprFromIR(pit->second, leaves, tree_set, mask, phi_redirects);
+                return BuildExprFromIRImpl(pit->second, leaves, tree_set, mask, phi_redirects, in_progress);
             }
 
             // Constant
@@ -579,9 +890,59 @@ namespace cobra {
             if (inst->getOpcode() == llvm::Instruction::ZExt
                 || inst->getOpcode() == llvm::Instruction::SExt)
             {
-                return BuildExprFromIR(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects
+                auto child = BuildExprFromIRImpl(
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
                 );
+                if (child == nullptr) {
+                    return nullptr;
+                }
+                // Sign-extending an i1 gives 0 or all-ones, which is exactly
+                // the negation of the 0/1 value. Passing it through unchanged
+                // would leave 0/1 and model a different function than the IR.
+                if (inst->getOpcode() == llvm::Instruction::SExt
+                    && inst->getOperand(0)->getType()->isIntegerTy(1))
+                {
+                    return Expr::Negate(std::move(child));
+                }
+                return child;
+            }
+
+            if (auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
+                auto lhs = BuildExprFromIRImpl(
+                    cmp->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                );
+                auto rhs = BuildExprFromIRImpl(
+                    cmp->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress
+                );
+                if (lhs == nullptr || rhs == nullptr) {
+                    return nullptr;
+                }
+                return BuildComparison(cmp->getPredicate(), std::move(lhs), std::move(rhs));
+            }
+
+            if (inst->getOpcode() == llvm::Instruction::Select) {
+                auto cond = BuildExprFromIRImpl(
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                );
+                auto then_arm = BuildExprFromIRImpl(
+                    inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress
+                );
+                auto else_arm = BuildExprFromIRImpl(
+                    inst->getOperand(2), leaves, tree_set, mask, phi_redirects, in_progress
+                );
+                if (cond == nullptr || then_arm == nullptr || else_arm == nullptr) {
+                    return nullptr;
+                }
+                // select(c, A, B) == B ^ ((A ^ B) & -c), because a 0/1 condition
+                // negates to all-ones or zero. Written in existing operators so
+                // no pass has to handle a three-child node. The clone is taken
+                // before `else_arm` is moved from, since argument evaluation
+                // order is unspecified.
+                auto diff   = Expr::BitwiseXor(std::move(then_arm), CloneExpr(*else_arm));
+                auto masked = Expr::BitwiseAnd(
+                    std::move(diff), Expr::Negate(std::move(cond))
+                );
+                return Expr::BitwiseXor(std::move(else_arm), std::move(masked));
             }
 
             // LShr with constant shift amount
@@ -591,7 +952,9 @@ namespace cobra {
                     return nullptr;
                 }
                 auto child =
-                    BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
+                    BuildExprFromIRImpl(
+                        inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                    );
                 if (child == nullptr) {
                     return nullptr;
                 }
@@ -603,7 +966,9 @@ namespace cobra {
                 auto *shift_amt = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
                 if (shift_amt == nullptr) { return nullptr; }
                 auto child =
-                    BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
+                    BuildExprFromIRImpl(
+                        inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                    );
                 if (child == nullptr) { return nullptr; }
                 uint64_t mul_val = 1ULL << shift_amt->getZExtValue();
                 return Expr::Mul(std::move(child), Expr::Constant(mul_val));
@@ -611,9 +976,13 @@ namespace cobra {
 
             // Binary operations
             auto lhs =
-                BuildExprFromIR(inst->getOperand(0), leaves, tree_set, mask, phi_redirects);
+                BuildExprFromIRImpl(
+                        inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                    );
             auto rhs =
-                BuildExprFromIR(inst->getOperand(1), leaves, tree_set, mask, phi_redirects);
+                BuildExprFromIRImpl(
+                        inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress
+                    );
             if (lhs == nullptr || rhs == nullptr) {
                 return nullptr;
             }
@@ -646,6 +1015,15 @@ namespace cobra {
                 default:
                     return nullptr;
             }
+        }
+
+        std::unique_ptr< Expr > BuildExprFromIR(
+            llvm::Value *v, const std::vector< llvm::Value * > &leaves,
+            const llvm::DenseSet< llvm::Value * > &tree_set, uint64_t mask,
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
+        ) {
+            llvm::DenseSet< llvm::Value * > in_progress;
+            return BuildExprFromIRImpl(v, leaves, tree_set, mask, phi_redirects, in_progress);
         }
 
         // Check that every leaf dependency of an alternative phi arm
@@ -794,7 +1172,7 @@ namespace cobra {
         // they can be emitted as standalone candidates.
         for (auto *bb : post_order(&f)) {
             for (auto &inst : llvm::reverse(*bb)) {
-                if (!IsMbaOpcode(inst.getOpcode())) {
+                if (!IsMbaRootOpcode(inst.getOpcode())) {
                     continue;
                 }
                 if (already_in_tree.contains(&inst) != 0u) {
@@ -812,7 +1190,7 @@ namespace cobra {
                 llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
                 std::vector< llvm::Value * > leaves;
                 llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
-                CollectTree(&inst, tree_insts, leaves, phi_redirects);
+                CollectTree(&inst, bw, tree_insts, leaves, phi_redirects);
 
                 if (tree_insts.size() < min_ast_size) {
                     continue;
@@ -854,7 +1232,7 @@ namespace cobra {
                     leaves.clear();
                     phi_redirects.clear();
                     CollectTree(
-                        &inst, tree_insts, leaves, phi_redirects,
+                        &inst, bw, tree_insts, leaves, phi_redirects,
                         /*try_phi_transparency=*/false
                     );
 
@@ -904,14 +1282,18 @@ namespace cobra {
                 // the Evaluator stays cheap; the per-call slot buffer is
                 // mutable state owned by the closure, matching the Evaluator
                 // thread-safety contract.
-                Evaluator evaluator;
-                if (expr != nullptr) {
-                    evaluator = [plan, scratch = std::vector< uint64_t >(plan->SlotCount())](
-                                    const std::vector< uint64_t > &vals
-                                ) mutable -> uint64_t {
-                        return plan->Evaluate(vals.data(), vals.size(), scratch);
-                    };
-                }
+                //
+                // The plan is built from the IR, so it stands on its own even
+                // when no Expr could be: trees holding a select or icmp have no
+                // Expr equivalent, and the 2^n signature alone samples each
+                // variable at 0 and 1 only. Full-width probing is what keeps
+                // those candidates honest, so the evaluator is always provided.
+                Evaluator evaluator =
+                    [plan, scratch = std::vector< uint64_t >(plan->SlotCount())](
+                        const std::vector< uint64_t > &vals
+                    ) mutable -> uint64_t {
+                    return plan->Evaluate(vals.data(), vals.size(), scratch);
+                };
 
                 candidates.push_back(
                     MBACandidate{ .root        = &inst,
@@ -954,7 +1336,7 @@ namespace cobra {
     }
 
     std::optional< MbaFingerprint > ComputeMbaFingerprint(llvm::Instruction *inst) {
-        if (inst == nullptr || !IsMbaOpcode(inst->getOpcode())
+        if (inst == nullptr || !IsMbaRootOpcode(inst->getOpcode())
             || !inst->getType()->isIntegerTy() || inst->getType()->getIntegerBitWidth() > 64)
         {
             return std::nullopt;
@@ -963,7 +1345,9 @@ namespace cobra {
         llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
         std::vector< llvm::Value * > leaves;
         llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
-        CollectTree(inst, tree_insts, leaves, phi_redirects);
+        CollectTree(
+            inst, inst->getType()->getIntegerBitWidth(), tree_insts, leaves, phi_redirects
+        );
 
         const llvm::DenseSet< llvm::Value * > tree_set(tree_insts.begin(), tree_insts.end());
         return FingerprintTree(inst, leaves, tree_set, phi_redirects);

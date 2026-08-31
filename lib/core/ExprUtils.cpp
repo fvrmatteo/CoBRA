@@ -152,6 +152,21 @@ namespace cobra {
                 return ModShr(
                     EvalConstantExpr(*expr.children[0], bitwidth), expr.constant_val, bitwidth
                 );
+            case Expr::Kind::kCmpEq:
+                return ModCmpEq(
+                    EvalConstantExpr(*expr.children[0], bitwidth),
+                    EvalConstantExpr(*expr.children[1], bitwidth), bitwidth
+                );
+            case Expr::Kind::kCmpUlt:
+                return ModCmpUlt(
+                    EvalConstantExpr(*expr.children[0], bitwidth),
+                    EvalConstantExpr(*expr.children[1], bitwidth), bitwidth
+                );
+            case Expr::Kind::kCmpSlt:
+                return ModCmpSlt(
+                    EvalConstantExpr(*expr.children[0], bitwidth),
+                    EvalConstantExpr(*expr.children[1], bitwidth), bitwidth
+                );
             case Expr::Kind::kVariable:
                 std::unreachable();
         }

@@ -33,6 +33,11 @@ namespace cobra {
                 case Expr::Kind::kAdd:
                 case Expr::Kind::kMul:
                 case Expr::Kind::kNeg:
+                // A comparison looks at its operands as whole words, so it has
+                // no per-bit reading and cannot take part in a bitwise atom.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt:
                     return false;
             }
             return false;
@@ -68,6 +73,11 @@ namespace cobra {
                 case Expr::Kind::kAdd:
                 case Expr::Kind::kMul:
                 case Expr::Kind::kNeg:
+                // Comparisons are not bitwise, so IsPurelyBitwise keeps them
+                // away from this function; EvalConstantArith evaluates them.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt:
                     break;
             }
             return 0;
@@ -103,6 +113,23 @@ namespace cobra {
                 case Expr::Kind::kXor:
                 case Expr::Kind::kNot:
                     return EvalConstantBitwise(expr, mask);
+                // A variable-free comparison folds to 0 or 1 exactly, and this
+                // function is reached for every variable-free subtree.
+                case Expr::Kind::kCmpEq:
+                    return ModCmpEq(
+                        EvalConstantArith(*expr.children[0], mask, bitwidth),
+                        EvalConstantArith(*expr.children[1], mask, bitwidth), bitwidth
+                    );
+                case Expr::Kind::kCmpUlt:
+                    return ModCmpUlt(
+                        EvalConstantArith(*expr.children[0], mask, bitwidth),
+                        EvalConstantArith(*expr.children[1], mask, bitwidth), bitwidth
+                    );
+                case Expr::Kind::kCmpSlt:
+                    return ModCmpSlt(
+                        EvalConstantArith(*expr.children[0], mask, bitwidth),
+                        EvalConstantArith(*expr.children[1], mask, bitwidth), bitwidth
+                    );
                 case Expr::Kind::kVariable:
                     break;
             }
@@ -157,6 +184,9 @@ namespace cobra {
                 case Expr::Kind::kMul:
                 case Expr::Kind::kNeg:
                 case Expr::Kind::kShr:
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt:
                     return OperatorFamily::kMixed;
             }
             return OperatorFamily::kMixed;
@@ -356,6 +386,11 @@ namespace cobra {
                 case Expr::Kind::kOr:
                 case Expr::Kind::kXor:
                 case Expr::Kind::kNot:
+                // A comparison over variables is neither a linear term nor a
+                // bitwise atom, so it gets the same explicit rejection.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt:
                     // Reached when the node has variables but is NOT
                     // purely bitwise (e.g. (x+y) & 0x457). Reject
                     // explicitly instead of silently dropping the subtree.

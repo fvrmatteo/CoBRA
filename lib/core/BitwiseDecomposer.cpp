@@ -65,6 +65,24 @@ namespace cobra {
                 return Expr::LogicalShr(
                     RemapVars(*expr.children[0], index_map), expr.constant_val
                 );
+            // Synthesis never produces comparisons, so these are not expected
+            // here, but the fallthrough below rewrites an unknown node to zero
+            // and that would silently change the expression's meaning.
+            case Expr::Kind::kCmpEq:
+                return Expr::CmpEq(
+                    RemapVars(*expr.children[0], index_map),
+                    RemapVars(*expr.children[1], index_map)
+                );
+            case Expr::Kind::kCmpUlt:
+                return Expr::CmpUlt(
+                    RemapVars(*expr.children[0], index_map),
+                    RemapVars(*expr.children[1], index_map)
+                );
+            case Expr::Kind::kCmpSlt:
+                return Expr::CmpSlt(
+                    RemapVars(*expr.children[0], index_map),
+                    RemapVars(*expr.children[1], index_map)
+                );
         }
         return Expr::Constant(0);
     }

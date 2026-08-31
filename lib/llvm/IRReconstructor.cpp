@@ -69,6 +69,23 @@ namespace cobra {
                 auto *rhs = ReconstructIr(*expr.children[1], candidate, builder, var_map);
                 return builder.CreateXor(lhs, rhs, "cobra.xor");
             }
+            // A comparison yields 0 or 1, so the i1 is widened back to the
+            // candidate width to keep every node in the tree the same type.
+            case Expr::Kind::kCmpEq:
+            case Expr::Kind::kCmpUlt:
+            case Expr::Kind::kCmpSlt: {
+                auto *lhs = ReconstructIr(*expr.children[0], candidate, builder, var_map);
+                auto *rhs = ReconstructIr(*expr.children[1], candidate, builder, var_map);
+                llvm::Value *cmp = nullptr;
+                if (expr.kind == Expr::Kind::kCmpEq) {
+                    cmp = builder.CreateICmpEQ(lhs, rhs, "cobra.cmpeq");
+                } else if (expr.kind == Expr::Kind::kCmpUlt) {
+                    cmp = builder.CreateICmpULT(lhs, rhs, "cobra.cmpult");
+                } else {
+                    cmp = builder.CreateICmpSLT(lhs, rhs, "cobra.cmpslt");
+                }
+                return builder.CreateZExt(cmp, int_ty, "cobra.cmpext");
+            }
             case Expr::Kind::kNot: {
                 auto *operand = ReconstructIr(*expr.children[0], candidate, builder, var_map);
                 auto *neg_one = llvm::ConstantInt::getAllOnesValue(int_ty);

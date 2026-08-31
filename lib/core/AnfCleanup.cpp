@@ -429,6 +429,9 @@ namespace cobra {
             case Expr::Kind::kMul:
             case Expr::Kind::kAnd:
             case Expr::Kind::kXor:
+            case Expr::Kind::kCmpEq:
+            case Expr::Kind::kCmpUlt:
+            case Expr::Kind::kCmpSlt:
             case Expr::Kind::kOr: {
                 uint32_t base = 1 + ExprCost(*expr.children[0]) + ExprCost(*expr.children[1]);
                 if (expr.kind == Expr::Kind::kOr) {

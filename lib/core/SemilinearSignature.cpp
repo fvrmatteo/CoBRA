@@ -3,6 +3,7 @@
 #include "cobra/core/Expr.h"
 #include "cobra/core/Trace.h"
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -99,6 +100,25 @@ namespace cobra {
                     for (size_t i = 0; i < len; ++i) { left[i] = (left[i] ^ right[i]) & kMask; }
                     return left;
                 }
+
+                // This is concrete evaluation at particular inputs rather than
+                // a per-bit abstraction, so a comparison evaluates exactly.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt: {
+                    auto left =
+                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
+                    auto right =
+                        EvalSemilinearRecursive(*expr.children[1], len, bitwidth, bit_pos);
+                    for (size_t i = 0; i < len; ++i) {
+                        left[i] = expr.kind == Expr::Kind::kCmpEq
+                            ? ModCmpEq(left[i], right[i], bitwidth)
+                            : (expr.kind == Expr::Kind::kCmpUlt
+                                   ? ModCmpUlt(left[i], right[i], bitwidth)
+                                   : ModCmpSlt(left[i], right[i], bitwidth));
+                    }
+                    return left;
+                }
             }
             return std::vector< uint64_t >(len, 0);
         }
@@ -165,6 +185,22 @@ namespace cobra {
                     return (EvalAtPoint(*expr.children[0], var_vals, mask)
                             ^ EvalAtPoint(*expr.children[1], var_vals, mask))
                         & mask;
+                // Only the mask is threaded through here, but it is always
+                // 2^bitwidth - 1, so its popcount recovers the width the
+                // signed comparison needs.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt: {
+                    const auto kBits = static_cast< uint32_t >(std::popcount(mask));
+                    const uint64_t kLhs = EvalAtPoint(*expr.children[0], var_vals, mask);
+                    const uint64_t kRhs = EvalAtPoint(*expr.children[1], var_vals, mask);
+                    if (expr.kind == Expr::Kind::kCmpEq) {
+                        return ModCmpEq(kLhs, kRhs, kBits);
+                    }
+                    return expr.kind == Expr::Kind::kCmpUlt
+                        ? ModCmpUlt(kLhs, kRhs, kBits)
+                        : ModCmpSlt(kLhs, kRhs, kBits);
+                }
             }
             return 0;
         }

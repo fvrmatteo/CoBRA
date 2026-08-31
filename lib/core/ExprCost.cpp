@@ -44,7 +44,14 @@ namespace cobra {
             case Expr::Kind::kAdd:
             case Expr::Kind::kAnd:
             case Expr::Kind::kOr:
-            case Expr::Kind::kXor: {
+            case Expr::Kind::kXor:
+            // Costed like any other binary node. Leaving these to the default
+            // below would price a whole comparison subtree at 1 and claim it
+            // has no variable dependency, understating the input a candidate is
+            // measured against.
+            case Expr::Kind::kCmpEq:
+            case Expr::Kind::kCmpUlt:
+            case Expr::Kind::kCmpSlt: {
                 auto lhs = ComputeCost(*expr.children[0]);
                 auto rhs = ComputeCost(*expr.children[1]);
                 return {

@@ -68,6 +68,9 @@ namespace cobra {
                 case Expr::Kind::kAnd:
                 case Expr::Kind::kOr:
                 case Expr::Kind::kXor:
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt:
                     frames.push_back({ .node = &node, .emit = true });
                     frames.push_back({ .node = node.children[1].get(), .emit = false });
                     frames.push_back({ .node = node.children[0].get(), .emit = false });
@@ -93,6 +96,9 @@ namespace cobra {
                 case Expr::Kind::kAnd:
                 case Expr::Kind::kOr:
                 case Expr::Kind::kXor:
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt:
                     --depth;
                     break;
             }
@@ -144,6 +150,21 @@ namespace cobra {
                     break;
                 case Expr::Kind::kXor:
                     stack[sp - 2] = (stack[sp - 2] ^ stack[sp - 1]) & compiled.mask;
+                    --sp;
+                    break;
+                case Expr::Kind::kCmpEq:
+                    stack[sp - 2] =
+                        ModCmpEq(stack[sp - 2], stack[sp - 1], compiled.bitwidth);
+                    --sp;
+                    break;
+                case Expr::Kind::kCmpUlt:
+                    stack[sp - 2] =
+                        ModCmpUlt(stack[sp - 2], stack[sp - 1], compiled.bitwidth);
+                    --sp;
+                    break;
+                case Expr::Kind::kCmpSlt:
+                    stack[sp - 2] =
+                        ModCmpSlt(stack[sp - 2], stack[sp - 1], compiled.bitwidth);
                     --sp;
                     break;
             }

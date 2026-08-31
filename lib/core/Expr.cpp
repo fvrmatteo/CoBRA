@@ -51,6 +51,12 @@ namespace cobra {
                     return 6;
                 case Expr::Kind::kOr:
                     return 7;
+                // Loosest binding, so a comparison is parenthesised inside any
+                // surrounding operator.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt:
+                    return 8;
                 default:
                     return 0;
             }
@@ -68,6 +74,12 @@ namespace cobra {
                     return " | ";
                 case Expr::Kind::kXor:
                     return " ^ ";
+                case Expr::Kind::kCmpEq:
+                    return " == ";
+                case Expr::Kind::kCmpUlt:
+                    return " <u ";
+                case Expr::Kind::kCmpSlt:
+                    return " <s ";
                 default:
                     return " ? ";
             }
@@ -185,6 +197,39 @@ namespace cobra {
         auto e          = MakeUnary(Kind::kShr, std::move(operand));
         e->constant_val = amount;
         return e;
+    }
+
+    // NOLINTNEXTLINE(readability-identifier-naming)
+    std::unique_ptr< Expr > Expr::CmpEq(
+        std::unique_ptr< Expr > lhs, std::unique_ptr< Expr > rhs
+    ) {
+        return MakeBinary(Kind::kCmpEq, std::move(lhs), std::move(rhs));
+    }
+
+    // NOLINTNEXTLINE(readability-identifier-naming)
+    std::unique_ptr< Expr > Expr::CmpUlt(
+        std::unique_ptr< Expr > lhs, std::unique_ptr< Expr > rhs
+    ) {
+        return MakeBinary(Kind::kCmpUlt, std::move(lhs), std::move(rhs));
+    }
+
+    // NOLINTNEXTLINE(readability-identifier-naming)
+    std::unique_ptr< Expr > Expr::CmpSlt(
+        std::unique_ptr< Expr > lhs, std::unique_ptr< Expr > rhs
+    ) {
+        return MakeBinary(Kind::kCmpSlt, std::move(lhs), std::move(rhs));
+    }
+
+    bool ContainsComparison(const Expr &expr) {
+        if (IsComparison(expr.kind)) {
+            return true;
+        }
+        for (const auto &child : expr.children) {
+            if (ContainsComparison(*child)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     std::unique_ptr< Expr > CloneExpr(const Expr &expr) {
