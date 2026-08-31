@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -14,6 +15,48 @@
 namespace cobra {
 
     namespace {
+
+        // CleanupAnf explores the same monomial set from several directions:
+        // Rule 3 recurses on the factored inner form and on the remainder, and
+        // FindBestFactor recurses once per candidate factor while ranking them.
+        // Those paths overlap heavily, and the function is pure in AnfForm, so
+        // the search collapses from exponential to the number of distinct
+        // sub-forms once results are keyed by the form itself. Entries are
+        // stored once and handed out as clones because callers own the tree.
+        struct AnfKey
+        {
+            std::vector< uint32_t > monomials;
+            uint32_t num_vars     = 0;
+            uint8_t constant_bit  = 0;
+
+            bool operator==(const AnfKey &other) const {
+                return constant_bit == other.constant_bit && num_vars == other.num_vars
+                    && monomials == other.monomials;
+            }
+        };
+
+        struct AnfKeyHash
+        {
+            size_t operator()(const AnfKey &key) const {
+                size_t hash = (static_cast< size_t >(key.num_vars) << 1)
+                    ^ static_cast< size_t >(key.constant_bit);
+                for (const uint32_t m : key.monomials) {
+                    hash ^= static_cast< size_t >(m) + 0x9E3779B97F4A7C15ULL + (hash << 6)
+                        + (hash >> 2);
+                }
+                return hash;
+            }
+        };
+
+        using AnfMemo = std::unordered_map< AnfKey, std::unique_ptr< Expr >, AnfKeyHash >;
+
+        AnfKey MakeAnfKey(const AnfForm &form) {
+            return AnfKey{ .monomials    = form.monomials,
+                           .num_vars     = form.num_vars,
+                           .constant_bit = form.constant_bit };
+        }
+
+        std::unique_ptr< Expr > CleanupAnfMemo(const AnfForm &form, AnfMemo &memo);
 
         bool MonomialLess(uint32_t a, uint32_t b) {
             const int kDa = std::popcount(a);
@@ -138,7 +181,7 @@ namespace cobra {
             std::vector< uint32_t > covered_indices;
         };
 
-        std::optional< FactorCandidate > FindBestFactor(const AnfForm &form) {
+        std::optional< FactorCandidate > FindBestFactor(const AnfForm &form, AnfMemo &memo) {
             if (form.monomials.size() < 2) { return std::nullopt; }
 
             // Collect candidate factors: single vars + var-pairs
@@ -209,7 +252,7 @@ namespace cobra {
                 const uint32_t factor_cost = MonomialExprCost(cand);
                 if (1 + factor_cost >= kRawCost) { continue; }
 
-                auto inner_expr              = CleanupAnf(inner);
+                auto inner_expr              = CleanupAnfMemo(inner, memo);
                 const uint32_t factored_cost = 1 + factor_cost + ExprCost(*inner_expr);
 
                 if (factored_cost < kRawCost) {
@@ -398,7 +441,9 @@ namespace cobra {
         return 1;
     }
 
-    std::unique_ptr< Expr > CleanupAnf(const AnfForm &form) {
+    namespace {
+
+    std::unique_ptr< Expr > CleanupAnfUncached(const AnfForm &form, AnfMemo &memo) {
         if (form.monomials.empty()) { return Expr::Constant(form.constant_bit); }
 
         // Rule 1: Full OR recognizer (exact match)
@@ -436,7 +481,7 @@ namespace cobra {
 
             if (remainder.monomials.empty() && remainder.constant_bit == 0) { return or_expr; }
 
-            auto rem_expr        = CleanupAnf(remainder);
+            auto rem_expr        = CleanupAnfMemo(remainder, memo);
             auto result          = Expr::BitwiseXor(std::move(or_expr), std::move(rem_expr));
             const uint32_t kCost = ExprCost(*result);
             if (kCost < best_cost) {
@@ -446,7 +491,7 @@ namespace cobra {
         }
 
         // Rule 3: Common-cube factoring
-        auto factor = FindBestFactor(form);
+        auto factor = FindBestFactor(form, memo);
         if (factor.has_value()) {
             std::vector< bool > used(form.monomials.size(), false);
             for (const uint32_t idx : factor->covered_indices) { used[idx] = true; }
@@ -464,7 +509,7 @@ namespace cobra {
             }
             std::sort(inner.monomials.begin(), inner.monomials.end(), MonomialLess);
 
-            auto inner_expr  = CleanupAnf(inner);
+            auto inner_expr  = CleanupAnfMemo(inner, memo);
             auto factor_expr = BuildMonomial(factor->factor_mask);
             auto factored    = Expr::BitwiseAnd(std::move(factor_expr), std::move(inner_expr));
 
@@ -479,7 +524,7 @@ namespace cobra {
             if (remainder.monomials.empty() && remainder.constant_bit == 0) {
                 result = std::move(factored);
             } else {
-                auto rem_expr = CleanupAnf(remainder);
+                auto rem_expr = CleanupAnfMemo(remainder, memo);
                 result        = Expr::BitwiseXor(std::move(factored), std::move(rem_expr));
             }
 
@@ -507,6 +552,22 @@ namespace cobra {
         }
 
         return best ? std::move(best) : std::move(raw);
+    }
+
+    std::unique_ptr< Expr > CleanupAnfMemo(const AnfForm &form, AnfMemo &memo) {
+        auto key = MakeAnfKey(form);
+        if (auto it = memo.find(key); it != memo.end()) { return CloneExpr(*it->second); }
+        auto result = CleanupAnfUncached(form, memo);
+        auto clone  = CloneExpr(*result);
+        memo.emplace(std::move(key), std::move(clone));
+        return result;
+    }
+
+    } // namespace
+
+    std::unique_ptr< Expr > CleanupAnf(const AnfForm &form) {
+        AnfMemo memo;
+        return CleanupAnfMemo(form, memo);
     }
 
 } // namespace cobra
