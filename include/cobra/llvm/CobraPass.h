@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cobra/core/Simplifier.h"
 #include "cobra/verify/Z3Verifier.h"
 
 #include <cstdint>
@@ -14,6 +15,7 @@ namespace cobra {
         uint32_t min_ast_size = 3;
         bool z3_verify        = false;
         Z3VerificationSettings z3_settings;
+        TechniqueFamily enabled_families = TechniqueFamily::kAll;
     };
 
     class CobraPass : public llvm::PassInfoMixin< CobraPass >

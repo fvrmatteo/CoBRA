@@ -153,11 +153,9 @@ namespace cobra {
                     );
                     fp.payload_hash = h;
                     fp.vars         = {};
-                } else if constexpr (
-                    std::is_same_v< T, NormalizedSemilinearPayload >
-                    || std::is_same_v< T, CheckedSemilinearPayload >
-                    || std::is_same_v< T, RewrittenSemilinearPayload >
-                )
+                } else if constexpr (std::is_same_v< T, NormalizedSemilinearPayload >
+                                     || std::is_same_v< T, CheckedSemilinearPayload >
+                                     || std::is_same_v< T, RewrittenSemilinearPayload >)
                 {
                     auto key        = BuildSemilinearFingerprintKey(payload.ctx.ir);
                     fp.payload_hash = std::hash< SemilinearFingerprintKey >{}(key);
@@ -225,9 +223,15 @@ namespace cobra {
             );
         }
         std::sort(key.terms.begin(), key.terms.end(), [](const auto &a, const auto &b) {
-            if (a.coeff != b.coeff) { return a.coeff < b.coeff; }
-            if (a.support != b.support) { return a.support < b.support; }
-            if (a.truth_table != b.truth_table) { return a.truth_table < b.truth_table; }
+            if (a.coeff != b.coeff) {
+                return a.coeff < b.coeff;
+            }
+            if (a.support != b.support) {
+                return a.support < b.support;
+            }
+            if (a.truth_table != b.truth_table) {
+                return a.truth_table < b.truth_table;
+            }
             if (a.structural_hash != b.structural_hash) {
                 return a.structural_hash < b.structural_hash;
             }
@@ -249,19 +253,29 @@ namespace cobra {
         // Sub-band within band 0: kCandidateExpr = 0, kCompetitionResolved = 1.
         int SubBandOf(const WorkItem &item) {
             auto kind = GetStateKind(item.payload);
-            if (kind == StateKind::kCandidateExpr) { return 0; }
-            if (kind == StateKind::kCompetitionResolved) { return 1; }
+            if (kind == StateKind::kCandidateExpr) {
+                return 0;
+            }
+            if (kind == StateKind::kCompetitionResolved) {
+                return 1;
+            }
             return 2;
         }
 
         bool IsBetterPriority(const WorkItem &a, const WorkItem &b) {
             int band_a = BandOf(a);
             int band_b = BandOf(b);
-            if (band_a != band_b) { return band_a < band_b; }
+            if (band_a != band_b) {
+                return band_a < band_b;
+            }
             int sub_a = SubBandOf(a);
             int sub_b = SubBandOf(b);
-            if (sub_a != sub_b) { return sub_a < sub_b; }
-            if (a.depth != b.depth) { return a.depth < b.depth; }
+            if (sub_a != sub_b) {
+                return sub_a < sub_b;
+            }
+            if (a.depth != b.depth) {
+                return a.depth < b.depth;
+            }
             if (a.features.provenance != b.features.provenance) {
                 return a.features.provenance < b.features.provenance;
             }
@@ -281,7 +295,9 @@ std::hash< cobra::StateFingerprint >::operator()(const cobra::StateFingerprint &
     h        = hash_combine(h, std::hash< int >{}(static_cast< int >(fp.kind)));
     h        = hash_combine(h, std::hash< uint32_t >{}(fp.bitwidth));
     h        = hash_combine(h, std::hash< int >{}(static_cast< int >(fp.provenance)));
-    for (const auto &v : fp.vars) { h = hash_combine(h, std::hash< std::string >{}(v)); }
+    for (const auto &v : fp.vars) {
+        h = hash_combine(h, std::hash< std::string >{}(v));
+    }
     return h;
 }
 
@@ -293,8 +309,12 @@ size_t std::hash< cobra::SemilinearFingerprintKey >::operator()(
     h        = hash_combine(h, std::hash< uint32_t >{}(key.bitwidth));
     for (const auto &t : key.terms) {
         h = hash_combine(h, std::hash< uint64_t >{}(t.coeff));
-        for (auto s : t.support) { h = hash_combine(h, std::hash< uint32_t >{}(s)); }
-        for (auto v : t.truth_table) { h = hash_combine(h, std::hash< uint64_t >{}(v)); }
+        for (auto s : t.support) {
+            h = hash_combine(h, std::hash< uint32_t >{}(s));
+        }
+        for (auto v : t.truth_table) {
+            h = hash_combine(h, std::hash< uint64_t >{}(v));
+        }
         h = hash_combine(h, std::hash< uint64_t >{}(t.structural_hash));
         h = hash_combine(h, std::hash< int >{}(static_cast< int >(t.provenance)));
     }
@@ -309,7 +329,9 @@ namespace cobra {
 
     bool PassAttemptCache::HasAttempted(const StateFingerprint &fp, PassId pass) const {
         auto it = cache_.find(fp);
-        if (it == cache_.end()) { return false; }
+        if (it == cache_.end()) {
+            return false;
+        }
         return (it->second & (uint64_t{ 1 } << static_cast< uint8_t >(pass))) != 0;
     }
 
@@ -321,7 +343,9 @@ namespace cobra {
     WorkItem Worklist::Pop() {
         size_t best = 0;
         for (size_t i = 1; i < items_.size(); ++i) {
-            if (IsBetterPriority(items_[i], items_[best])) { best = i; }
+            if (IsBetterPriority(items_[i], items_[best])) {
+                best = i;
+            }
         }
         WorkItem result = std::move(items_[best]);
         items_.erase(items_.begin() + static_cast< ptrdiff_t >(best));
@@ -416,9 +440,15 @@ namespace cobra {
         // 1. Candidate → kVerifyCandidate
         if (kind == StateKind::kCandidateExpr) {
             auto pass = PassId::kVerifyCandidate;
-            if (verifications_used >= policy.max_candidates) { return std::nullopt; }
-            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
-            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            if (verifications_used >= policy.max_candidates) {
+                return std::nullopt;
+            }
+            if ((item.attempted_mask & Bit(pass)) != 0) {
+                return std::nullopt;
+            }
+            if (cache.HasAttempted(fp, pass)) {
+                return std::nullopt;
+            }
             return pass;
         }
 
@@ -438,8 +468,12 @@ namespace cobra {
             };
 
             for (const auto &entry : kSignatureStatePasses) {
-                if ((item.attempted_mask & Bit(entry.id)) != 0) { continue; }
-                if (cache.HasAttempted(fp, entry.id)) { continue; }
+                if ((item.attempted_mask & Bit(entry.id)) != 0) {
+                    continue;
+                }
+                if (cache.HasAttempted(fp, entry.id)) {
+                    continue;
+                }
                 return entry.id;
             }
             return std::nullopt;
@@ -457,8 +491,12 @@ namespace cobra {
             };
 
             for (const auto &entry : kSignatureCoeffPasses) {
-                if ((item.attempted_mask & Bit(entry.id)) != 0) { continue; }
-                if (cache.HasAttempted(fp, entry.id)) { continue; }
+                if ((item.attempted_mask & Bit(entry.id)) != 0) {
+                    continue;
+                }
+                if (cache.HasAttempted(fp, entry.id)) {
+                    continue;
+                }
                 return entry.id;
             }
             return std::nullopt;
@@ -467,8 +505,12 @@ namespace cobra {
         // 3. CoreCandidate → kPrepareRemainderFromCore
         if (kind == StateKind::kCoreCandidate) {
             auto pass = PassId::kPrepareRemainderFromCore;
-            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
-            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            if ((item.attempted_mask & Bit(pass)) != 0) {
+                return std::nullopt;
+            }
+            if (cache.HasAttempted(fp, pass)) {
+                return std::nullopt;
+            }
             return pass;
         }
 
@@ -492,8 +534,12 @@ namespace cobra {
 
             for (size_t i = 0; i < table_size; ++i) {
                 const auto &entry = table[i];
-                if ((item.attempted_mask & Bit(entry.id)) != 0) { continue; }
-                if (cache.HasAttempted(fp, entry.id)) { continue; }
+                if ((item.attempted_mask & Bit(entry.id)) != 0) {
+                    continue;
+                }
+                if (cache.HasAttempted(fp, entry.id)) {
+                    continue;
+                }
                 return entry.id;
             }
             return std::nullopt;
@@ -502,40 +548,60 @@ namespace cobra {
         // 5. SemilinearNormalizedIr → kSemilinearCheck
         if (kind == StateKind::kSemilinearNormalizedIr) {
             auto pass = PassId::kSemilinearCheck;
-            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
-            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            if ((item.attempted_mask & Bit(pass)) != 0) {
+                return std::nullopt;
+            }
+            if (cache.HasAttempted(fp, pass)) {
+                return std::nullopt;
+            }
             return pass;
         }
 
         // 6. SemilinearCheckedIr → kSemilinearRewrite
         if (kind == StateKind::kSemilinearCheckedIr) {
             auto pass = PassId::kSemilinearRewrite;
-            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
-            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            if ((item.attempted_mask & Bit(pass)) != 0) {
+                return std::nullopt;
+            }
+            if (cache.HasAttempted(fp, pass)) {
+                return std::nullopt;
+            }
             return pass;
         }
 
         // 7. SemilinearRewrittenIr → kSemilinearReconstruct
         if (kind == StateKind::kSemilinearRewrittenIr) {
             auto pass = PassId::kSemilinearReconstruct;
-            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
-            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            if ((item.attempted_mask & Bit(pass)) != 0) {
+                return std::nullopt;
+            }
+            if (cache.HasAttempted(fp, pass)) {
+                return std::nullopt;
+            }
             return pass;
         }
 
         // 7b. CompetitionResolved → kResolveCompetition
         if (kind == StateKind::kCompetitionResolved) {
             auto pass = PassId::kResolveCompetition;
-            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
-            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            if ((item.attempted_mask & Bit(pass)) != 0) {
+                return std::nullopt;
+            }
+            if (cache.HasAttempted(fp, pass)) {
+                return std::nullopt;
+            }
             return pass;
         }
 
         // 7c. LiftedSkeleton → kPrepareLiftedOuterSolve
         if (kind == StateKind::kLiftedSkeleton) {
             auto pass = PassId::kPrepareLiftedOuterSolve;
-            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
-            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            if ((item.attempted_mask & Bit(pass)) != 0) {
+                return std::nullopt;
+            }
+            if (cache.HasAttempted(fp, pass)) {
+                return std::nullopt;
+            }
             return pass;
         }
 
@@ -547,46 +613,66 @@ namespace cobra {
                 && item.features.classification->semantic == SemanticClass::kSemilinear)
             {
                 eligible_semilinear = true;
-            } else if (
-                item.features.provenance == Provenance::kRewritten
-                && item.features.classification
-                && item.features.classification->semantic == SemanticClass::kSemilinear
-            )
+            } else if (item.features.provenance == Provenance::kRewritten
+                       && item.features.classification
+                       && item.features.classification->semantic == SemanticClass::kSemilinear)
             {
                 if (auto *ast = std::get_if< AstPayload >(&item.payload)) {
-                    if (ast->solve_ctx.has_value()) { eligible_semilinear = true; }
+                    if (ast->solve_ctx.has_value()) {
+                        eligible_semilinear = true;
+                    }
                 }
             }
             if (eligible_semilinear) {
                 auto pass = PassId::kSemilinearNormalize;
-                if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
-                if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+                if ((item.attempted_mask & Bit(pass)) != 0) {
+                    return std::nullopt;
+                }
+                if (cache.HasAttempted(fp, pass)) {
+                    return std::nullopt;
+                }
                 return pass;
             }
-            if (item.features.provenance == Provenance::kOriginal) { return std::nullopt; }
+            if (item.features.provenance == Provenance::kOriginal) {
+                return std::nullopt;
+            }
         }
 
         // 9. Non-original: must have classification and no unknown shape
-        if (!item.features.classification) { return std::nullopt; }
+        if (!item.features.classification) {
+            return std::nullopt;
+        }
         const auto &cls = *item.features.classification;
-        if (HasFlag(cls.flags, kSfHasUnknownShape)) { return std::nullopt; }
+        if (HasFlag(cls.flags, kSfHasUnknownShape)) {
+            return std::nullopt;
+        }
 
         // 10. Non-exploration candidates → only kBuildSignatureState
         if (!IsFoldedAstExplorationCandidate(cls.flags)) {
             auto pass = PassId::kBuildSignatureState;
-            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
-            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            if ((item.attempted_mask & Bit(pass)) != 0) {
+                return std::nullopt;
+            }
+            if (cache.HasAttempted(fp, pass)) {
+                return std::nullopt;
+            }
             return pass;
         }
 
         // 11. Exploration candidates → iterate the pass table
         for (const auto &entry : kFoldedAstPasses) {
-            if ((item.attempted_mask & Bit(entry.id)) != 0) { continue; }
-            if ((item.attempted_mask & entry.prereq_mask) != entry.prereq_mask) { continue; }
+            if ((item.attempted_mask & Bit(entry.id)) != 0) {
+                continue;
+            }
+            if ((item.attempted_mask & entry.prereq_mask) != entry.prereq_mask) {
+                continue;
+            }
             if (entry.is_structural_transform && item.rewrite_gen >= policy.max_rewrite_gen) {
                 continue;
             }
-            if (cache.HasAttempted(fp, entry.id)) { continue; }
+            if (cache.HasAttempted(fp, entry.id)) {
+                continue;
+            }
             return entry.id;
         }
 
@@ -596,28 +682,46 @@ namespace cobra {
 
     bool UnsupportedRankBetter(const UnsupportedCandidate &a, const UnsupportedCandidate &b) {
         // 1. Candidates (verification-failed) rank highest
-        if (a.is_candidate_state != b.is_candidate_state) { return a.is_candidate_state; }
+        if (a.is_candidate_state != b.is_candidate_state) {
+            return a.is_candidate_state;
+        }
         // 2. Deeper depth
-        if (a.depth != b.depth) { return a.depth > b.depth; }
+        if (a.depth != b.depth) {
+            return a.depth > b.depth;
+        }
         // 3. More rewrites
-        if (a.rewrite_gen != b.rewrite_gen) { return a.rewrite_gen > b.rewrite_gen; }
+        if (a.rewrite_gen != b.rewrite_gen) {
+            return a.rewrite_gen > b.rewrite_gen;
+        }
         // 4. More passes attempted
-        if (a.history_size != b.history_size) { return a.history_size > b.history_size; }
+        if (a.history_size != b.history_size) {
+            return a.history_size > b.history_size;
+        }
         // 5. Last PassId enum order
-        if (a.last_pass != b.last_pass) { return a.last_pass > b.last_pass; }
+        if (a.last_pass != b.last_pass) {
+            return a.last_pass > b.last_pass;
+        }
         // 6. Prefer items with structural transform terminal evidence
         bool a_has_terminal = a.metadata.structural_transform_terminal.has_value();
         bool b_has_terminal = b.metadata.structural_transform_terminal.has_value();
-        if (a_has_terminal != b_has_terminal) { return a_has_terminal; }
+        if (a_has_terminal != b_has_terminal) {
+            return a_has_terminal;
+        }
         if (a_has_terminal && b_has_terminal) {
             auto rank = [](ReasonCategory c) -> int {
-                if (c == ReasonCategory::kVerifyFailed) { return 2; }
-                if (c == ReasonCategory::kRepresentationGap) { return 1; }
+                if (c == ReasonCategory::kVerifyFailed) {
+                    return 2;
+                }
+                if (c == ReasonCategory::kRepresentationGap) {
+                    return 1;
+                }
                 return 0;
             };
             int ra = rank(a.metadata.structural_transform_terminal->category);
             int rb = rank(b.metadata.structural_transform_terminal->category);
-            if (ra != rb) { return ra > rb; }
+            if (ra != rb) {
+                return ra > rb;
+            }
         }
         return false;
     }
@@ -638,16 +742,22 @@ namespace cobra {
         std::optional< OrchestratorResult >
         TryReducedPolynomialSeedOutcome(const WorkItem &sig_seed, OrchestratorContext &ctx) {
             auto fast_candidate = TryReducedPolynomialFastPath(sig_seed, ctx);
-            if (!fast_candidate.has_value()) { return std::nullopt; }
+            if (!fast_candidate.has_value()) {
+                return std::nullopt;
+            }
 
             if (fast_candidate->needs_original_space_verification) {
-                if (!ctx.evaluator) { return std::nullopt; }
+                if (!ctx.evaluator) {
+                    return std::nullopt;
+                }
 
                 auto check = internal::VerifyInOriginalSpace(
                     *ctx.evaluator, ctx.original_vars, fast_candidate->real_vars,
                     *fast_candidate->expr, ctx.bitwidth
                 );
-                if (!check.passed) { return std::nullopt; }
+                if (!check.passed) {
+                    return std::nullopt;
+                }
 
                 fast_candidate->verification = VerificationState::kVerified;
                 fast_candidate->needs_original_space_verification = false;
@@ -785,7 +895,9 @@ namespace cobra {
 
             // Prerequisite: lower NOT-over-arith
             auto lower_result = RunLowerNotOverArith(seed, ctx);
-            if (!lower_result.has_value()) { return std::unexpected(lower_result.error()); }
+            if (!lower_result.has_value()) {
+                return std::unexpected(lower_result.error());
+            }
 
             auto &lr = lower_result.value();
 
@@ -802,7 +914,9 @@ namespace cobra {
 
             // Classify the target
             auto cls_result = RunClassifyAst(*classify_target, ctx);
-            if (!cls_result.has_value()) { return std::unexpected(cls_result.error()); }
+            if (!cls_result.has_value()) {
+                return std::unexpected(cls_result.error());
+            }
 
             auto &cr        = cls_result.value();
             auto classified = std::move(cr.next[0]);
@@ -1010,14 +1124,15 @@ namespace cobra {
             effective_opts.evaluator = Evaluator::FromExpr(*input_expr, opts.bitwidth);
         }
         OrchestratorPolicy policy;
+        policy.disabled_passes = DisabledPassMask(opts.enabled_families);
         OrchestratorContext context{
             .opts          = effective_opts,
             .original_vars = vars,
             .evaluator     = effective_opts.evaluator
-                ? std::optional< Evaluator >(
+                    ? std::optional< Evaluator >(
                       effective_opts.evaluator.WithTrace(EvaluatorTraceKind::kRoot)
                   )
-                : std::nullopt,
+                    : std::nullopt,
             .bitwidth      = opts.bitwidth,
             .run_metadata  = {},
             .input_sig     = sig,
@@ -1036,7 +1151,9 @@ namespace cobra {
         // Seeding
         if (input_expr == nullptr) {
             auto seed_result = SeedNoAst(sig, vars, context, worklist);
-            if (!seed_result.has_value()) { return std::unexpected(seed_result.error()); }
+            if (!seed_result.has_value()) {
+                return std::unexpected(seed_result.error());
+            }
             if (seed_result.value().has_value()) {
                 return Ok(ToSimplifyOutcome(
                     std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth,
@@ -1045,7 +1162,9 @@ namespace cobra {
             }
         } else {
             auto seed_result = SeedWithAst(*input_expr, context, worklist);
-            if (!seed_result.has_value()) { return std::unexpected(seed_result.error()); }
+            if (!seed_result.has_value()) {
+                return std::unexpected(seed_result.error());
+            }
             if (seed_result.value().has_value()) {
                 return Ok(ToSimplifyOutcome(
                     std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth,
@@ -1057,7 +1176,9 @@ namespace cobra {
         // Build registry lookup map
         const auto &registry = GetPassRegistry();
         absl::flat_hash_map< PassId, const PassDescriptor * > registry_map;
-        for (const auto &desc : registry) { registry_map[desc.id] = &desc; }
+        for (const auto &desc : registry) {
+            registry_map[desc.id] = &desc;
+        }
         PassAttemptCache cache;
         uint32_t expansions    = 0;
         uint32_t verifications = 0;
@@ -1102,8 +1223,12 @@ namespace cobra {
             if (item.metadata.structural_transform_terminal) {
                 auto &sig  = *item.metadata.structural_transform_terminal;
                 auto trank = [](ReasonCategory c) -> int {
-                    if (c == ReasonCategory::kVerifyFailed) { return 2; }
-                    if (c == ReasonCategory::kRepresentationGap) { return 1; }
+                    if (c == ReasonCategory::kVerifyFailed) {
+                        return 2;
+                    }
+                    if (c == ReasonCategory::kRepresentationGap) {
+                        return 1;
+                    }
                     return 0;
                 };
                 if (!strongest_transform_terminal
@@ -1151,7 +1276,9 @@ namespace cobra {
                         );
                         auto resolved =
                             ReleaseHandle(context.competition_groups, *item.group_id);
-                        if (resolved.has_value()) { worklist.Push(std::move(*resolved)); }
+                        if (resolved.has_value()) {
+                            worklist.Push(std::move(*resolved));
+                        }
                         continue;
                     }
 
@@ -1172,11 +1299,20 @@ namespace cobra {
             }
 
             // Select one pass
-            auto pass_id = SelectNextPass(item, policy, verifications, cache);
+            //
+            // Disabled families are folded into the item's attempted set rather
+            // than checked separately, so every table in SelectNextPass skips
+            // them by the rule it already has. Safe against the prerequisite
+            // check there because the only prerequisite in the tables is
+            // kExtractProductCore, which belongs to no disableable family.
+            item.attempted_mask |= policy.disabled_passes;
+            auto pass_id         = SelectNextPass(item, policy, verifications, cache);
             if (!pass_id) {
                 if (item.group_id.has_value()) {
                     auto resolved = ReleaseHandle(context.competition_groups, *item.group_id);
-                    if (resolved.has_value()) { worklist.Push(std::move(*resolved)); }
+                    if (resolved.has_value()) {
+                        worklist.Push(std::move(*resolved));
+                    }
                 }
                 continue;
             }
@@ -1192,7 +1328,9 @@ namespace cobra {
 
             // Run the pass
             auto it = registry_map.find(*pass_id);
-            if (it == registry_map.end()) { continue; }
+            if (it == registry_map.end()) {
+                continue;
+            }
             telemetry.passes_attempted.push_back(*pass_id);
             auto result = [&]() {
                 COBRA_ZONE_N("RunPass");
@@ -1203,7 +1341,9 @@ namespace cobra {
                 ++verifications;
                 telemetry.candidates_verified = verifications;
             }
-            if (!result.has_value()) { return std::unexpected(result.error()); }
+            if (!result.has_value()) {
+                return std::unexpected(result.error());
+            }
             cache.Record(fp, *pass_id);
 
             auto &pr = result.value();
@@ -1256,7 +1396,9 @@ namespace cobra {
                 // because it has no transfer mechanism.
             } else {
                 // kBlocked / kNoProgress
-                if (!pr.reason.top.message.empty()) { item.metadata.last_failure = pr.reason; }
+                if (!pr.reason.top.message.empty()) {
+                    item.metadata.last_failure = pr.reason;
+                }
                 // Accumulate technique failure into owning competition group
                 // so no-winner resolution produces deterministic diagnostics.
                 if (item.group_id.has_value() && !pr.reason.top.message.empty()) {
@@ -1316,7 +1458,9 @@ namespace cobra {
                     // Item consumed — release its group handle so the
                     // competition group can eventually resolve.
                     auto resolved = ReleaseHandle(context.competition_groups, *item.group_id);
-                    if (resolved.has_value()) { worklist.Push(std::move(*resolved)); }
+                    if (resolved.has_value()) {
+                        worklist.Push(std::move(*resolved));
+                    }
                 }
             }
         }
@@ -1379,7 +1523,9 @@ namespace cobra {
         {
             const auto &sf = *context.run_metadata.semilinear_failure;
             final_meta.cause_chain.push_back(sf.top);
-            for (const auto &c : sf.causes) { final_meta.cause_chain.push_back(c); }
+            for (const auto &c : sf.causes) {
+                final_meta.cause_chain.push_back(c);
+            }
         }
         // Fallback: collect cause chain from exhaustion reason
         if (final_meta.cause_chain.empty() && !exhaustion_reason.causes.empty()) {

@@ -69,6 +69,42 @@ namespace cobra {
         return id >= PassId::kExtractProductCore && id <= PassId::kResidualTemplate;
     }
 
+    // Passes that belong to no family are always scheduled: they are the
+    // classification, signature-building and verification steps every route
+    // depends on, not techniques in their own right.
+    inline uint64_t DisabledPassMask(TechniqueFamily enabled) {
+        const auto kBit = [](PassId id) { return uint64_t{ 1 } << static_cast< uint8_t >(id); };
+
+        uint64_t mask = 0;
+        if (!HasFamily(enabled, TechniqueFamily::kSemilinear)) {
+            mask |= kBit(PassId::kSemilinearNormalize) | kBit(PassId::kSemilinearCheck)
+                | kBit(PassId::kSemilinearRewrite) | kBit(PassId::kSemilinearReconstruct);
+        }
+        if (!HasFamily(enabled, TechniqueFamily::kPolynomial)) {
+            mask |= kBit(PassId::kExtractPolyCoreD2) | kBit(PassId::kExtractPolyCoreD3)
+                | kBit(PassId::kExtractPolyCoreD4) | kBit(PassId::kResidualPolyRecovery)
+                | kBit(PassId::kSignatureSingletonPolyRecovery)
+                | kBit(PassId::kSignatureMultivarPolyRecovery);
+        }
+        if (!HasFamily(enabled, TechniqueFamily::kTemplate)) {
+            mask |= kBit(PassId::kExtractTemplateCore) | kBit(PassId::kResidualTemplate);
+        }
+        if (!HasFamily(enabled, TechniqueFamily::kBitwise)) {
+            mask |= kBit(PassId::kSignatureBitwiseDecompose)
+                | kBit(PassId::kSignatureHybridDecompose);
+        }
+        if (!HasFamily(enabled, TechniqueFamily::kGhost)) {
+            mask |= kBit(PassId::kResidualGhost) | kBit(PassId::kResidualFactoredGhost)
+                | kBit(PassId::kResidualFactoredGhostEscalated);
+        }
+        if (!HasFamily(enabled, TechniqueFamily::kLifting)) {
+            mask |= kBit(PassId::kLiftArithmeticAtoms)
+                | kBit(PassId::kLiftRepeatedSubexpressions)
+                | kBit(PassId::kPrepareLiftedOuterSolve);
+        }
+        return mask;
+    }
+
     inline ExtractorKind ProjectExtractorKind(RemainderOrigin origin) {
         switch (origin) {
             case RemainderOrigin::kDirectBooleanNull:
