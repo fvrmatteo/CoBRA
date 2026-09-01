@@ -1,4 +1,5 @@
 #include "cobra/verify/Z3Verifier.h"
+#include "VerifyCache.h"
 #include "cobra/core/Expr.h"
 #include <cstddef>
 #include <cstdint>
@@ -101,11 +102,12 @@ namespace cobra {
                 case Expr::Kind::kCmpEq:
                 case Expr::Kind::kCmpUlt:
                 case Expr::Kind::kCmpSlt: {
-                    auto *l = BuildZ3Expr(ctx, *expr.children[0], var_asts, bitwidth);
-                    auto *r = BuildZ3Expr(ctx, *expr.children[1], var_asts, bitwidth);
-                    auto *cmp = expr.kind == Expr::Kind::kCmpEq ? Z3_mk_eq(ctx, l, r)
-                        : (expr.kind == Expr::Kind::kCmpUlt ? Z3_mk_bvult(ctx, l, r)
-                                                           : Z3_mk_bvslt(ctx, l, r));
+                    auto *l    = BuildZ3Expr(ctx, *expr.children[0], var_asts, bitwidth);
+                    auto *r    = BuildZ3Expr(ctx, *expr.children[1], var_asts, bitwidth);
+                    auto *cmp  = expr.kind == Expr::Kind::kCmpEq
+                         ? Z3_mk_eq(ctx, l, r)
+                         : (expr.kind == Expr::Kind::kCmpUlt ? Z3_mk_bvult(ctx, l, r)
+                                                             : Z3_mk_bvslt(ctx, l, r));
                     auto *sort = Z3_mk_bv_sort(ctx, bitwidth);
                     return Z3_mk_ite(
                         ctx, cmp, Z3_mk_unsigned_int64(ctx, 1, sort),
@@ -160,6 +162,14 @@ namespace cobra {
         const std::vector< std::string > &var_names, uint32_t num_vars, uint32_t bitwidth,
         Z3VerificationSettings settings
     ) {
+        using namespace verify_detail;
+
+        auto key =
+            CoeffQueryKey(cob_coeffs, simplified, var_names, num_vars, bitwidth, settings);
+        if (const auto *cached = Cache().Find(key)) {
+            return *cached;
+        }
+
         Z3_config cfg = Z3_mk_config();
         Z3_set_param_value(cfg, "timeout", std::to_string(settings.timeout_ms).c_str());
         Z3_context ctx = Z3_mk_context(cfg);
@@ -191,7 +201,7 @@ namespace cobra {
         Z3_solver_dec_ref(ctx, solver);
         Z3_del_context(ctx);
 
-        return result;
+        return Cache().Insert(std::move(key), result);
     }
 
     Z3VerifyResult Z3VerifyExprs(
@@ -199,6 +209,13 @@ namespace cobra {
         const std::vector< std::string > &var_names, uint32_t bitwidth,
         Z3VerificationSettings settings
     ) {
+        using namespace verify_detail;
+
+        auto key = ExprQueryKey(original, simplified, var_names, bitwidth, settings);
+        if (const auto *cached = Cache().Find(key)) {
+            return *cached;
+        }
+
         Z3_config cfg = Z3_mk_config();
         Z3_set_param_value(cfg, "timeout", std::to_string(settings.timeout_ms).c_str());
         Z3_context ctx = Z3_mk_context(cfg);
@@ -229,7 +246,7 @@ namespace cobra {
         Z3_solver_dec_ref(ctx, solver);
         Z3_del_context(ctx);
 
-        return result;
+        return Cache().Insert(std::move(key), result);
     }
 
 } // namespace cobra
