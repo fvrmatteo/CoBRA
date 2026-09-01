@@ -4,8 +4,9 @@
 // the two into cobra-verify, so both provide the same Z3Verify/Z3VerifyExprs
 // entry points. Bitwuzla is preferred when the superbuild provides it because
 // it discharges these bitvector queries faster; Z3 remains the fallback.
-#include "cobra/verify/Z3Verifier.h"
+#include "VerifyCache.h"
 #include "cobra/core/Expr.h"
+#include "cobra/verify/Z3Verifier.h"
 #include <bitwuzla/cpp/bitwuzla.h>
 #include <chrono>
 #include <cstddef>
@@ -64,31 +65,29 @@ namespace cobra {
                     return kUnary(bitwuzla::Kind::BV_NOT);
                 case Expr::Kind::kNeg:
                     return kUnary(bitwuzla::Kind::BV_NEG);
-                    // Comparisons are 0/1 valued, so the boolean result is
-                    // widened back to the expression's bitvector sort.
-                    case Expr::Kind::kCmpEq:
-                    case Expr::Kind::kCmpUlt:
-                    case Expr::Kind::kCmpSlt: {
-                        const auto kKind = expr.kind == Expr::Kind::kCmpEq
-                            ? bitwuzla::Kind::EQUAL
-                            : (expr.kind == Expr::Kind::kCmpUlt ? bitwuzla::Kind::BV_ULT
-                                                                : bitwuzla::Kind::BV_SLT);
-                        auto cmp         = tm.mk_term(
-                            kKind,
-                            { BuildSmtExpr(tm, *expr.children[0], var_terms, bitwidth),
-                                      BuildSmtExpr(tm, *expr.children[1], var_terms, bitwidth) }
-                        );
-                        return tm.mk_term(
-                            bitwuzla::Kind::ITE,
-                            { cmp, BvValue(tm, bitwidth, 1),
-                              BvValue(tm, bitwidth, 0) }
-                        );
-                    }
-                    case Expr::Kind::kShr: {
+                // Comparisons are 0/1 valued, so the boolean result is
+                // widened back to the expression's bitvector sort.
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt: {
+                    const auto kKind = expr.kind == Expr::Kind::kCmpEq
+                        ? bitwuzla::Kind::EQUAL
+                        : (expr.kind == Expr::Kind::kCmpUlt ? bitwuzla::Kind::BV_ULT
+                                                            : bitwuzla::Kind::BV_SLT);
+                    auto cmp         = tm.mk_term(
+                        kKind,
+                        { BuildSmtExpr(tm, *expr.children[0], var_terms, bitwidth),
+                                  BuildSmtExpr(tm, *expr.children[1], var_terms, bitwidth) }
+                    );
+                    return tm.mk_term(
+                        bitwuzla::Kind::ITE,
+                        { cmp, BvValue(tm, bitwidth, 1), BvValue(tm, bitwidth, 0) }
+                    );
+                }
+                case Expr::Kind::kShr: {
                     // For kShr, constant_val carries the shift amount.
                     auto operand = BuildSmtExpr(tm, *expr.children[0], var_terms, bitwidth);
-                    auto amount =
-                        BvValue(tm, bitwidth, expr.constant_val);
+                    auto amount  = BvValue(tm, bitwidth, expr.constant_val);
                     return tm.mk_term(bitwuzla::Kind::BV_SHR, { operand, amount });
                 }
             }
@@ -185,7 +184,7 @@ namespace cobra {
                 return result;
             }
 
-            result.unknown = true;
+            result.unknown   = true;
             // Bitwuzla reports no reason for UNKNOWN, so infer the time limit
             // from how long the check actually ran.
             result.timed_out = settings.timeout_ms > 0
@@ -198,8 +197,8 @@ namespace cobra {
         }
 
         std::vector< bitwuzla::Term > MakeVars(
-            bitwuzla::TermManager &tm, const std::vector< std::string > &var_names, size_t count,
-            uint32_t bitwidth
+            bitwuzla::TermManager &tm, const std::vector< std::string > &var_names,
+            size_t count, uint32_t bitwidth
         ) {
             const auto kSort = tm.mk_bv_sort(bitwidth);
             std::vector< bitwuzla::Term > vars;
@@ -217,13 +216,24 @@ namespace cobra {
         const std::vector< std::string > &var_names, uint32_t num_vars, uint32_t bitwidth,
         Z3VerificationSettings settings
     ) {
+        using namespace verify_detail;
+
+        auto key =
+            CoeffQueryKey(cob_coeffs, simplified, var_names, num_vars, bitwidth, settings);
+        if (const auto *cached = Cache().Find(key)) {
+            return *cached;
+        }
+
         bitwuzla::TermManager tm;
         auto var_terms = MakeVars(tm, var_names, num_vars, bitwidth);
 
         auto original = BuildOriginalFromCoeffs(tm, cob_coeffs, var_terms, num_vars, bitwidth);
         auto simpl    = BuildSmtExpr(tm, simplified, var_terms, bitwidth);
 
-        return CheckDisequality(tm, original, simpl, var_terms, var_names, settings);
+        return Cache().Insert(
+            std::move(key),
+            CheckDisequality(tm, original, simpl, var_terms, var_names, settings)
+        );
     }
 
     Z3VerifyResult Z3VerifyExprs(
@@ -231,13 +241,22 @@ namespace cobra {
         const std::vector< std::string > &var_names, uint32_t bitwidth,
         Z3VerificationSettings settings
     ) {
+        using namespace verify_detail;
+
+        auto key = ExprQueryKey(original, simplified, var_names, bitwidth, settings);
+        if (const auto *cached = Cache().Find(key)) {
+            return *cached;
+        }
+
         bitwuzla::TermManager tm;
         auto var_terms = MakeVars(tm, var_names, var_names.size(), bitwidth);
 
         auto lhs = BuildSmtExpr(tm, original, var_terms, bitwidth);
         auto rhs = BuildSmtExpr(tm, simplified, var_terms, bitwidth);
 
-        return CheckDisequality(tm, lhs, rhs, var_terms, var_names, settings);
+        return Cache().Insert(
+            std::move(key), CheckDisequality(tm, lhs, rhs, var_terms, var_names, settings)
+        );
     }
 
 } // namespace cobra
