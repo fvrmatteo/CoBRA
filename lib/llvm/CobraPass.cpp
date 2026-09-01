@@ -169,6 +169,7 @@ namespace cobra {
             tag          = mix(tag, options.z3_verify ? 1 : 0);
             tag          = mix(tag, options.z3_settings.timeout_ms);
             tag = mix(tag, static_cast< uint64_t >(options.z3_settings.unknown_result_mode));
+            tag = mix(tag, static_cast< uint64_t >(options.enabled_families));
             return tag;
         }
 
@@ -176,10 +177,11 @@ namespace cobra {
         // null when any gate rejects it.
         OutcomeCache::Entry
         SolveCandidate(const MBACandidate &cand, const CobraPassOptions &options) {
-            Options opts{ .bitwidth   = cand.bitwidth,
-                          .max_vars   = options.max_vars,
-                          .spot_check = true,
-                          .evaluator  = cand.evaluator };
+            Options opts{ .bitwidth         = cand.bitwidth,
+                          .max_vars         = options.max_vars,
+                          .spot_check       = true,
+                          .enabled_families = options.enabled_families,
+                          .evaluator        = cand.evaluator };
 
             // Pass AST when available — unlocks semilinear,
             // MixedRewrite, and decomposition pipelines.
@@ -273,10 +275,9 @@ namespace cobra {
             }
 #endif
 
-            return std::make_shared< const CandidateOutcome >(
-                CandidateOutcome{ .expr      = std::move(result.value().expr),
-                                  .real_vars = std::move(result.value().real_vars) }
-            );
+            return std::make_shared< const CandidateOutcome >(CandidateOutcome{
+                .expr      = std::move(result.value().expr),
+                .real_vars = std::move(result.value().real_vars) });
         }
 
     } // namespace
@@ -320,8 +321,7 @@ namespace cobra {
                 // shape that led nowhere is recorded on the root.
                 RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
 
-                for (auto &inner :
-                     ExpandMbaCandidate(cand, options_.min_ast_size, options_tag))
+                for (auto &inner : ExpandMbaCandidate(cand, options_.min_ast_size, options_tag))
                 {
                     candidates.push_back(std::move(inner));
                 }
@@ -350,16 +350,16 @@ namespace cobra {
             // Everything the builder emits lands between `mark` and the root, so
             // the replacement can be priced in the only currency that matters —
             // instructions — before anything commits to it.
-            auto *block          = cand.root->getParent();
-            const bool kAtFront  = cand.root->getIterator() == block->begin();
-            const auto kMark     = kAtFront ? block->end() : std::prev(cand.root->getIterator());
+            auto *block         = cand.root->getParent();
+            const bool kAtFront = cand.root->getIterator() == block->begin();
+            const auto kMark    = kAtFront ? block->end() : std::prev(cand.root->getIterator());
 
             llvm::IRBuilder<> builder(cand.root);
             auto *new_val = ReconstructIr(*outcome->expr, cand, builder, var_map);
 
             llvm::SmallVector< llvm::Instruction *, 16 > emitted;
-            for (auto it = kAtFront ? block->begin() : std::next(kMark);
-                 &*it != cand.root; ++it)
+            for (auto it = kAtFront ? block->begin() : std::next(kMark); &*it != cand.root;
+                 ++it)
             {
                 emitted.push_back(&*it);
             }
@@ -382,8 +382,7 @@ namespace cobra {
                                  << " instructions to remove " << cand.dying_count << "\n"
                 );
                 RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
-                for (auto &inner :
-                     ExpandMbaCandidate(cand, options_.min_ast_size, options_tag))
+                for (auto &inner : ExpandMbaCandidate(cand, options_.min_ast_size, options_tag))
                 {
                     candidates.push_back(std::move(inner));
                 }

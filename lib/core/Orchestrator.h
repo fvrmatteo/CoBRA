@@ -325,6 +325,8 @@ namespace cobra {
         uint32_t max_expansions  = 1024;
         uint32_t max_rewrite_gen = 3;
         uint32_t max_candidates  = 8;
+        // Passes belonging to technique families the caller switched off.
+        uint64_t disabled_passes = 0;
     };
 
     struct OrchestratorTelemetry
