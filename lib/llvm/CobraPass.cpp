@@ -204,6 +204,27 @@ namespace cobra {
                 return nullptr;
             }
 
+            // Cost gate: don't replace if simplified form is not
+            // smaller. nuw/nsw flags are intentionally dropped —
+            // CoBRA's Expr model is modular arithmetic and we
+            // cannot soundly preserve wrapping guarantees.
+            //
+            // Runs before verification: it is a purely syntactic comparison of
+            // the two forms, so a candidate it rejects is rejected whatever the
+            // solver would have said, and checking it first keeps the rejected
+            // majority out of the solver entirely.
+            if (cand.expr != nullptr) {
+                auto original_cost   = ComputeCost(*cand.expr);
+                auto simplified_cost = ComputeCost(*result.value().expr);
+                if (!IsBetter(simplified_cost.cost, original_cost.cost)) {
+                    ++NumSkippedCost;
+                    LLVM_DEBUG(
+                        llvm::dbgs() << "CoBRA: skipping — simplified form is not smaller\n"
+                    );
+                    return nullptr;
+                }
+            }
+
 #ifdef COBRA_HAS_Z3
             if (options.z3_verify) {
                 if (ast == nullptr) {
@@ -251,22 +272,6 @@ namespace cobra {
                 return nullptr;
             }
 #endif
-
-            // Cost gate: don't replace if simplified form is not
-            // smaller. nuw/nsw flags are intentionally dropped —
-            // CoBRA's Expr model is modular arithmetic and we
-            // cannot soundly preserve wrapping guarantees.
-            if (cand.expr != nullptr) {
-                auto original_cost   = ComputeCost(*cand.expr);
-                auto simplified_cost = ComputeCost(*result.value().expr);
-                if (!IsBetter(simplified_cost.cost, original_cost.cost)) {
-                    ++NumSkippedCost;
-                    LLVM_DEBUG(
-                        llvm::dbgs() << "CoBRA: skipping — simplified form is not smaller\n"
-                    );
-                    return nullptr;
-                }
-            }
 
             return std::make_shared< const CandidateOutcome >(
                 CandidateOutcome{ .expr      = std::move(result.value().expr),
