@@ -164,6 +164,40 @@ namespace cobra {
             return best;
         }
 
+        std::optional< std::unique_ptr< Expr > > TryRecoverUnaryMaskedXor(
+            const Expr &expr, uint32_t bitwidth, const ExprCost &baseline_cost
+        ) {
+            const uint64_t kConstant = EvalExpr(expr, { 0 }, bitwidth);
+            uint64_t mask            = 0;
+
+            for (uint32_t bit = 0; bit < bitwidth; ++bit) {
+                const uint64_t kBasis = uint64_t{ 1 } << bit;
+                const uint64_t kValue = EvalExpr(expr, { kBasis }, bitwidth);
+                if (kValue == kConstant) { continue; }
+                if (kValue != (kConstant ^ kBasis)) { return std::nullopt; }
+                mask |= kBasis;
+            }
+
+            if (mask == 0) { return std::nullopt; }
+
+            auto variable = Expr::Variable(0);
+            std::unique_ptr< Expr > masked = mask == Bitmask(bitwidth)
+                ? std::move(variable)
+                : Expr::BitwiseAnd(std::move(variable), Expr::Constant(mask));
+            auto candidate = kConstant == 0
+                ? std::move(masked)
+                : Expr::BitwiseXor(Expr::Constant(kConstant), std::move(masked));
+
+            if (!IsBetter(ComputeCost(*candidate).cost, baseline_cost)) {
+                return std::nullopt;
+            }
+            auto check = FullWidthCheck(
+                expr, 1, *candidate, {}, bitwidth, kResidualGateProbeCount
+            );
+            if (!check.passed) { return std::nullopt; }
+            return candidate;
+        }
+
         std::optional< std::unique_ptr< Expr > >
         TrySimplifyPatternSubtree(const Expr &expr, uint32_t bitwidth) {
             const auto baseline_cost = ComputeCost(expr).cost;
@@ -192,6 +226,14 @@ namespace cobra {
                         if (!support.empty()) { RemapVarIndices(**match, support); }
                         return match;
                     }
+                }
+            }
+
+            if (num_vars == 1) {
+                auto unary = TryRecoverUnaryMaskedXor(*dense_expr, bitwidth, baseline_cost);
+                if (unary.has_value()) {
+                    if (!support.empty()) { RemapVarIndices(**unary, support); }
+                    return unary;
                 }
             }
 

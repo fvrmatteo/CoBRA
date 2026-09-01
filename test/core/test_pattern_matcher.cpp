@@ -614,6 +614,35 @@ TEST(PatternMatcherTest, SimplifyPatternSubtreesCollapsesTwoVarAffineCombo) {
     EXPECT_NE(Render(*simplified, { "b", "x" }).find("^"), std::string::npos);
 }
 
+TEST(PatternMatcherTest, SimplifyPatternSubtreesRecoversUnaryMaskedXor) {
+    auto mixed = Expr::BitwiseXor(Expr::Variable(0), Expr::Constant(263317464));
+    auto carry = Expr::CmpUlt(Expr::Constant(2718937588), CloneExpr(*mixed));
+    auto carry_bit = Expr::BitwiseAnd(
+        Expr::Constant(2147483648), Expr::Negate(std::move(carry))
+    );
+    auto expr = Expr::Add(
+        Expr::Add(
+            Expr::Add(
+                Expr::BitwiseXor(
+                    Expr::LogicalShr(Expr::Variable(0), 1), Expr::Constant(3604949782)
+                ),
+                Expr::Constant(1)
+            ),
+            Expr::LogicalShr(
+                Expr::Add(std::move(mixed), Expr::Constant(1576029707)), 1
+            )
+        ),
+        std::move(carry_bit)
+    );
+    auto original   = CloneExpr(*expr);
+    auto simplified = SimplifyPatternSubtrees(std::move(expr), 32);
+
+    auto check = FullWidthCheck(*original, 1, *simplified, {}, 32, kResidualGateProbeCount);
+    EXPECT_TRUE(check.passed);
+    EXPECT_TRUE(IsBetter(ComputeCost(*simplified).cost, ComputeCost(*original).cost));
+    EXPECT_EQ(Render(*simplified, { "x" }, 32), "229656072 ^ x & 1576029707");
+}
+
 // Exhaustive: verify all 256 3-var Boolean functions produce correct
 // expressions by evaluating at every input combination.
 TEST(PatternMatcherTest, ThreeVarExhaustiveCorrectness) {
