@@ -18,13 +18,14 @@
 #include <functional>
 #include <hwy/highway.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
 
 namespace cobra {
 
@@ -82,6 +83,146 @@ namespace cobra {
             return (h0 ^ h1) ^ (h2 ^ h3);
         }
 
+        struct TemplateCacheKey
+        {
+            ProbeVals target;
+            uint32_t num_vars;
+            uint32_t bitwidth;
+
+            bool operator==(const TemplateCacheKey &other) const {
+                return num_vars == other.num_vars && bitwidth == other.bitwidth
+                    && static_cast< const std::array< uint64_t, kNProbes > & >(target)
+                    == static_cast< const std::array< uint64_t, kNProbes > & >(other.target);
+            }
+        };
+
+        struct TemplateCacheKeyHash
+        {
+            size_t operator()(const TemplateCacheKey &key) const {
+                size_t hash  = Fingerprint(key.target);
+                hash        ^= static_cast< size_t >(key.num_vars) + 0x9E3779B9U + (hash << 6)
+                    + (hash >> 2);
+                hash ^= static_cast< size_t >(key.bitwidth) + 0x9E3779B9U + (hash << 6)
+                    + (hash >> 2);
+                return hash;
+            }
+        };
+
+        // Candidates that reached a full-width check and were turned down.
+        //
+        // The enumeration a template search performs is a pure function of the
+        // cache key: the probe points, the atom pool and the seeded constants
+        // are all derived from the target signature, the arity and the
+        // bitwidth. The evaluator only enters through FullWidthCheckEval, so
+        // two searches sharing a key differ only in which candidates that check
+        // accepts. Keeping the rejected candidates means a later search on the
+        // same key can be answered by re-checking just those: if they all fail
+        // again, every other candidate was already ruled out on the probe
+        // values alone and the search cannot end anywhere but where it did.
+        using MissWitnesses = std::vector< std::unique_ptr< Expr > >;
+
+        struct WitnessCollector
+        {
+            // A search that turns down more candidates than this is left
+            // uncached: replaying a long witness list is no longer clearly
+            // cheaper than redoing the search.
+            static constexpr size_t kMaxWitnesses = 4096;
+
+            MissWitnesses failed;
+            bool overflow = false;
+        };
+
+        WitnessCollector *&ActiveWitnessCollector() {
+            static thread_local WitnessCollector *active = nullptr;
+            return active;
+        }
+
+        class WitnessScope
+        {
+          public:
+            WitnessScope() : previous_(ActiveWitnessCollector()) {
+                ActiveWitnessCollector() = &collector_;
+            }
+
+            WitnessScope(const WitnessScope &)            = delete;
+            WitnessScope &operator=(const WitnessScope &) = delete;
+
+            ~WitnessScope() { ActiveWitnessCollector() = previous_; }
+
+            WitnessCollector &collector() { return collector_; }
+
+          private:
+            WitnessCollector collector_;
+            WitnessCollector *previous_;
+        };
+
+        void RecordMissWitness(const Expr &candidate) {
+            auto *collector = ActiveWitnessCollector();
+            if (collector == nullptr || collector->overflow) {
+                return;
+            }
+            if (collector->failed.size() >= WitnessCollector::kMaxWitnesses) {
+                collector->overflow = true;
+                collector->failed.clear();
+                return;
+            }
+            collector->failed.push_back(CloneExpr(candidate));
+        }
+
+        class TemplateCache
+        {
+          public:
+            std::shared_ptr< const MissWitnesses > FindMiss(const TemplateCacheKey &key) const {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                const auto it = misses_.find(key);
+                return it == misses_.end() ? nullptr : it->second;
+            }
+
+            std::unique_ptr< Expr > FindSuccess(const TemplateCacheKey &key) const {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                const auto it = successes_.find(key);
+                return it == successes_.end() ? nullptr : CloneExpr(*it->second);
+            }
+
+            void InsertMiss(TemplateCacheKey key, MissWitnesses witnesses) {
+                auto entry = std::make_shared< const MissWitnesses >(std::move(witnesses));
+                const std::lock_guard< std::mutex > lock(mutex_);
+                MakeRoom();
+                misses_.insert_or_assign(std::move(key), std::move(entry));
+            }
+
+            void InsertSuccess(TemplateCacheKey key, const Expr &expr) {
+                auto clone = CloneExpr(expr);
+                const std::lock_guard< std::mutex > lock(mutex_);
+                MakeRoom();
+                successes_.insert_or_assign(std::move(key), std::move(clone));
+            }
+
+          private:
+            static constexpr size_t kMaxEntries = 4096;
+
+            void MakeRoom() {
+                if (misses_.size() + successes_.size() < kMaxEntries) {
+                    return;
+                }
+                misses_.clear();
+                successes_.clear();
+            }
+
+            mutable std::mutex mutex_;
+            std::unordered_map<
+                TemplateCacheKey, std::shared_ptr< const MissWitnesses >, TemplateCacheKeyHash >
+                misses_;
+            std::unordered_map<
+                TemplateCacheKey, std::unique_ptr< Expr >, TemplateCacheKeyHash >
+                successes_;
+        };
+
+        TemplateCache &SharedTemplateCache() {
+            static TemplateCache cache;
+            return cache;
+        }
+
         // Maps 64-bit probe-value fingerprints to pool/inner indices.
         // Uses absl::flat_hash_map for SIMD-accelerated lookup.
         //
@@ -113,7 +254,9 @@ namespace cobra {
 
             const size_t *find_hashed(uint64_t fingerprint) const {
                 auto it = map_.find(fingerprint);
-                if (it == map_.end()) { return nullptr; }
+                if (it == map_.end()) {
+                    return nullptr;
+                }
                 idx_buf_ = it->second;
                 return &idx_buf_;
             }
@@ -141,7 +284,9 @@ namespace cobra {
             const Expr &e, const std::vector< std::vector< uint64_t > > &pts, uint32_t bw
         ) { // NOLINT(hicpp-named-parameter,readability-named-parameter)
             ProbeVals v;
-            for (size_t i = 0; i < kNProbes; ++i) { v[i] = EvalExpr(e, pts[i], bw); }
+            for (size_t i = 0; i < kNProbes; ++i) {
+                v[i] = EvalExpr(e, pts[i], bw);
+            }
             return v;
         }
 
@@ -205,7 +350,9 @@ namespace cobra {
             // Subtraction (non-commutative)
             for (uint32_t i = 0; i < nv; ++i) {
                 for (uint32_t j = 0; j < nv; ++j) {
-                    if (i == j) { continue; }
+                    if (i == j) {
+                        continue;
+                    }
                     add(Expr::Add(Expr::Variable(i), Expr::Negate(Expr::Variable(j))));
                 }
             }
@@ -442,7 +589,7 @@ namespace cobra {
             const std::vector< Atom > &pool, const ValMap &vmap, uint64_t mask
         ) {
             InnerCompositions inner;
-            const size_t pn = pool.size();
+            const size_t pn          = pool.size();
             // Each gate contributes at most one composition per unordered
             // pair of atoms, so the final size has a tight upper bound.
             // Reserving up front keeps the growth of these containers from
@@ -483,15 +630,26 @@ namespace cobra {
         // NOLINTNEXTLINE(readability-identifier-naming)
         bool TryUpdate(
             std::optional< SignaturePayload > &best, std::unique_ptr< Expr > candidate,
-            const Evaluator &eval, uint32_t num_vars, uint32_t bw, const ExprCost *baseline
+            const Evaluator &eval, uint32_t num_vars, uint32_t bw, const ExprCost *baseline,
+            bool &saw_probe_match
         ) {
             COBRA_ZONE_N("TemplateFWCheck");
-            auto chk = FullWidthCheckEval(eval, num_vars, *candidate, bw);
-            if (!chk.passed) { return false; }
+            saw_probe_match = true;
+            auto chk        = FullWidthCheckEval(eval, num_vars, *candidate, bw);
+            if (!chk.passed) {
+                RecordMissWitness(*candidate);
+                return false;
+            }
 
             auto info = ComputeCost(*candidate);
-            if ((baseline != nullptr) && !IsBetter(info.cost, *baseline)) { return false; }
-            if (best.has_value() && !IsBetter(info.cost, best->cost)) { return false; }
+            if ((baseline != nullptr) && !IsBetter(info.cost, *baseline)) {
+                RecordMissWitness(*candidate);
+                return false;
+            }
+            if (best.has_value() && !IsBetter(info.cost, best->cost)) {
+                RecordMissWitness(*candidate);
+                return false;
+            }
 
             best = SignaturePayload{
                 .expr         = std::move(candidate),
@@ -505,7 +663,7 @@ namespace cobra {
         std::optional< SignaturePayload > Layer1(
             const ProbeVals &target, std::span< const Atom > pool, const ValMap &vmap,
             uint64_t mask, const Evaluator &eval, uint32_t nv, uint32_t bw,
-            const ExprCost *baseline
+            const ExprCost *baseline, bool &saw_probe_match
         ) {
             std::optional< SignaturePayload > best;
             const size_t pool_n = pool.size();
@@ -515,11 +673,13 @@ namespace cobra {
                     for (size_t ai = 0; ai < pool_n; ++ai) {
                         auto res         = GateResidual(target, pool[ai].vals, g, mask);
                         const auto *slot = vmap.find(res);
-                        if (slot == nullptr) { continue; }
+                        if (slot == nullptr) {
+                            continue;
+                        }
                         auto e = GateExpr(
                             g, CloneExpr(*pool[ai].expr), CloneExpr(*pool[*slot].expr)
                         );
-                        TryUpdate(best, std::move(e), eval, nv, bw, baseline);
+                        TryUpdate(best, std::move(e), eval, nv, bw, baseline, saw_probe_match);
                     }
                 } else {
                     for (size_t ai = 0; ai < pool_n; ++ai) {
@@ -536,11 +696,15 @@ namespace cobra {
                             auto e = GateExpr(
                                 g, CloneExpr(*pool[ai].expr), CloneExpr(*pool[bi].expr)
                             );
-                            TryUpdate(best, std::move(e), eval, nv, bw, baseline);
+                            TryUpdate(
+                                best, std::move(e), eval, nv, bw, baseline, saw_probe_match
+                            );
                         }
                     }
                 }
-                if (best.has_value()) { return best; }
+                if (best.has_value()) {
+                    return best;
+                }
             }
             return best;
         }
@@ -598,7 +762,9 @@ namespace cobra {
                 if (!Compatible0(candidates[i].vals[0], target[0], g)) {
                     continue;
                 }
-                if (Compatible(candidates[i].vals, target, g)) { indices.push_back(i); }
+                if (Compatible(candidates[i].vals, target, g)) {
+                    indices.push_back(i);
+                }
             }
         }
 
@@ -754,7 +920,9 @@ namespace cobra {
 
             const auto append_bucket = [&](uint64_t probe0_value) {
                 auto it = probe0_buckets.find(probe0_value);
-                if (it == probe0_buckets.end()) { return; }
+                if (it == probe0_buckets.end()) {
+                    return;
+                }
                 out.insert(out.end(), it->second.begin(), it->second.end());
             };
 
@@ -765,7 +933,6 @@ namespace cobra {
                     break;
                 }
             }
-
 
             // Restore ascending composition order so the candidate visited
             // first does not depend on the bucket layout.
@@ -817,8 +984,12 @@ namespace cobra {
             }
 
             const auto twos = lhs.twos;
-            if ((target_probe0 & Bitmask(twos)) != 0) { return true; }
-            if (twos > kMaxEnumeratedShift) { return false; }
+            if ((target_probe0 & Bitmask(twos)) != 0) {
+                return true;
+            }
+            if (twos > kMaxEnumeratedShift) {
+                return false;
+            }
 
             const uint32_t reduced_bits = bitwidth - twos;
             uint64_t base_solution      = 0;
@@ -829,7 +1000,9 @@ namespace cobra {
 
             const auto append_bucket = [&](uint64_t probe0_value) {
                 auto it = probe0_buckets.find(probe0_value);
-                if (it == probe0_buckets.end()) { return; }
+                if (it == probe0_buckets.end()) {
+                    return;
+                }
                 out.insert(out.end(), it->second.begin(), it->second.end());
             };
 
@@ -851,7 +1024,7 @@ namespace cobra {
         std::optional< SignaturePayload > Layer2(
             const ProbeVals &target, std::span< const Atom > pool,
             const InnerCompositions &inner_cache, uint64_t mask, const Evaluator &eval,
-            uint32_t nv, uint32_t bw, const ExprCost *baseline
+            uint32_t nv, uint32_t bw, const ExprCost *baseline, bool &saw_probe_match
         ) {
             std::span< const InnerComp > inner = inner_cache.comps;
             const auto &inner_idx              = inner_cache.index;
@@ -870,28 +1043,40 @@ namespace cobra {
                 COBRA_ZONE_N("L2Invertible");
                 // Case A: G_out(base_atom, inner_comp)
                 for (auto g_out : kAllGates) {
-                    if (!GateInvertible(g_out)) { continue; }
+                    if (!GateInvertible(g_out)) {
+                        continue;
+                    }
                     for (const auto &ai : pool) {
                         auto res         = GateResidual(target, ai.vals, g_out, mask);
                         const auto *slot = inner_idx.find(res);
-                        if (slot == nullptr) { continue; }
+                        if (slot == nullptr) {
+                            continue;
+                        }
                         auto e = GateExpr(g_out, CloneExpr(*ai.expr), make_inner(inner[*slot]));
-                        TryUpdate(best, std::move(e), eval, nv, bw, baseline);
+                        TryUpdate(best, std::move(e), eval, nv, bw, baseline, saw_probe_match);
                     }
-                    if (best.has_value()) { return best; }
+                    if (best.has_value()) {
+                        return best;
+                    }
                 }
                 // Case B: G_out(inner_comp, inner_comp)
                 for (auto g_out : kAllGates) {
-                    if (!GateInvertible(g_out)) { continue; }
+                    if (!GateInvertible(g_out)) {
+                        continue;
+                    }
                     for (size_t ii = 0; ii < inner.size(); ++ii) {
                         auto res         = GateResidual(target, inner[ii].vals, g_out, mask);
                         const auto *slot = inner_idx.find(res);
-                        if (slot == nullptr) { continue; }
+                        if (slot == nullptr) {
+                            continue;
+                        }
                         auto e =
                             GateExpr(g_out, make_inner(inner[ii]), make_inner(inner[*slot]));
-                        TryUpdate(best, std::move(e), eval, nv, bw, baseline);
+                        TryUpdate(best, std::move(e), eval, nv, bw, baseline, saw_probe_match);
                     }
-                    if (best.has_value()) { return best; }
+                    if (best.has_value()) {
+                        return best;
+                    }
                 }
             }
 
@@ -924,13 +1109,21 @@ namespace cobra {
                             const bool matches = (g_out == Gate::kAnd)
                                 ? AndMatches(ai.vals, ii.vals, target)
                                 : OrMatches(ai.vals, ii.vals, target);
-                            if (!matches) { continue; }
+                            if (!matches) {
+                                continue;
+                            }
                             auto e = GateExpr(g_out, CloneExpr(*ai.expr), make_inner(ii));
-                            TryUpdate(best, std::move(e), eval, nv, bw, baseline);
-                            if (best.has_value()) { return best; }
+                            TryUpdate(
+                                best, std::move(e), eval, nv, bw, baseline, saw_probe_match
+                            );
+                            if (best.has_value()) {
+                                return best;
+                            }
                         }
                     }
-                    if (best.has_value()) { return best; }
+                    if (best.has_value()) {
+                        return best;
+                    }
                 }
             }
 
@@ -942,7 +1135,9 @@ namespace cobra {
                 [[maybe_unused]] size_t mul_fallback_outer = 0;
 
                 for (const auto &ai : pool) {
-                    if (!MulCompatible(ai.vals, target, mask)) { continue; }
+                    if (!MulCompatible(ai.vals, target, mask)) {
+                        continue;
+                    }
                     const bool used_probe0_filter = CollectMulProbe0Candidates(
                         inner_cache.probe0_buckets, MulProbe0FactorOf(ai.vals[0], bw),
                         target[0], bw, mul_probe0_candidates
@@ -958,20 +1153,30 @@ namespace cobra {
                                 continue;
                             }
                             const auto &ii = inner[ii_idx];
-                            if (!MulMatches(ai.vals, ii.vals, target, mask, 1)) { continue; }
+                            if (!MulMatches(ai.vals, ii.vals, target, mask, 1)) {
+                                continue;
+                            }
                             auto e = GateExpr(Gate::kMul, CloneExpr(*ai.expr), make_inner(ii));
-                            TryUpdate(best, std::move(e), eval, nv, bw, baseline);
-                            if (best.has_value()) { return best; }
+                            TryUpdate(
+                                best, std::move(e), eval, nv, bw, baseline, saw_probe_match
+                            );
+                            if (best.has_value()) {
+                                return best;
+                            }
                         }
                         continue;
                     }
 
                     ++mul_fallback_outer;
                     for (const auto &ii : inner) {
-                        if (!MulMatches(ai.vals, ii.vals, target, mask)) { continue; }
+                        if (!MulMatches(ai.vals, ii.vals, target, mask)) {
+                            continue;
+                        }
                         auto e = GateExpr(Gate::kMul, CloneExpr(*ai.expr), make_inner(ii));
-                        TryUpdate(best, std::move(e), eval, nv, bw, baseline);
-                        if (best.has_value()) { return best; }
+                        TryUpdate(best, std::move(e), eval, nv, bw, baseline, saw_probe_match);
+                        if (best.has_value()) {
+                            return best;
+                        }
                     }
                 }
 
@@ -985,7 +1190,7 @@ namespace cobra {
         std::optional< SignaturePayload > Layer3(
             const ProbeVals &target, std::span< const Atom > pool, const ValMap &vmap,
             const InnerCompositions &inner_cache, uint64_t mask, const Evaluator &eval,
-            uint32_t nv, uint32_t bw, const ExprCost *baseline
+            uint32_t nv, uint32_t bw, const ExprCost *baseline, bool &saw_probe_match
         ) {
             std::span< const InnerComp > inner = inner_cache.comps;
             const auto &inner_idx              = inner_cache.index;
@@ -1000,13 +1205,19 @@ namespace cobra {
 
             // Invertible G1, invertible G2: hash-based lookup.
             for (auto g1 : kAllGates) {
-                if (!GateInvertible(g1)) { continue; }
+                if (!GateInvertible(g1)) {
+                    continue;
+                }
                 for (size_t ai = 0; ai < pool_n; ++ai) {
                     auto r1 = GateResidual(target, pool[ai].vals, g1, mask);
-                    if (vmap.contains(r1)) { continue; }
+                    if (vmap.contains(r1)) {
+                        continue;
+                    }
 
                     for (auto g2 : kAllGates) {
-                        if (!GateInvertible(g2)) { continue; }
+                        if (!GateInvertible(g2)) {
+                            continue;
+                        }
                         for (size_t bi = 0; bi < pool_n; ++bi) {
                             auto r2 = GateResidual(r1, pool[bi].vals, g2, mask);
                             std::unique_ptr< Expr > r2_expr;
@@ -1014,20 +1225,31 @@ namespace cobra {
                             const auto fingerprint = Fingerprint(r2);
                             {
                                 const auto *p = vmap.find_hashed(fingerprint);
-                                if (p != nullptr) { r2_expr = CloneExpr(*pool[*p].expr); }
+                                if (p != nullptr) {
+                                    r2_expr = CloneExpr(*pool[*p].expr);
+                                }
                             }
                             if (!r2_expr) {
                                 const auto *p = inner_idx.find_hashed(fingerprint);
-                                if (p != nullptr) { r2_expr = make_inner(inner[*p]); }
+                                if (p != nullptr) {
+                                    r2_expr = make_inner(inner[*p]);
+                                }
                             }
-                            if (!r2_expr) { continue; }
+                            if (!r2_expr) {
+                                continue;
+                            }
                             auto mid =
                                 GateExpr(g2, CloneExpr(*pool[bi].expr), std::move(r2_expr));
-                            auto e   = GateExpr(g1, CloneExpr(*pool[ai].expr), std::move(mid));
-                            auto chk = FullWidthCheckEval(eval, nv, *e, bw);
-                            if (!chk.passed) { continue; }
+                            auto e = GateExpr(g1, CloneExpr(*pool[ai].expr), std::move(mid));
+                            saw_probe_match = true;
+                            auto chk        = FullWidthCheckEval(eval, nv, *e, bw);
+                            if (!chk.passed) {
+                                RecordMissWitness(*e);
+                                continue;
+                            }
                             auto info = ComputeCost(*e);
                             if ((baseline != nullptr) && !IsBetter(info.cost, *baseline)) {
+                                RecordMissWitness(*e);
                                 continue;
                             }
                             SignaturePayload s{
@@ -1053,7 +1275,7 @@ namespace cobra {
         std::optional< SignaturePayload > Layer4(
             const ProbeVals &target, std::span< const Atom > pool, const ValMap &vmap,
             const InnerCompositions &inner_cache, uint64_t mask, const Evaluator &eval,
-            uint32_t nv, uint32_t bw, const ExprCost *baseline
+            uint32_t nv, uint32_t bw, const ExprCost *baseline, bool &saw_probe_match
         ) {
             std::span< const InnerComp > inner = inner_cache.comps;
             const auto &inner_idx              = inner_cache.index;
@@ -1080,10 +1302,14 @@ namespace cobra {
             std::vector< size_t > andor_candidates;
             std::vector< size_t > compat_inner;
             for (auto g1 : kAllGates) {
-                if (!GateInvertible(g1)) { continue; }
+                if (!GateInvertible(g1)) {
+                    continue;
+                }
                 for (size_t ai = 0; ai < pool_n; ++ai) {
                     auto r1 = GateResidual(target, pool[ai].vals, g1, mask);
-                    if (vmap.contains(r1)) { continue; }
+                    if (vmap.contains(r1)) {
+                        continue;
+                    }
 
                     // Try Neg and Not of the residual
                     for (int wrap = 0; wrap < 2; ++wrap) {
@@ -1102,7 +1328,11 @@ namespace cobra {
                                     : Expr::BitwiseNot(std::move(inner_e));
                                 auto e =
                                     GateExpr(g1, CloneExpr(*pool[ai].expr), std::move(wrapped));
-                                if (TryUpdate(best, std::move(e), eval, nv, bw, baseline)) {
+                                if (TryUpdate(
+                                        best, std::move(e), eval, nv, bw, baseline,
+                                        saw_probe_match
+                                    ))
+                                {
                                     return best;
                                 }
                             }
@@ -1128,7 +1358,9 @@ namespace cobra {
                                 if (!Compatible0(pool[bi].vals[0], lifted[0], g2)) {
                                     continue;
                                 }
-                                if (!Compatible(pool[bi].vals, lifted, g2)) { continue; }
+                                if (!Compatible(pool[bi].vals, lifted, g2)) {
+                                    continue;
+                                }
 
                                 const bool filtered = CollectAndOrProbe0Candidates(
                                     inner_cache.probe0_buckets, pool[bi].vals[0], lifted[0], g2,
@@ -1165,7 +1397,9 @@ namespace cobra {
                                     const bool matches = (g2 == Gate::kAnd)
                                         ? AndMatches(pool[bi].vals, inner[ii].vals, lifted)
                                         : OrMatches(pool[bi].vals, inner[ii].vals, lifted);
-                                    if (!matches) { continue; }
+                                    if (!matches) {
+                                        continue;
+                                    }
                                     auto g2_e = GateExpr(
                                         g2, CloneExpr(*pool[bi].expr), make_inner(inner[ii])
                                     );
@@ -1175,18 +1409,23 @@ namespace cobra {
                                     auto e       = GateExpr(
                                         g1, CloneExpr(*pool[ai].expr), std::move(wrapped)
                                     );
-                                    if (TryUpdate(best, std::move(e), eval, nv, bw, baseline)) {
+                                    if (TryUpdate(
+                                            best, std::move(e), eval, nv, bw, baseline,
+                                            saw_probe_match
+                                        ))
+                                    {
                                         return best;
                                     }
                                 }
                             }
                         }
 
-
                         // Mul scan: lifted = Mul(atom_B, inner_C)
                         {
                             for (size_t bi = 0; bi < pool_n; ++bi) {
-                                if (!MulCompatible(pool[bi].vals, lifted, mask)) { continue; }
+                                if (!MulCompatible(pool[bi].vals, lifted, mask)) {
+                                    continue;
+                                }
                                 const bool filtered = CollectMulProbe0Candidates(
                                     inner_cache.probe0_buckets, pool_mul_factors[bi], lifted[0],
                                     bw, mul_candidates
@@ -1223,7 +1462,8 @@ namespace cobra {
                                             g1, CloneExpr(*pool[ai].expr), std::move(wrapped)
                                         );
                                         if (TryUpdate(
-                                                best, std::move(e), eval, nv, bw, baseline
+                                                best, std::move(e), eval, nv, bw, baseline,
+                                                saw_probe_match
                                             ))
                                         {
                                             return best;
@@ -1248,7 +1488,11 @@ namespace cobra {
                                     auto e       = GateExpr(
                                         g1, CloneExpr(*pool[ai].expr), std::move(wrapped)
                                     );
-                                    if (TryUpdate(best, std::move(e), eval, nv, bw, baseline)) {
+                                    if (TryUpdate(
+                                            best, std::move(e), eval, nv, bw, baseline,
+                                            saw_probe_match
+                                        ))
+                                    {
                                         return best;
                                     }
                                 }
@@ -1323,12 +1567,62 @@ namespace cobra {
         std::vector< std::vector< uint64_t > > pts(kNProbes);
         for (auto &p : pts) {
             p.resize(num_vars);
-            for (auto &v : p) { v = rng() & kMask; }
+            for (auto &v : p) {
+                v = rng() & kMask;
+            }
         }
 
         // Evaluate target at probe points.
         ProbeVals target;
-        for (size_t i = 0; i < kNProbes; ++i) { target[i] = (*ctx.eval)(pts[i]); }
+        for (size_t i = 0; i < kNProbes; ++i) {
+            target[i] = (*ctx.eval)(pts[i]);
+        }
+        const TemplateCacheKey cache_key{ .target   = target,
+                                          .num_vars = num_vars,
+                                          .bitwidth = opts.bitwidth };
+        auto &template_cache = SharedTemplateCache();
+        if (auto cached = template_cache.FindSuccess(cache_key)) {
+            auto chk = FullWidthCheckEval(*ctx.eval, num_vars, *cached, opts.bitwidth);
+            if (chk.passed) {
+                auto info = ComputeCost(*cached);
+                if ((baseline_cost == nullptr) || IsBetter(info.cost, *baseline_cost)) {
+                    SignaturePayload payload{
+                        .expr         = std::move(cached),
+                        .cost         = info.cost,
+                        .verification = VerificationState::kVerified,
+                    };
+                    return SolverResult< SignaturePayload >::Success(std::move(payload));
+                }
+            }
+        }
+        if (auto witnesses = template_cache.FindMiss(cache_key)) {
+            // A recorded miss only stands while every candidate it turned down
+            // is still turned down. Re-checking them costs a handful of
+            // evaluations against the whole layered search behind them.
+            bool still_missing = true;
+            for (const auto &witness : *witnesses) {
+                if (FullWidthCheckEval(*ctx.eval, num_vars, *witness, opts.bitwidth).passed) {
+                    still_missing = false;
+                    break;
+                }
+            }
+            if (still_missing) {
+                return SolverResult< SignaturePayload >::Blocked(
+                    ReasonDetail{
+                        .top = { .code    = { ReasonCategory::kSearchExhausted,
+                                              ReasonDomain::kTemplateDecomposer,
+                                              template_decomposer::kNoMatch },
+                                .message = "no template match found" }
+                }
+                );
+            }
+        }
+        WitnessScope witness_scope;
+        auto return_success = [&](SignaturePayload payload) {
+            template_cache.InsertSuccess(cache_key, *payload.expr);
+            return SolverResult< SignaturePayload >::Success(std::move(payload));
+        };
+        bool saw_probe_match = false;
 
         // Build atom pool.
         std::vector< Atom > pool;
@@ -1346,12 +1640,16 @@ namespace cobra {
         // FullWidthCheckEval-gated, so extra constants only widen the search.
         {
             uint64_t or_fold = 0;
-            for (size_t i = 0; i < kNProbes; ++i) { or_fold |= target[i]; }
+            for (size_t i = 0; i < kNProbes; ++i) {
+                or_fold |= target[i];
+            }
             // Skip values already seeded: Push dedups the pool by probe-vals, so
             // re-seeding the same constant only wastes a Probe() call.
             std::unordered_set< uint64_t > seeded_vals;
             auto seed_const = [&](uint64_t c) {
-                if (c == 0 || !seeded_vals.insert(c).second) { return; }
+                if (c == 0 || !seeded_vals.insert(c).second) {
+                    return;
+                }
                 auto e = Expr::Constant(c);
                 auto v = Probe(*e, pts, opts.bitwidth);
                 Push(pool, vmap, std::move(e), v);
@@ -1370,8 +1668,9 @@ namespace cobra {
         {
             const auto *slot = vmap.find(target);
             if (slot != nullptr) {
-                auto e   = CloneExpr(*pool[*slot].expr);
-                auto chk = FullWidthCheckEval(*ctx.eval, num_vars, *e, opts.bitwidth);
+                auto e          = CloneExpr(*pool[*slot].expr);
+                saw_probe_match = true;
+                auto chk        = FullWidthCheckEval(*ctx.eval, num_vars, *e, opts.bitwidth);
                 if (chk.passed) {
                     auto info = ComputeCost(*e);
                     if ((baseline_cost == nullptr) || IsBetter(info.cost, *baseline_cost)) {
@@ -1380,8 +1679,11 @@ namespace cobra {
                             .cost         = info.cost,
                             .verification = VerificationState::kVerified,
                         };
-                        return SolverResult< SignaturePayload >::Success(std::move(s));
+                        return return_success(std::move(s));
                     }
+                    RecordMissWitness(*e);
+                } else {
+                    RecordMissWitness(*e);
                 }
             }
         }
@@ -1390,10 +1692,11 @@ namespace cobra {
         {
             COBRA_ZONE_N("TemplateLayer1");
             auto r1 = Layer1(
-                target, pool, vmap, kMask, *ctx.eval, num_vars, opts.bitwidth, baseline_cost
+                target, pool, vmap, kMask, *ctx.eval, num_vars, opts.bitwidth, baseline_cost,
+                saw_probe_match
             );
             if (r1.has_value()) {
-                return SolverResult< SignaturePayload >::Success(std::move(*r1));
+                return return_success(std::move(*r1));
             }
         }
 
@@ -1403,11 +1706,12 @@ namespace cobra {
         {
             COBRA_ZONE_N("TemplateLayer2");
             auto inner = BuildInnerCompositions(pool, vmap, kMask);
-            auto r2 = Layer2(
-                target, pool, inner, kMask, *ctx.eval, num_vars, opts.bitwidth, baseline_cost
+            auto r2    = Layer2(
+                target, pool, inner, kMask, *ctx.eval, num_vars, opts.bitwidth, baseline_cost,
+                saw_probe_match
             );
             if (r2.has_value()) {
-                return SolverResult< SignaturePayload >::Success(std::move(*r2));
+                return return_success(std::move(*r2));
             }
             inner_cache = std::move(inner);
         }
@@ -1427,12 +1731,17 @@ namespace cobra {
 
             auto check_wrap =
                 [&](std::unique_ptr< Expr > inner) -> std::optional< SignaturePayload > {
-                auto wrapped = (wrap == 0) ? Expr::Negate(std::move(inner))
-                                           : Expr::BitwiseNot(std::move(inner));
-                auto chk     = FullWidthCheckEval(*ctx.eval, num_vars, *wrapped, opts.bitwidth);
-                if (!chk.passed) { return std::nullopt; }
+                auto wrapped    = (wrap == 0) ? Expr::Negate(std::move(inner))
+                                              : Expr::BitwiseNot(std::move(inner));
+                saw_probe_match = true;
+                auto chk = FullWidthCheckEval(*ctx.eval, num_vars, *wrapped, opts.bitwidth);
+                if (!chk.passed) {
+                    RecordMissWitness(*wrapped);
+                    return std::nullopt;
+                }
                 auto info = ComputeCost(*wrapped);
                 if (baseline_cost && !IsBetter(info.cost, *baseline_cost)) {
+                    RecordMissWitness(*wrapped);
                     return std::nullopt;
                 }
                 SignaturePayload s{
@@ -1449,18 +1758,20 @@ namespace cobra {
                 if (slot != nullptr) {
                     auto r = check_wrap(CloneExpr(*pool[*slot].expr));
                     if (r.has_value()) {
-                        return SolverResult< SignaturePayload >::Success(std::move(*r));
+                        return return_success(std::move(*r));
                     }
                 }
             }
 
             // Layer 1 on lifted
-            auto w1 =
-                Layer1(lifted, pool, vmap, kMask, *ctx.eval, num_vars, opts.bitwidth, nullptr);
+            auto w1 = Layer1(
+                lifted, pool, vmap, kMask, *ctx.eval, num_vars, opts.bitwidth, nullptr,
+                saw_probe_match
+            );
             if (w1.has_value()) {
                 auto r = check_wrap(std::move(w1->expr));
                 if (r.has_value()) {
-                    return SolverResult< SignaturePayload >::Success(std::move(*r));
+                    return return_success(std::move(*r));
                 }
             }
         }
@@ -1473,10 +1784,10 @@ namespace cobra {
             COBRA_ZONE_N("TemplateLayer3");
             auto r3 = Layer3(
                 target, pool, vmap, *inner_cache, kMask, *ctx.eval, num_vars, opts.bitwidth,
-                baseline_cost
+                baseline_cost, saw_probe_match
             );
             if (r3.has_value()) {
-                return SolverResult< SignaturePayload >::Success(std::move(*r3));
+                return return_success(std::move(*r3));
             }
         }
 
@@ -1486,14 +1797,17 @@ namespace cobra {
             COBRA_ZONE_N("TemplateLayer4");
             auto r4 = Layer4(
                 target, pool, vmap, *inner_cache, kMask, *ctx.eval, num_vars, opts.bitwidth,
-                baseline_cost
+                baseline_cost, saw_probe_match
             );
             if (r4.has_value()) {
-                return SolverResult< SignaturePayload >::Success(std::move(*r4));
+                return return_success(std::move(*r4));
             }
         }
 
         COBRA_TRACE("TemplateDecomp", "TryTemplateDecomposition: found={}", false);
+        if (!witness_scope.collector().overflow) {
+            template_cache.InsertMiss(cache_key, std::move(witness_scope.collector().failed));
+        }
         ReasonDetail reason{
             .top = { .code    = { ReasonCategory::kSearchExhausted,
                                   ReasonDomain::kTemplateDecomposer,
