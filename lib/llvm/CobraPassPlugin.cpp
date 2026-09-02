@@ -24,9 +24,9 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
                              fpm.addPass(cobra::CobraPass());
                              return true;
                          }
-                         if (name == "cobra-simplify<tree-cost>") {
+                         if (name == "cobra-simplify<dying-cost>") {
                              cobra::CobraPassOptions options;
-                             options.cost_model = cobra::MbaCostModel::kTreeInstructions;
+                             options.cost_model = cobra::MbaCostModel::kDyingInstructions;
                              fpm.addPass(cobra::CobraPass(options));
                              return true;
                          }
