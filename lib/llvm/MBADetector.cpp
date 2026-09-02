@@ -1197,7 +1197,7 @@ namespace cobra {
         // arranges by feeding `MBACandidate::inner_roots` back in.
         void BuildCandidates(
             llvm::ArrayRef< llvm::Instruction * > roots, uint32_t min_ast_size,
-            MbaCostModel cost_model, uint64_t options_tag,
+            uint32_t max_vars, MbaCostModel cost_model, uint64_t options_tag,
             std::vector< MBACandidate > &candidates, uint32_t max_nodes = 0
         ) {
             llvm::DenseSet< llvm::Instruction * > already_in_tree;
@@ -1228,8 +1228,16 @@ namespace cobra {
                     continue;
                 }
 
+                // The sweep below is 2^leaves, so every leaf doubles the price
+                // of finding out whether the solver can use the tree at all.
+                // Auxiliary variables are eliminated only after it has been
+                // paid, and the orchestrator then rejects anything still over
+                // `max_vars` — so collecting past that budget buys a candidate
+                // that has to shed the excess as decoration to survive, at
+                // twice the cost per variable of hope. The absolute ceiling
+                // stays as a guard against a caller asking for 2^40 entries.
                 constexpr uint32_t kPreElimCap = 20;
-                if (leaves.size() > kPreElimCap) {
+                if (leaves.size() > std::min(max_vars, kPreElimCap)) {
                     continue;
                 }
 
@@ -1277,7 +1285,7 @@ namespace cobra {
                     if (tree_insts.size() < min_ast_size) {
                         continue;
                     }
-                    if (leaves.size() > kPreElimCap) {
+                    if (leaves.size() > std::min(max_vars, kPreElimCap)) {
                         continue;
                     }
                 }
@@ -1412,7 +1420,7 @@ namespace cobra {
     } // namespace
 
     std::vector< MBACandidate > DetectMbaCandidates(
-        llvm::Function &f, uint32_t min_ast_size, uint32_t /*max_vars*/, uint64_t options_tag,
+        llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
         MbaCostModel cost_model
     ) {
         // Post-order: process uses before defs across blocks. Within each block,
@@ -1428,52 +1436,61 @@ namespace cobra {
         }
 
         std::vector< MBACandidate > candidates;
-        BuildCandidates(roots, min_ast_size, cost_model, options_tag, candidates);
+        BuildCandidates(roots, min_ast_size, max_vars, cost_model, options_tag, candidates);
         return candidates;
     }
 
     std::vector< MBACandidate > ExpandMbaCandidate(
-        const MBACandidate &cand, uint32_t min_ast_size, uint64_t options_tag,
-        MbaCostModel cost_model
+        llvm::ArrayRef< llvm::Instruction * > inner_roots, uint32_t min_ast_size,
+        uint32_t max_vars, uint64_t options_tag, MbaCostModel cost_model
     ) {
         std::vector< MBACandidate > candidates;
-        BuildCandidates(cand.inner_roots, min_ast_size, cost_model, options_tag, candidates);
+        BuildCandidates(
+            inner_roots, min_ast_size, max_vars, cost_model, options_tag, candidates
+        );
         return candidates;
     }
 
     std::vector< MBACandidate > RecutMbaCandidate(
-        const MBACandidate &cand, uint32_t min_ast_size, uint64_t options_tag,
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint32_t max_recut_nodes, uint32_t max_recut_vars, uint64_t options_tag,
         MbaCostModel cost_model
     ) {
         std::vector< MBACandidate > candidates;
-        if (cand.root == nullptr) {
+        if (cand.root == nullptr || cand.node_limit >= max_recut_nodes) {
             return candidates;
         }
 
-        const uint32_t bw = cand.bitwidth;
-
-        // The full collection is what the cuts are working towards: once a
-        // budget buys the whole tree there is nothing smaller left to try, and
-        // the candidate it would build is the one that just failed.
-        llvm::SmallVector< llvm::Instruction *, 16 > full_insts;
-        {
-            std::vector< llvm::Value * > full_leaves;
-            llvm::DenseMap< llvm::Value *, llvm::Value * > full_redirects;
-            CollectTree(cand.root, bw, full_insts, full_leaves, full_redirects);
+        // A cut is a search over the ways this root could have been written, and
+        // the solver only finds identities over a few variables at a time. A
+        // collection that already ends in many independent leaves is not one the
+        // expansion buried anything in — its cuts are smaller expressions with
+        // no fewer variables, which is the direction the search gets worse in.
+        if (cand.node_limit == 0 && cand.var_names.size() > max_recut_vars) {
+            return candidates;
         }
 
         // One cut per rejection, smallest first. Handing back the whole ladder
         // at once would keep solving cuts of a root that a smaller one has
         // already rewritten; produced one at a time, the chain simply stops
         // advancing as soon as a cut succeeds. The budget strictly increases and
-        // is bounded by the full tree, so the chain always ends.
-        for (uint32_t nodes = cand.node_limit + 1; nodes < full_insts.size(); ++nodes) {
+        // is capped, so the chain always ends.
+        for (uint32_t nodes = cand.node_limit + 1; nodes <= max_recut_nodes; ++nodes) {
             BuildCandidates(
-                { cand.root }, min_ast_size, cost_model, options_tag, candidates, nodes
+                { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates,
+                nodes
             );
-            if (!candidates.empty()) {
-                return candidates;
+            if (candidates.empty()) {
+                continue;
             }
+
+            // A cut that did not spend its whole budget ran out of tree first,
+            // so it is the full collection — which is the candidate that sent
+            // us here. There is nothing left to cut.
+            if (candidates.front().tree_size < nodes) {
+                candidates.clear();
+            }
+            return candidates;
         }
 
         return candidates;

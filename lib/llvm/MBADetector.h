@@ -86,16 +86,23 @@ namespace cobra {
     // invalidates every record without needing to rewrite the IR.
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
-        MbaCostModel cost_model = MbaCostModel::kDyingInstructions
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions
     );
 
-    // Candidates for the roots inside `cand`, to be used once `cand` itself has
+    // Candidates for `inner_roots`, to be used once the tree enclosing them has
     // been rejected. Descending only on failure keeps the common case at one
     // candidate per tree while still reaching expressions an irreducible outer
     // node would otherwise hide.
+    //
+    // The roots are taken rather than the candidate they came from because
+    // sub-expressions are shared: by the time an outer node fails, most of what
+    // it encloses has usually been attempted under some other root, and building
+    // a candidate costs a tree walk and a signature sweep whether or not anyone
+    // ends up looking at it. Only the caller knows which ones are new.
     std::vector< MBACandidate > ExpandMbaCandidate(
-        const MBACandidate &cand, uint32_t min_ast_size, uint64_t options_tag,
-        MbaCostModel cost_model = MbaCostModel::kDyingInstructions
+        llvm::ArrayRef< llvm::Instruction * > inner_roots, uint32_t min_ast_size,
+        uint32_t max_vars, uint64_t options_tag,
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions
     );
 
     // The same root as `cand`, re-collected with the tree cut short so that
@@ -116,13 +123,21 @@ namespace cobra {
     // one of them while leaving its sibling whole.
     //
     // Returns the next viable cut above the one `cand` already used, smallest
-    // first, or nothing once the cuts have caught up with the full tree. One at
-    // a time is what keeps this honest: handing back the whole ladder would go
-    // on solving cuts of a root a smaller cut has already rewritten, whereas a
-    // chain that only advances on rejection stops the moment one succeeds.
+    // first, or nothing once the cuts have caught up with the full tree or with
+    // `max_recut_nodes`. One at a time is what keeps this honest: handing back
+    // the whole ladder would go on solving cuts of a root a smaller cut has
+    // already rewritten, whereas a chain that only advances on rejection stops
+    // the moment one succeeds.
+    //
+    // The ladder is capped because the cuts that pay are small ones. An identity
+    // is a statement about a handful of operators; the cut has to hold those and
+    // leave their operands opaque, and once it is holding much more than that it
+    // is only converging on the full collection that was already rejected — at a
+    // candidate, a signature sweep and a solve per rung.
     std::vector< MBACandidate > RecutMbaCandidate(
-        const MBACandidate &cand, uint32_t min_ast_size, uint64_t options_tag,
-        MbaCostModel cost_model = MbaCostModel::kDyingInstructions
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint32_t max_recut_nodes, uint32_t max_recut_vars, uint64_t options_tag,
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions
     );
 
     // Record `fp` on `inst` so a later run can skip the tree rooted there.

@@ -166,6 +166,8 @@ namespace cobra {
 
             uint64_t tag = mix(0, options.max_vars);
             tag          = mix(tag, options.min_ast_size);
+            tag          = mix(tag, options.max_recut_nodes);
+            tag          = mix(tag, options.max_recut_vars);
             tag          = mix(tag, options.z3_verify ? 1 : 0);
             tag          = mix(tag, options.z3_settings.timeout_ms);
             tag = mix(tag, static_cast< uint64_t >(options.z3_settings.unknown_result_mode));
@@ -306,12 +308,18 @@ namespace cobra {
         // reaches expressions the root buries; re-cutting reaches the one the
         // root *is*, written in operands the full expansion dissolved. A tree is
         // therefore attempted once per cut, not once per root.
+        //
+        // A tree is claimed when it is queued, not when it is reached: the same
+        // sub-expression is an inner root of every tree that encloses it, and
+        // building the candidate is what costs — a tree walk and a signature
+        // sweep — whether or not the queue ever gets to it.
         llvm::DenseSet< std::pair< llvm::Instruction *, uint32_t > > attempted;
+        for (const auto &cand : candidates) {
+            attempted.insert({ cand.root, cand.node_limit });
+        }
+
         for (size_t index = 0; index < candidates.size(); ++index) {
             auto &cand = candidates[index];
-            if (!attempted.insert({ cand.root, cand.node_limit }).second) {
-                continue;
-            }
 
             // Only a full collection speaks for the tree rooted at an
             // instruction; a re-cut saw part of it, so recording its verdict
@@ -330,16 +338,37 @@ namespace cobra {
             // reallocate `candidates`, and `cand` is a reference into it.
             const auto requeue_retries = [&] {
                 auto recuts = RecutMbaCandidate(
-                    cand, options_.min_ast_size, options_tag, options_.cost_model
+                    cand, options_.min_ast_size, options_.max_vars, options_.max_recut_nodes,
+                    options_.max_recut_vars, options_tag, options_.cost_model
                 );
+
+                // Only a full collection speaks for what the tree holds. A
+                // re-cut is another view of the same root, not a different set
+                // of sub-expressions: its inner roots are a subset of the ones
+                // the full candidate already handed back, so descending again
+                // from every rung of the ladder re-queues the same trees over
+                // and over.
+                llvm::SmallVector< llvm::Instruction *, 8 > fresh;
+                if (cand.node_limit == 0) {
+                    for (auto *inner : cand.inner_roots) {
+                        if (!attempted.contains({ inner, 0u })) {
+                            fresh.push_back(inner);
+                        }
+                    }
+                }
                 auto inners = ExpandMbaCandidate(
-                    cand, options_.min_ast_size, options_tag, options_.cost_model
+                    fresh, options_.min_ast_size, options_.max_vars, options_tag,
+                    options_.cost_model
                 );
                 for (auto &recut : recuts) {
-                    candidates.push_back(std::move(recut));
+                    if (attempted.insert({ recut.root, recut.node_limit }).second) {
+                        candidates.push_back(std::move(recut));
+                    }
                 }
                 for (auto &inner : inners) {
-                    candidates.push_back(std::move(inner));
+                    if (attempted.insert({ inner.root, inner.node_limit }).second) {
+                        candidates.push_back(std::move(inner));
+                    }
                 }
             };
 
