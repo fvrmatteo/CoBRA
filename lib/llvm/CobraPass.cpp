@@ -170,6 +170,7 @@ namespace cobra {
             tag          = mix(tag, options.z3_settings.timeout_ms);
             tag = mix(tag, static_cast< uint64_t >(options.z3_settings.unknown_result_mode));
             tag = mix(tag, static_cast< uint64_t >(options.enabled_families));
+            tag = mix(tag, static_cast< uint64_t >(options.cost_model));
             return tag;
         }
 
@@ -288,8 +289,9 @@ namespace cobra {
 
         const uint64_t options_tag = OptionsTag(options_);
 
-        auto candidates =
-            DetectMbaCandidates(f, options_.min_ast_size, options_.max_vars, options_tag);
+        auto candidates = DetectMbaCandidates(
+            f, options_.min_ast_size, options_.max_vars, options_tag, options_.cost_model
+        );
 
         NumCandidates += candidates.size();
 
@@ -299,12 +301,48 @@ namespace cobra {
         // expression stays reachable even when the tree enclosing it is not
         // something CoBRA can do anything with. Each descent strictly shrinks
         // the tree and `attempted` bars repeats, so the queue always drains.
-        llvm::DenseSet< llvm::Instruction * > attempted;
+        //
+        // They also put the same root back with the tree cut shorter. Descending
+        // reaches expressions the root buries; re-cutting reaches the one the
+        // root *is*, written in operands the full expansion dissolved. A tree is
+        // therefore attempted once per cut, not once per root.
+        llvm::DenseSet< std::pair< llvm::Instruction *, uint32_t > > attempted;
         for (size_t index = 0; index < candidates.size(); ++index) {
             auto &cand = candidates[index];
-            if (!attempted.insert(cand.root).second) {
+            if (!attempted.insert({ cand.root, cand.node_limit }).second) {
                 continue;
             }
+
+            // Only a full collection speaks for the tree rooted at an
+            // instruction; a re-cut saw part of it, so recording its verdict
+            // would tell the next run the whole tree was examined.
+            const auto record_rejection = [&] {
+                if (cand.node_limit == 0) {
+                    RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
+                }
+            };
+
+            // Re-cuts first: they are the only candidates that read the same
+            // operands this one did, so they are worth trying while the IR still
+            // looks the way they were collected from.
+            //
+            // Both lists are built before either is queued: pushing can
+            // reallocate `candidates`, and `cand` is a reference into it.
+            const auto requeue_retries = [&] {
+                auto recuts = RecutMbaCandidate(
+                    cand, options_.min_ast_size, options_tag, options_.cost_model
+                );
+                auto inners = ExpandMbaCandidate(
+                    cand, options_.min_ast_size, options_tag, options_.cost_model
+                );
+                for (auto &recut : recuts) {
+                    candidates.push_back(std::move(recut));
+                }
+                for (auto &inner : inners) {
+                    candidates.push_back(std::move(inner));
+                }
+            };
+
             const std::string key = CandidateKey(cand, options_);
 
             OutcomeCache::Entry outcome;
@@ -319,12 +357,8 @@ namespace cobra {
                 // the next run rediscover and re-solve it from scratch, which
                 // is the dominant cost when a function is re-optimized, so the
                 // shape that led nowhere is recorded on the root.
-                RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
-
-                for (auto &inner : ExpandMbaCandidate(cand, options_.min_ast_size, options_tag))
-                {
-                    candidates.push_back(std::move(inner));
-                }
+                record_rejection();
+                requeue_retries();
                 continue;
             }
 
@@ -341,7 +375,7 @@ namespace cobra {
                         llvm::dbgs() << "CoBRA: skipping — real_vars not contained in "
                                         "candidate variable set\n"
                     );
-                    RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
+                    record_rejection();
                     continue;
                 }
                 var_map = std::move(*checked_var_map);
@@ -368,9 +402,12 @@ namespace cobra {
             // has already lost the sharing the IR had. Held to that yardstick a
             // single add reading two values computed elsewhere looks like the
             // whole cone beneath it, and expanding it into a polynomial reads as
-            // progress. Comparing emitted instructions against removed ones is
-            // what the rewrite is really worth.
-            if (emitted.size() >= cand.dying_count) {
+            // progress. Pricing it in instructions is what the rewrite is really
+            // worth; which instructions count is the caller's call.
+            const uint32_t budget = options_.cost_model == MbaCostModel::kTreeInstructions
+                ? cand.tree_size
+                : cand.dying_count;
+            if (emitted.size() >= budget) {
                 for (auto *dead : llvm::reverse(emitted)) {
                     if (dead->use_empty()) {
                         dead->eraseFromParent();
@@ -379,13 +416,10 @@ namespace cobra {
                 ++NumSkippedCost;
                 LLVM_DEBUG(
                     llvm::dbgs() << "CoBRA: skipping — rewrite emits " << emitted.size()
-                                 << " instructions to remove " << cand.dying_count << "\n"
+                                 << " instructions against a budget of " << budget << "\n"
                 );
-                RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
-                for (auto &inner : ExpandMbaCandidate(cand, options_.min_ast_size, options_tag))
-                {
-                    candidates.push_back(std::move(inner));
-                }
+                record_rejection();
+                requeue_retries();
                 continue;
             }
 
