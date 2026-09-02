@@ -30,9 +30,7 @@
 
 #define DEBUG_TYPE "cobra"
 
-STATISTIC(
-    NumFingerprintSkips, "Number of MBA trees skipped (unchanged since last examined)"
-);
+STATISTIC(NumFingerprintSkips, "Number of MBA trees skipped (unchanged since last examined)");
 
 namespace cobra {
 
@@ -57,7 +55,9 @@ namespace cobra {
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
             llvm::DenseMap< llvm::Value *, std::pair< uint64_t, uint32_t > > &memo
         ) {
-            if (auto it = memo.find(v); it != memo.end()) { return it->second; }
+            if (auto it = memo.find(v); it != memo.end()) {
+                return it->second;
+            }
 
             // Leaves are checked before the redirect map so that a phi kept as
             // a leaf hashes by position, matching how it is later evaluated.
@@ -73,9 +73,8 @@ namespace cobra {
                 return c;
             }
             if (auto it = phi_redirects.find(v); it != phi_redirects.end()) {
-                auto through = FingerprintNode(
-                    it->second, leaf_index, tree_set, phi_redirects, memo
-                );
+                auto through =
+                    FingerprintNode(it->second, leaf_index, tree_set, phi_redirects, memo);
                 memo[v] = through;
                 return through;
             }
@@ -114,7 +113,9 @@ namespace cobra {
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
         ) {
             llvm::DenseMap< llvm::Value *, uint32_t > leaf_index;
-            for (uint32_t i = 0; i < leaves.size(); ++i) { leaf_index[leaves[i]] = i; }
+            for (uint32_t i = 0; i < leaves.size(); ++i) {
+                leaf_index[leaves[i]] = i;
+            }
 
             llvm::DenseMap< llvm::Value *, std::pair< uint64_t, uint32_t > > memo;
             auto walked = FingerprintNode(root, leaf_index, tree_set, phi_redirects, memo);
@@ -130,13 +131,20 @@ namespace cobra {
             const llvm::Instruction &inst, const MbaFingerprint &fp, uint64_t options_tag
         ) {
             auto *node = inst.getMetadata(kFingerprintMD);
-            if (node == nullptr || node->getNumOperands() != 4) { return false; }
+            if (node == nullptr || node->getNumOperands() != 4) {
+                return false;
+            }
 
             const auto read = [node](unsigned i) -> std::optional< uint64_t > {
-                auto *as_const = llvm::dyn_cast< llvm::ConstantAsMetadata >(node->getOperand(i));
-                if (as_const == nullptr) { return std::nullopt; }
+                auto *as_const =
+                    llvm::dyn_cast< llvm::ConstantAsMetadata >(node->getOperand(i));
+                if (as_const == nullptr) {
+                    return std::nullopt;
+                }
                 auto *as_int = llvm::dyn_cast< llvm::ConstantInt >(as_const->getValue());
-                if (as_int == nullptr) { return std::nullopt; }
+                if (as_int == nullptr) {
+                    return std::nullopt;
+                }
                 return as_int->getZExtValue();
             };
 
@@ -144,10 +152,12 @@ namespace cobra {
             auto depth     = read(1);
             auto num_vars  = read(2);
             auto tag       = read(3);
-            if (!structure || !depth || !num_vars || !tag) { return false; }
+            if (!structure || !depth || !num_vars || !tag) {
+                return false;
+            }
 
-            return *structure == fp.structure && *depth == fp.depth
-                && *num_vars == fp.num_vars && *tag == options_tag;
+            return *structure == fp.structure && *depth == fp.depth && *num_vars == fp.num_vars
+                && *tag == options_tag;
         }
 
         bool IsMbaOpcode(unsigned opcode) {
@@ -297,12 +307,18 @@ namespace cobra {
         // PHI nodes are treated as transparent when all incoming
         // values are MBA opcodes — the first arm is followed and a
         // redirect entry is recorded for evaluation / expr building.
+        //
+        // `max_nodes`, when non-zero, stops the tree at that many instructions:
+        // once the budget is spent every value still to be visited is kept as a
+        // leaf rather than expanded. The walk is breadth-first, so the budget
+        // buys the nodes nearest the root and the result is a connected prefix
+        // of the full tree.
         void CollectTree(
             llvm::Instruction *root, uint32_t bw,
             llvm::SmallVector< llvm::Instruction *, 16 > &tree_insts,
             std::vector< llvm::Value * > &leaves,
             llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
-            bool try_phi_transparency = true
+            bool try_phi_transparency = true, uint32_t max_nodes = 0
         ) {
             llvm::DenseSet< llvm::Value * > visited;
             std::queue< llvm::Value * > work;
@@ -316,6 +332,20 @@ namespace cobra {
                 }
 
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
+
+                // Out of budget: the node is whatever it computes, not how it
+                // computes it. Constants stay constants — turning one into a
+                // variable would only widen the signature with a column that
+                // never varies.
+                if (max_nodes != 0 && tree_insts.size() >= max_nodes
+                    && !llvm::isa< llvm::Constant >(v))
+                {
+                    if (std::find(leaves.begin(), leaves.end(), v) == leaves.end()) {
+                        leaves.push_back(v);
+                    }
+                    continue;
+                }
+
                 if ((inst != nullptr) && IsMbaOpcode(inst->getOpcode())
                     && FitsTreeWidth(inst, bw))
                 {
@@ -478,14 +508,14 @@ namespace cobra {
                         // Operands are masked to the tree width, so the sign
                         // bit has to be re-extended before comparing.
                         case Op::kCmpSlt:
-                            slots[i] = SignExtend(slots[n.a], bits_)
-                                    < SignExtend(slots[n.b], bits_)
+                            slots[i] =
+                                SignExtend(slots[n.a], bits_) < SignExtend(slots[n.b], bits_)
                                 ? 1
                                 : 0;
                             break;
                         case Op::kCmpSle:
-                            slots[i] = SignExtend(slots[n.a], bits_)
-                                    <= SignExtend(slots[n.b], bits_)
+                            slots[i] =
+                                SignExtend(slots[n.a], bits_) <= SignExtend(slots[n.b], bits_)
                                 ? 1
                                 : 0;
                             break;
@@ -560,7 +590,7 @@ namespace cobra {
             // a comparison has to mask its operands itself: an out-of-range
             // probe value would otherwise order differently than the IR does.
             // gt/ge become lt/le with the operands swapped.
-            template < typename LowerFn >
+            template< typename LowerFn >
             uint32_t LowerCompare(llvm::ICmpInst &cmp, LowerFn &&lower) {
                 const uint32_t a = Emit(Op::kMask, lower(cmp.getOperand(0)), 0);
                 const uint32_t b = Emit(Op::kMask, lower(cmp.getOperand(1)), 0);
@@ -866,7 +896,9 @@ namespace cobra {
             // Phi redirect: build from the chosen arm.
             auto pit = phi_redirects.find(v);
             if (pit != phi_redirects.end()) {
-                return BuildExprFromIRImpl(pit->second, leaves, tree_set, mask, phi_redirects, in_progress);
+                return BuildExprFromIRImpl(
+                    pit->second, leaves, tree_set, mask, phi_redirects, in_progress
+                );
             }
 
             // Constant
@@ -939,9 +971,7 @@ namespace cobra {
                 // before `else_arm` is moved from, since argument evaluation
                 // order is unspecified.
                 auto diff   = Expr::BitwiseXor(std::move(then_arm), CloneExpr(*else_arm));
-                auto masked = Expr::BitwiseAnd(
-                    std::move(diff), Expr::Negate(std::move(cond))
-                );
+                auto masked = Expr::BitwiseAnd(std::move(diff), Expr::Negate(std::move(cond)));
                 return Expr::BitwiseXor(std::move(else_arm), std::move(masked));
             }
 
@@ -951,10 +981,9 @@ namespace cobra {
                 if (shift_amt == nullptr) {
                     return nullptr;
                 }
-                auto child =
-                    BuildExprFromIRImpl(
-                        inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
-                    );
+                auto child = BuildExprFromIRImpl(
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                );
                 if (child == nullptr) {
                     return nullptr;
                 }
@@ -964,25 +993,26 @@ namespace cobra {
             // Shl with constant shift amount
             if (inst->getOpcode() == llvm::Instruction::Shl) {
                 auto *shift_amt = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
-                if (shift_amt == nullptr) { return nullptr; }
-                auto child =
-                    BuildExprFromIRImpl(
-                        inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
-                    );
-                if (child == nullptr) { return nullptr; }
+                if (shift_amt == nullptr) {
+                    return nullptr;
+                }
+                auto child = BuildExprFromIRImpl(
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                );
+                if (child == nullptr) {
+                    return nullptr;
+                }
                 uint64_t mul_val = 1ULL << shift_amt->getZExtValue();
                 return Expr::Mul(std::move(child), Expr::Constant(mul_val));
             }
 
             // Binary operations
-            auto lhs =
-                BuildExprFromIRImpl(
-                        inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
-                    );
-            auto rhs =
-                BuildExprFromIRImpl(
-                        inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress
-                    );
+            auto lhs = BuildExprFromIRImpl(
+                inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+            );
+            auto rhs = BuildExprFromIRImpl(
+                inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress
+            );
             if (lhs == nullptr || rhs == nullptr) {
                 return nullptr;
             }
@@ -1167,7 +1197,8 @@ namespace cobra {
         // arranges by feeding `MBACandidate::inner_roots` back in.
         void BuildCandidates(
             llvm::ArrayRef< llvm::Instruction * > roots, uint32_t min_ast_size,
-            uint64_t options_tag, std::vector< MBACandidate > &candidates
+            MbaCostModel cost_model, uint64_t options_tag,
+            std::vector< MBACandidate > &candidates, uint32_t max_nodes = 0
         ) {
             llvm::DenseSet< llvm::Instruction * > already_in_tree;
 
@@ -1188,7 +1219,10 @@ namespace cobra {
                 llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
                 std::vector< llvm::Value * > leaves;
                 llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
-                CollectTree(&inst, bw, tree_insts, leaves, phi_redirects);
+                CollectTree(
+                    &inst, bw, tree_insts, leaves, phi_redirects,
+                    /*try_phi_transparency=*/true, max_nodes
+                );
 
                 if (tree_insts.size() < min_ast_size) {
                     continue;
@@ -1213,9 +1247,15 @@ namespace cobra {
                 // new to learn, so claim its instructions and move on. The tree
                 // is still claimed because the enclosing root must keep winning
                 // over its inner nodes whether or not it gets re-examined.
+                //
+                // A re-cut is exempt on both counts. Its fingerprint describes a
+                // partial view of the root, so matching it against the record —
+                // which is written for the full tree — compares two different
+                // things, and it is only ever built because the full tree has
+                // already been tried and rejected in this very run.
                 const MbaFingerprint fingerprint =
                     FingerprintTree(&inst, leaves, tree_set, phi_redirects);
-                if (FingerprintUnchanged(inst, fingerprint, options_tag)) {
+                if (max_nodes == 0 && FingerprintUnchanged(inst, fingerprint, options_tag)) {
                     ++NumFingerprintSkips;
                     for (auto *ti : tree_insts) {
                         already_in_tree.insert(ti);
@@ -1231,7 +1271,7 @@ namespace cobra {
                     phi_redirects.clear();
                     CollectTree(
                         &inst, bw, tree_insts, leaves, phi_redirects,
-                        /*try_phi_transparency=*/false
+                        /*try_phi_transparency=*/false, max_nodes
                     );
 
                     if (tree_insts.size() < min_ast_size) {
@@ -1282,7 +1322,13 @@ namespace cobra {
                 // but replacing the root removes one instruction, so no rewrite
                 // can repay the search. What has to clear the bar is the number
                 // of instructions actually at stake.
-                if (dying.size() < min_ast_size) {
+                //
+                // Unless the caller prices the whole tree, in which case a root
+                // with shared operands is exactly what it means to keep, and the
+                // bar has already been cleared by the tree itself.
+                if (cost_model == MbaCostModel::kDyingInstructions
+                    && dying.size() < min_ast_size)
+                {
                     continue;
                 }
 
@@ -1326,10 +1372,10 @@ namespace cobra {
                 // Expr equivalent, and the 2^n signature alone samples each
                 // variable at 0 and 1 only. Full-width probing is what keeps
                 // those candidates honest, so the evaluator is always provided.
-                Evaluator evaluator =
-                    [plan, scratch = std::vector< uint64_t >(plan->SlotCount())](
-                        const std::vector< uint64_t > &vals
-                    ) mutable -> uint64_t {
+                Evaluator evaluator = [plan,
+                                       scratch = std::vector< uint64_t >(plan->SlotCount())](
+                                          const std::vector< uint64_t > &vals
+                                      ) mutable -> uint64_t {
                     return plan->Evaluate(vals.data(), vals.size(), scratch);
                 };
 
@@ -1356,16 +1402,18 @@ namespace cobra {
                                   .evaluator   = std::move(evaluator),
                                   .fingerprint = fingerprint,
                                   .inner_roots = std::move(inner_roots),
-                                  .dying_count = static_cast< uint32_t >(dying.size()) }
+                                  .dying_count = static_cast< uint32_t >(dying.size()),
+                                  .node_limit  = max_nodes,
+                                  .tree_size   = static_cast< uint32_t >(tree_insts.size()) }
                 );
             }
         }
 
     } // namespace
 
-    std::vector< MBACandidate >
-    DetectMbaCandidates(
-        llvm::Function &f, uint32_t min_ast_size, uint32_t /*max_vars*/, uint64_t options_tag
+    std::vector< MBACandidate > DetectMbaCandidates(
+        llvm::Function &f, uint32_t min_ast_size, uint32_t /*max_vars*/, uint64_t options_tag,
+        MbaCostModel cost_model
     ) {
         // Post-order: process uses before defs across blocks. Within each block,
         // reverse iteration hits outermost roots first, so the largest MBA tree
@@ -1380,22 +1428,63 @@ namespace cobra {
         }
 
         std::vector< MBACandidate > candidates;
-        BuildCandidates(roots, min_ast_size, options_tag, candidates);
+        BuildCandidates(roots, min_ast_size, cost_model, options_tag, candidates);
         return candidates;
     }
 
     std::vector< MBACandidate > ExpandMbaCandidate(
-        const MBACandidate &cand, uint32_t min_ast_size, uint64_t options_tag
+        const MBACandidate &cand, uint32_t min_ast_size, uint64_t options_tag,
+        MbaCostModel cost_model
     ) {
         std::vector< MBACandidate > candidates;
-        BuildCandidates(cand.inner_roots, min_ast_size, options_tag, candidates);
+        BuildCandidates(cand.inner_roots, min_ast_size, cost_model, options_tag, candidates);
+        return candidates;
+    }
+
+    std::vector< MBACandidate > RecutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint64_t options_tag,
+        MbaCostModel cost_model
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr) {
+            return candidates;
+        }
+
+        const uint32_t bw = cand.bitwidth;
+
+        // The full collection is what the cuts are working towards: once a
+        // budget buys the whole tree there is nothing smaller left to try, and
+        // the candidate it would build is the one that just failed.
+        llvm::SmallVector< llvm::Instruction *, 16 > full_insts;
+        {
+            std::vector< llvm::Value * > full_leaves;
+            llvm::DenseMap< llvm::Value *, llvm::Value * > full_redirects;
+            CollectTree(cand.root, bw, full_insts, full_leaves, full_redirects);
+        }
+
+        // One cut per rejection, smallest first. Handing back the whole ladder
+        // at once would keep solving cuts of a root that a smaller one has
+        // already rewritten; produced one at a time, the chain simply stops
+        // advancing as soon as a cut succeeds. The budget strictly increases and
+        // is bounded by the full tree, so the chain always ends.
+        for (uint32_t nodes = cand.node_limit + 1; nodes < full_insts.size(); ++nodes) {
+            BuildCandidates(
+                { cand.root }, min_ast_size, cost_model, options_tag, candidates, nodes
+            );
+            if (!candidates.empty()) {
+                return candidates;
+            }
+        }
+
         return candidates;
     }
 
     void RecordMbaFingerprint(
         llvm::Instruction *inst, const MbaFingerprint &fp, uint64_t options_tag
     ) {
-        if (inst == nullptr) { return; }
+        if (inst == nullptr) {
+            return;
+        }
 
         auto &ctx      = inst->getContext();
         auto *i64_type = llvm::Type::getInt64Ty(ctx);
