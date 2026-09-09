@@ -1,4 +1,5 @@
 #include "cobra/core/ExprUtils.h"
+#include "cobra/core/ExprTraversal.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/Expr.h"
 #include <algorithm>
@@ -173,6 +174,38 @@ namespace cobra {
         std::unreachable();
     }
 
+#if COBRA_NONRECURSIVE
+
+    bool HasVarDep(const Expr &expr) {
+        return AnyNode(expr, [](const Expr &node) {
+            return node.kind == Expr::Kind::kVariable;
+        });
+    }
+
+    bool HasNonleafBitwise(const Expr &expr) {
+        // One bottom-up pass settles the variable dependency of every node, so
+        // the test at each bitwise node is a lookup. Asking it the recursive
+        // way re-walks the whole subtree beneath every bitwise node, which is
+        // quadratic in the size of the expression - and this predicate is
+        // itself called at every node by the callers that classify a tree.
+        // Bit 0 of the folded value carries the dependency, bit 1 the answer.
+        const uint8_t kFolded = FoldPostOrder< uint8_t >(
+            expr,
+            [](const Expr &node, uint8_t *kids, size_t count) -> uint8_t {
+                uint8_t state = node.kind == Expr::Kind::kVariable ? 1 : 0;
+                for (size_t k = 0; k < count; ++k) { state |= kids[k]; }
+                const bool kBitwise = node.kind == Expr::Kind::kAnd
+                    || node.kind == Expr::Kind::kOr || node.kind == Expr::Kind::kXor
+                    || node.kind == Expr::Kind::kNot;
+                if (kBitwise && (state & 1) != 0) { state |= 2; }
+                return state;
+            }
+        );
+        return (kFolded & 2) != 0;
+    }
+
+#else
+
     bool HasVarDep(const Expr &expr) {
         if (expr.kind == Expr::Kind::kVariable) {
             return true;
@@ -191,6 +224,8 @@ namespace cobra {
             return HasNonleafBitwise(*c);
         });
     }
+
+#endif
 
     namespace {
 

@@ -1,4 +1,5 @@
 #include "cobra/core/SemilinearSignature.h"
+#include "cobra/core/ExprTraversal.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/Expr.h"
 #include "cobra/core/Trace.h"
@@ -16,8 +17,11 @@ namespace cobra {
         /// Bottom-up evaluation with variables taking {0, 2^bit_pos} values.
         /// Structurally identical to SignatureEval::EvalSigRecursive, but
         /// the kVariable case returns 2^bit_pos instead of 1.
-        std::vector< uint64_t > EvalSemilinearRecursive(
-            const Expr &expr, size_t len, uint32_t bitwidth, uint32_t bit_pos
+        // The work one node does once its children's rows are in hand, shared
+        // by both walks below.
+        std::vector< uint64_t > CombineSemilinear(
+            const Expr &expr, size_t len, uint32_t bitwidth, uint32_t bit_pos,
+            std::vector< uint64_t > left, std::vector< uint64_t > right
         ) {
             const uint64_t kMask   = Bitmask(bitwidth);
             const uint64_t kBitVal = (bit_pos < 64) ? (1ULL << bit_pos) : 0;
@@ -36,69 +40,46 @@ namespace cobra {
                 }
 
                 case Expr::Kind::kNot: {
-                    auto child =
-                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
+                    auto &child = left;
                     for (auto &v : child) { v = (~v) & kMask; }
-                    return child;
+                    return std::move(child);
                 }
                 case Expr::Kind::kNeg: {
-                    auto child =
-                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
+                    auto &child = left;
                     for (auto &v : child) { v = (-v) & kMask; }
-                    return child;
+                    return std::move(child);
                 }
                 case Expr::Kind::kShr: {
-                    auto child =
-                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
+                    auto &child = left;
                     const uint64_t kK = expr.constant_val;
                     if (kK >= 64) {
                         std::fill(child.begin(), child.end(), 0);
                     } else {
                         for (auto &v : child) { v = (v >> kK) & kMask; }
                     }
-                    return child;
+                    return std::move(child);
                 }
 
                 case Expr::Kind::kAdd: {
-                    auto left =
-                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
-                    auto right =
-                        EvalSemilinearRecursive(*expr.children[1], len, bitwidth, bit_pos);
-                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] + right[i]) & kMask; }
-                    return left;
+                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] + right[i]) & kMask; }
+                    return std::move(left);
                 }
                 case Expr::Kind::kMul: {
-                    auto left =
-                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
-                    auto right =
-                        EvalSemilinearRecursive(*expr.children[1], len, bitwidth, bit_pos);
-                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] * right[i]) & kMask; }
-                    return left;
+                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] * right[i]) & kMask; }
+                    return std::move(left);
                 }
 
                 case Expr::Kind::kAnd: {
-                    auto left =
-                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
-                    auto right =
-                        EvalSemilinearRecursive(*expr.children[1], len, bitwidth, bit_pos);
-                    for (size_t i = 0; i < len; ++i) { left[i] = left[i] & right[i]; }
-                    return left;
+                                        for (size_t i = 0; i < len; ++i) { left[i] = left[i] & right[i]; }
+                    return std::move(left);
                 }
                 case Expr::Kind::kOr: {
-                    auto left =
-                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
-                    auto right =
-                        EvalSemilinearRecursive(*expr.children[1], len, bitwidth, bit_pos);
-                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] | right[i]) & kMask; }
-                    return left;
+                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] | right[i]) & kMask; }
+                    return std::move(left);
                 }
                 case Expr::Kind::kXor: {
-                    auto left =
-                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
-                    auto right =
-                        EvalSemilinearRecursive(*expr.children[1], len, bitwidth, bit_pos);
-                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] ^ right[i]) & kMask; }
-                    return left;
+                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] ^ right[i]) & kMask; }
+                    return std::move(left);
                 }
 
                 // This is concrete evaluation at particular inputs rather than
@@ -106,22 +87,55 @@ namespace cobra {
                 case Expr::Kind::kCmpEq:
                 case Expr::Kind::kCmpUlt:
                 case Expr::Kind::kCmpSlt: {
-                    auto left =
-                        EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
-                    auto right =
-                        EvalSemilinearRecursive(*expr.children[1], len, bitwidth, bit_pos);
-                    for (size_t i = 0; i < len; ++i) {
+                                        for (size_t i = 0; i < len; ++i) {
                         left[i] = expr.kind == Expr::Kind::kCmpEq
                             ? ModCmpEq(left[i], right[i], bitwidth)
                             : (expr.kind == Expr::Kind::kCmpUlt
                                    ? ModCmpUlt(left[i], right[i], bitwidth)
                                    : ModCmpSlt(left[i], right[i], bitwidth));
                     }
-                    return left;
+                    return std::move(left);
                 }
             }
             return std::vector< uint64_t >(len, 0);
         }
+
+#if COBRA_NONRECURSIVE
+
+        std::vector< uint64_t > EvalSemilinearIterative(
+            const Expr &root, size_t len, uint32_t bitwidth, uint32_t bit_pos
+        ) {
+            return FoldPostOrder< std::vector< uint64_t > >(
+                root,
+                [&](const Expr &node, std::vector< uint64_t > *kids, size_t count) {
+                    std::vector< uint64_t > left;
+                    std::vector< uint64_t > right;
+                    if (count > 0) { left = std::move(kids[0]); }
+                    if (count > 1) { right = std::move(kids[1]); }
+                    return CombineSemilinear(
+                        node, len, bitwidth, bit_pos, std::move(left), std::move(right)
+                    );
+                }
+            );
+        }
+
+#else
+
+        std::vector< uint64_t > EvalSemilinearRecursive(
+            const Expr &expr, size_t len, uint32_t bitwidth, uint32_t bit_pos
+        ) {
+            std::vector< uint64_t > left;
+            std::vector< uint64_t > right;
+            if (!expr.children.empty()) {
+                left = EvalSemilinearRecursive(*expr.children[0], len, bitwidth, bit_pos);
+            }
+            if (expr.children.size() > 1) {
+                right = EvalSemilinearRecursive(*expr.children[1], len, bitwidth, bit_pos);
+            }
+            return CombineSemilinear(expr, len, bitwidth, bit_pos, std::move(left), std::move(right));
+        }
+
+#endif
 
     } // namespace
 
@@ -134,7 +148,11 @@ namespace cobra {
         // so the UB cannot reach a future caller.
         assert(num_vars < 64 && "EvaluateSemilinearRow: 1 << num_vars UB for num_vars >= 64");
         const size_t kLen = size_t{ 1 } << num_vars;
+#if COBRA_NONRECURSIVE
+        auto result       = EvalSemilinearIterative(expr, kLen, bitwidth, bit_pos);
+#else
         auto result       = EvalSemilinearRecursive(expr, kLen, bitwidth, bit_pos);
+#endif
 
         if (bit_pos > 0 && bit_pos < 64) {
             const uint64_t kMask = Bitmask(bitwidth);

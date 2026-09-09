@@ -1,4 +1,5 @@
 #include "cobra/core/Expr.h"
+#include "cobra/core/ExprTraversal.h"
 #include "cobra/core/BitWidth.h"
 #include <cstdint>
 #include <memory>
@@ -220,6 +221,14 @@ namespace cobra {
         return MakeBinary(Kind::kCmpSlt, std::move(lhs), std::move(rhs));
     }
 
+#if COBRA_NONRECURSIVE
+
+    bool ContainsComparison(const Expr &expr) {
+        return AnyNode(expr, [](const Expr &node) { return IsComparison(node.kind); });
+    }
+
+#else
+
     bool ContainsComparison(const Expr &expr) {
         if (IsComparison(expr.kind)) {
             return true;
@@ -232,6 +241,48 @@ namespace cobra {
         return false;
     }
 
+#endif
+
+#if COBRA_NONRECURSIVE
+
+    Expr::~Expr() {
+        if (children.empty()) { return; }
+        std::vector< std::unique_ptr< Expr > > pending;
+        for (auto &child : children) {
+            if (child) { pending.push_back(std::move(child)); }
+        }
+        children.clear();
+        while (!pending.empty()) {
+            auto node = std::move(pending.back());
+            pending.pop_back();
+            for (auto &child : node->children) {
+                if (child) { pending.push_back(std::move(child)); }
+            }
+            // Cleared before `node` goes out of scope, so its destructor has
+            // nothing left to descend into.
+            node->children.clear();
+        }
+    }
+
+    std::unique_ptr< Expr > CloneExpr(const Expr &expr) {
+        return FoldPostOrder< std::unique_ptr< Expr > >(
+            expr,
+            [](const Expr &node, std::unique_ptr< Expr > *kids, size_t count) {
+                auto dst          = std::make_unique< Expr >();
+                dst->kind         = node.kind;
+                dst->constant_val = node.constant_val;
+                dst->var_index    = node.var_index;
+                dst->children.reserve(count);
+                for (size_t k = 0; k < count; ++k) {
+                    dst->children.push_back(std::move(kids[k]));
+                }
+                return dst;
+            }
+        );
+    }
+
+#else
+
     std::unique_ptr< Expr > CloneExpr(const Expr &expr) {
         auto dst          = std::make_unique< Expr >();
         dst->kind         = expr.kind;
@@ -240,6 +291,8 @@ namespace cobra {
         for (const auto &child : expr.children) { dst->children.push_back(CloneExpr(*child)); }
         return dst;
     }
+
+#endif
 
     std::string
     Render(const Expr &expr, const std::vector< std::string > &var_names, uint32_t bitwidth) {

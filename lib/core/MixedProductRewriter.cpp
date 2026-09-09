@@ -3,6 +3,7 @@
 #include "cobra/core/Classifier.h"
 #include "cobra/core/Expr.h"
 #include "cobra/core/ExprUtils.h"
+#include "cobra/core/ExprTraversal.h"
 #include "cobra/core/Trace.h"
 #include <cstdint>
 #include <vector>
@@ -11,11 +12,21 @@
 
 namespace cobra {
 
+#if COBRA_NONRECURSIVE
+
+    uint32_t NodeCount(const Expr &expr) {
+        return static_cast< uint32_t >(CountNodes(expr));
+    }
+
+#else
+
     uint32_t NodeCount(const Expr &expr) {
         uint32_t count = 1;
         for (const auto &child : expr.children) { count += NodeCount(*child); }
         return count;
     }
+
+#endif
 
     namespace {
 
@@ -31,6 +42,30 @@ namespace cobra {
             return ctx.in_mixed_product || ctx.in_bitwise_over_arith;
         }
 
+#if COBRA_NONRECURSIVE
+
+        // Same shape as `HasNonleafBitwise`, and quadratic for the same reason
+        // when written as recursion: one bottom-up pass for the variable
+        // dependency turns the test at each arithmetic node into a lookup.
+        // Same shape as `HasNonleafBitwise`, and quadratic for the same reason
+        // when written as recursion.
+        bool HasArithVar(const Expr &expr) {
+            const uint8_t kFolded = FoldPostOrder< uint8_t >(
+                expr,
+                [](const Expr &node, uint8_t *kids, size_t count) -> uint8_t {
+                    uint8_t state = node.kind == Expr::Kind::kVariable ? 1 : 0;
+                    for (size_t k = 0; k < count; ++k) { state |= kids[k]; }
+                    const bool kArith = node.kind == Expr::Kind::kAdd
+                        || node.kind == Expr::Kind::kMul || node.kind == Expr::Kind::kNeg;
+                    if (kArith && (state & 1) != 0) { state |= 2; }
+                    return state;
+                }
+            );
+            return (kFolded & 2) != 0;
+        }
+
+#else
+
         bool HasArithVar(const Expr &expr) {
             if (expr.kind == Expr::Kind::kAdd || expr.kind == Expr::Kind::kMul
                 || expr.kind == Expr::Kind::kNeg)
@@ -42,6 +77,8 @@ namespace cobra {
             }
             return false;
         }
+
+#endif
 
         uint32_t CountSitesImpl(const Expr &expr, const RewriteContext &ctx) {
             uint32_t count = 0;
@@ -197,15 +234,23 @@ namespace cobra {
     ) { // NOLINT(readability-identifier-naming)
         auto cls = ClassifyStructural(*expr);
         if (HasFlag(cls.flags, kSfHasUnknownShape)
-            || !HasFlag(cls.flags, kSfHasMixedProduct | kSfHasBitwiseOverArith)
-            || CountRewriteableSites(*expr) == 0)
+            || !HasFlag(cls.flags, kSfHasMixedProduct | kSfHasBitwiseOverArith))
         {
+            return { .expr = std::move(expr), .rounds_applied = 0, .structure_changed = false };
+        }
+
+        // Counting the sites walks the whole expression and asks a predicate at
+        // every node. Nothing has changed it since, so the count the guard
+        // needs is also the one the first round is compared against, and asking
+        // twice was a second walk of the same tree for the same answer.
+        const uint32_t initial_sites = CountRewriteableSites(*expr);
+        if (initial_sites == 0) {
             return { .expr = std::move(expr), .rounds_applied = 0, .structure_changed = false };
         }
 
         const uint32_t initial_count = NodeCount(*expr);
         auto old_flags               = cls.flags & kUnsupportedFlagMask;
-        auto old_sites               = CountRewriteableSites(*expr);
+        auto old_sites               = initial_sites;
         COBRA_TRACE(
             "MixedRewriter",
             "RewriteMixedProducts: max_rounds={} max_growth={} initial_nodes={} "
