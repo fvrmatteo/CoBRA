@@ -5,6 +5,7 @@
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/Trace.h"
 #include <cstdint>
+#include <vector>
 #include <memory>
 #include <utility>
 
@@ -88,10 +89,26 @@ namespace cobra {
 
         // Apply XOR lowering: x ^ y -> x + y - 2*(x & y)
         // Only in unsupported contexts.
+        //
+        // `node_limit` is the budget `RewriteMixedProducts` will accept, and it
+        // is enforced here rather than only on the finished tree. Each lowering
+        // duplicates both of its operands, and the walk is bottom-up, so nested
+        // XORs double at every level: an expression that ends up over budget
+        // does not end up slightly over it, it ends up exponentially over it,
+        // and building the whole of that before measuring it is what the
+        // rewriter spends most of its memory on. The rewrite only ever adds
+        // nodes, so stopping as soon as the running count passes the budget
+        // rejects exactly the expressions the finished-tree check rejected,
+        // while never allocating more than the budget allows. `nodes` reports
+        // the size of the subtree returned; `aborted` says the budget was
+        // passed and the result is to be discarded.
         // NOLINTNEXTLINE(readability-identifier-naming)
         std::unique_ptr< Expr > ApplyXorLoweringImpl(
-            std::unique_ptr< Expr > expr, const RewriteContext &ctx, uint32_t bitwidth
+            std::unique_ptr< Expr > expr, const RewriteContext &ctx, uint32_t bitwidth,
+            uint64_t node_limit, uint64_t &nodes, bool &aborted
         ) {
+            nodes = 0;
+            if (aborted) { return expr; }
             RewriteContext child_ctx = ctx;
 
             if (expr->kind == Expr::Kind::kMul) {
@@ -123,14 +140,28 @@ namespace cobra {
             }
 
             // Recurse into children first (bottom-up)
+            std::vector< uint64_t > child_nodes;
+            child_nodes.reserve(expr->children.size());
+            uint64_t subtree = 1;
             for (auto &c : expr->children) {
-                c = ApplyXorLoweringImpl(std::move(c), child_ctx, bitwidth);
+                uint64_t produced = 0;
+                c = ApplyXorLoweringImpl(std::move(c), child_ctx, bitwidth, node_limit, produced, aborted);
+                if (aborted) { return expr; }
+                child_nodes.push_back(produced);
+                subtree += produced;
             }
 
             // Apply XOR lowering if in unsupported context
             if (expr->kind == Expr::Kind::kXor && IsInUnsupportedContext(child_ctx)
                 && expr->children.size() == 2)
             {
+                // The replacement holds both operands twice, plus the six nodes
+                // that spell out `x + y - 2*(x & y)`.
+                const uint64_t lowered = (2 * (child_nodes[0] + child_nodes[1])) + 6;
+                if (lowered > node_limit) {
+                    aborted = true;
+                    return expr;
+                }
                 COBRA_TRACE("MixedRewriter", "  XOR lowering: x^y -> x+y-2*(x&y)");
                 // x ^ y -> x + y - 2*(x & y)
                 auto lhs  = CloneExpr(*expr->children[0]);
@@ -142,9 +173,15 @@ namespace cobra {
                 auto and_term    = Expr::BitwiseAnd(std::move(lhs2), std::move(rhs2));
                 auto two_and     = Expr::Mul(Expr::Constant(2), std::move(and_term));
                 auto neg_two_and = Expr::Negate(std::move(two_and));
+                nodes            = lowered;
                 return Expr::Add(std::move(sum), std::move(neg_two_and));
             }
 
+            if (subtree > node_limit) {
+                aborted = true;
+                return expr;
+            }
+            nodes = subtree;
             return expr;
         }
 
@@ -181,9 +218,21 @@ namespace cobra {
         result.rounds_applied    = 0;
         result.structure_changed = false;
 
+        const uint64_t node_limit =
+            static_cast< uint64_t >(initial_count) * static_cast< uint64_t >(opts.max_node_growth);
+
         for (uint32_t round = 1; round <= opts.max_rounds; ++round) {
             const RewriteContext ctx;
-            auto new_expr = ApplyXorLoweringImpl(CloneExpr(*result.expr), ctx, opts.bitwidth);
+            uint64_t produced = 0;
+            bool aborted      = false;
+            auto new_expr =
+                ApplyXorLoweringImpl(CloneExpr(*result.expr), ctx, opts.bitwidth, node_limit, produced, aborted);
+            if (aborted) {
+                COBRA_TRACE(
+                    "MixedRewriter", "Round {}: ABORT - node growth exceeded during rewrite", round
+                );
+                break;
+            }
 
             const uint32_t new_count = NodeCount(*new_expr);
             if (new_count > initial_count * opts.max_node_growth) {
