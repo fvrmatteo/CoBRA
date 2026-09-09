@@ -1,4 +1,5 @@
 #include "cobra/core/SignatureEval.h"
+#include "cobra/core/ExprTraversal.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/Expr.h"
 #include "cobra/core/Profile.h"
@@ -44,8 +45,13 @@ namespace cobra {
         // Complexity: O(tree_size * 2^n) element-wise ops in a single tree
         // walk. Per-node result buffers are recycled through `pool` so the
         // 2^n vectors are not malloc'd once per leaf.
-        std::vector< uint64_t >
-        EvalSigRecursive(const Expr &expr, SigBufferPool &pool, uint32_t bitwidth) {
+                // The work one node does once its children's buffers are in hand. Both
+        // walks below share it, so the recursive and the iterative evaluation
+        // are the same arithmetic by construction.
+std::vector< uint64_t > CombineSig(
+            const Expr &expr, SigBufferPool &pool, uint32_t bitwidth,
+            std::vector< uint64_t > left, std::vector< uint64_t > right
+        ) {
             const uint64_t kMask = Bitmask(bitwidth);
             const size_t len     = pool.len;
 
@@ -62,17 +68,17 @@ namespace cobra {
                     return r;
                 }
                 case Expr::Kind::kNot: {
-                    auto child = EvalSigRecursive(*expr.children[0], pool, bitwidth);
+                    auto &child = left;
                     for (size_t i = 0; i < len; ++i) { child[i] = (~child[i]) & kMask; }
-                    return child;
+                    return std::move(child);
                 }
                 case Expr::Kind::kNeg: {
-                    auto child = EvalSigRecursive(*expr.children[0], pool, bitwidth);
+                    auto &child = left;
                     for (size_t i = 0; i < len; ++i) { child[i] = (-child[i]) & kMask; }
-                    return child;
+                    return std::move(child);
                 }
                 case Expr::Kind::kShr: {
-                    auto child        = EvalSigRecursive(*expr.children[0], pool, bitwidth);
+                    auto &child       = left;
                     const uint64_t kK = expr.constant_val;
                     if (kK >= 64) {
                         std::fill(child.begin(), child.end(), 0);
@@ -81,73 +87,94 @@ namespace cobra {
                             child[i] = (child[i] >> kK) & kMask;
                         }
                     }
-                    return child;
+                    return std::move(child);
                 }
                 case Expr::Kind::kAdd: {
-                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
-                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
-                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] + right[i]) & kMask; }
+                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] + right[i]) & kMask; }
                     pool.Release(std::move(right));
-                    return left;
+                    return std::move(left);
                 }
                 case Expr::Kind::kMul: {
-                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
-                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
-                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] * right[i]) & kMask; }
+                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] * right[i]) & kMask; }
                     pool.Release(std::move(right));
-                    return left;
+                    return std::move(left);
                 }
                 case Expr::Kind::kAnd: {
-                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
-                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
-                    for (size_t i = 0; i < len; ++i) { left[i] = left[i] & right[i]; }
+                                        for (size_t i = 0; i < len; ++i) { left[i] = left[i] & right[i]; }
                     pool.Release(std::move(right));
-                    return left;
+                    return std::move(left);
                 }
                 case Expr::Kind::kOr: {
-                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
-                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
-                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] | right[i]) & kMask; }
+                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] | right[i]) & kMask; }
                     pool.Release(std::move(right));
-                    return left;
+                    return std::move(left);
                 }
                 case Expr::Kind::kXor: {
-                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
-                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
-                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] ^ right[i]) & kMask; }
+                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] ^ right[i]) & kMask; }
                     pool.Release(std::move(right));
-                    return left;
+                    return std::move(left);
                 }
                 case Expr::Kind::kCmpEq: {
-                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
-                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
-                    for (size_t i = 0; i < len; ++i) {
+                                        for (size_t i = 0; i < len; ++i) {
                         left[i] = ModCmpEq(left[i], right[i], bitwidth);
                     }
                     pool.Release(std::move(right));
-                    return left;
+                    return std::move(left);
                 }
                 case Expr::Kind::kCmpUlt: {
-                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
-                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
-                    for (size_t i = 0; i < len; ++i) {
+                                        for (size_t i = 0; i < len; ++i) {
                         left[i] = ModCmpUlt(left[i], right[i], bitwidth);
                     }
                     pool.Release(std::move(right));
-                    return left;
+                    return std::move(left);
                 }
                 case Expr::Kind::kCmpSlt: {
-                    auto left  = EvalSigRecursive(*expr.children[0], pool, bitwidth);
-                    auto right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
-                    for (size_t i = 0; i < len; ++i) {
+                                        for (size_t i = 0; i < len; ++i) {
                         left[i] = ModCmpSlt(left[i], right[i], bitwidth);
                     }
                     pool.Release(std::move(right));
-                    return left;
+                    return std::move(left);
                 }
             }
             return std::vector< uint64_t >(len, 0);
         }
+
+#if COBRA_NONRECURSIVE
+
+        // Bottom-up over an explicit order rather than the call stack: the
+        // depth of an obfuscated expression is chosen by the input, and a
+        // signature is evaluated for every candidate, so this is the walk most
+        // likely to meet a tree deeper than the stack allows.
+        std::vector< uint64_t >
+        EvalSigIterative(const Expr &root, SigBufferPool &pool, uint32_t bitwidth) {
+            return FoldPostOrder< std::vector< uint64_t > >(
+                root,
+                [&](const Expr &node, std::vector< uint64_t > *kids, size_t count) {
+                    std::vector< uint64_t > left;
+                    std::vector< uint64_t > right;
+                    if (count > 0) { left = std::move(kids[0]); }
+                    if (count > 1) { right = std::move(kids[1]); }
+                    return CombineSig(node, pool, bitwidth, std::move(left), std::move(right));
+                }
+            );
+        }
+
+#else
+
+        std::vector< uint64_t >
+        EvalSigRecursive(const Expr &expr, SigBufferPool &pool, uint32_t bitwidth) {
+            std::vector< uint64_t > left;
+            std::vector< uint64_t > right;
+            if (!expr.children.empty()) {
+                left = EvalSigRecursive(*expr.children[0], pool, bitwidth);
+            }
+            if (expr.children.size() > 1) {
+                right = EvalSigRecursive(*expr.children[1], pool, bitwidth);
+            }
+            return CombineSig(expr, pool, bitwidth, std::move(left), std::move(right));
+        }
+
+#endif
 
 #ifdef COBRA_SIG_STATS
         uint32_t CountNodesLocal(const Expr &e) {
@@ -173,7 +200,11 @@ namespace cobra {
 #endif
         const size_t kLen = size_t{ 1 } << num_vars;
         SigBufferPool pool{ .len = kLen, .free = {} };
+#if COBRA_NONRECURSIVE
+        auto result = EvalSigIterative(expr, pool, bitwidth);
+#else
         auto result = EvalSigRecursive(expr, pool, bitwidth);
+#endif
 #ifdef COBRA_SIG_STATS
         auto t1   = std::chrono::high_resolution_clock::now();
         double us = std::chrono::duration< double, std::micro >(t1 - t0).count();

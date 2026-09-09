@@ -4,6 +4,7 @@ set_target_properties(cobra-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_sources(cobra-core PRIVATE
     CompiledExpr.cpp
     Expr.cpp
+    ExprTraversal.cpp
     SignatureVector.cpp
     AuxVarEliminator.cpp
     AnfTransform.cpp

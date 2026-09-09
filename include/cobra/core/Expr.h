@@ -41,6 +41,21 @@ namespace cobra {
         uint32_t var_index    = 0;
         std::vector< std::unique_ptr< Expr > > children; // move-only by design
 
+#if COBRA_NONRECURSIVE
+        // Releasing the children through the implicit destructor recurses once
+        // per level of the tree, so a tree deep enough to build is not always
+        // shallow enough to destroy. The out-of-line destructor unlinks the
+        // children onto a worklist instead, which costs heap rather than stack.
+        // Declaring it suppresses the implicit moves, so they are asked for
+        // back; the type stays move-only either way.
+        Expr()                        = default;
+        Expr(Expr &&)                 = default;
+        Expr &operator=(Expr &&)      = default;
+        Expr(const Expr &)            = delete;
+        Expr &operator=(const Expr &) = delete;
+        ~Expr();
+#endif
+
         static std::unique_ptr< Expr > Constant(uint64_t val);
         static std::unique_ptr< Expr > Variable(uint32_t index);
         static std::unique_ptr< Expr >

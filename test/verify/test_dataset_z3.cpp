@@ -101,8 +101,10 @@ namespace {
                 RemapVarIndices(*simpl, idx);
             }
 
-            auto z3r =
-                Z3VerifyExprs(*folded, *simpl, parse_result.value().vars, 64, timeout_ms);
+            auto z3r = Z3VerifyExprs(
+                *folded, *simpl, parse_result.value().vars, 64,
+                Z3VerificationSettings{ .timeout_ms = timeout_ms }
+            );
 
             if (z3r.equivalent) {
                 stats.verified++;
@@ -205,7 +207,10 @@ TEST(DatasetZ3, MSiMBASample) {
             RemapVarIndices(*simpl, remap);
         }
 
-        auto z3r = Z3VerifyExprs(*folded, *simpl, parse_result.value().vars, 64, 120000);
+        auto z3r = Z3VerifyExprs(
+            *folded, *simpl, parse_result.value().vars, 64,
+            Z3VerificationSettings{ .timeout_ms = 120000 }
+        );
 
         if (z3r.equivalent) {
             verified++;
