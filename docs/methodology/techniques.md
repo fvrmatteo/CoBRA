@@ -53,7 +53,7 @@ Pre-processing step that detects variables which cancel out of an expression. If
 
 ### Bit Partitioning
 
-Groups bit positions by semantic profile (constant mask behavior). Within each partition, constants reduce to 0 or 1, enabling standard linear simplification per partition.
+Groups bit positions by semantic profile (constant mask behavior). Within each partition, constants reduce to 0 or 1, enabling standard linear simplification per partition - the Partition Solve below.
 
 **Source:** [BitPartitioner.cpp](../../lib/core/BitPartitioner.cpp)
 **Used in:** [Semilinear Techniques](semilinear-techniques.md#bit-partitioning)
@@ -270,6 +270,16 @@ ANF cleanup pass that detects the pattern `x XOR y XOR (x & y)` and rewrites it 
 
 **Source:** [AnfCleanup.cpp](../../lib/core/AnfCleanup.cpp)
 **Used in:** [Signature Techniques](signature-techniques.md#anf-cleanup)
+
+---
+
+### Partition Solve
+
+Solves a semilinear sum one bit class at a time. On each class the sum is an ordinary linear MBA - the constants inside its atoms have collapsed to 0 or 1 - so its bit-slice signature is interpolated and rebuilt through the CoB builder, and the answer is masked back to the class's bits. A shifted atom whose coefficient is a multiple of `2^shift` is read as the unshifted atom with its low bits cleared. This is what reads a variable hidden under a constant inside a multi-variable atom, e.g. `((y ^ c) & ~x) + ((y ^ c) & x)` to `y ^ c`, and a word split into masked, shifted pieces back into one `xor`.
+
+**Source:** [PartitionSolver.cpp](../../lib/core/PartitionSolver.cpp)
+**Used in:** [Semilinear Techniques](semilinear-techniques.md#partition-solve)
+**Reference:** Skees, [Deobfuscation of Semi-Linear Mixed Boolean-Arithmetic Expressions](https://arxiv.org/abs/2406.10016) (MSiMBA, 2024)
 
 ---
 

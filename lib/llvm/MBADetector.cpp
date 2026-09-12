@@ -17,6 +17,7 @@
 #include "llvm/Support/Casting.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -172,6 +173,7 @@ namespace cobra {
                 case llvm::Instruction::LShr:
                 case llvm::Instruction::ZExt:
                 case llvm::Instruction::SExt:
+                case llvm::Instruction::Trunc:
                 case llvm::Instruction::Select:
                 case llvm::Instruction::ICmp:
                     return true;
@@ -182,8 +184,48 @@ namespace cobra {
 
         // `icmp` produces i1, which is useless as a candidate root: it is only
         // worth following as the condition feeding a `select` in a wider tree.
+        // A truncation is no better: the value it narrows is wider than the
+        // root, so it could never join the tree, and the root would only ever
+        // be rewritten into itself.
         bool IsMbaRootOpcode(unsigned opcode) {
-            return opcode != llvm::Instruction::ICmp && IsMbaOpcode(opcode);
+            return opcode != llvm::Instruction::ICmp && opcode != llvm::Instruction::Trunc
+                && IsMbaOpcode(opcode);
+        }
+
+        // The operators that read their operands bit by bit, and the ones that
+        // carry between bits. An arithmetic value under a bitwise reader can
+        // only ever be a variable to the reading above it - no sum of atoms
+        // over `a` and `b` equals `(a + b) ^ c` - which is what the boundary
+        // cut in `CollectTree` is about.
+        bool IsArithmeticOpcode(unsigned opcode) {
+            return opcode == llvm::Instruction::Add || opcode == llvm::Instruction::Sub
+                || opcode == llvm::Instruction::Mul || opcode == llvm::Instruction::Shl;
+        }
+
+        bool IsBitwiseReaderOpcode(unsigned opcode) {
+            switch (opcode) { // NOLINT(hicpp-multiway-paths-covered)
+                case llvm::Instruction::And:
+                case llvm::Instruction::Or:
+                case llvm::Instruction::Xor:
+                case llvm::Instruction::LShr:
+                case llvm::Instruction::Trunc:
+                case llvm::Instruction::ZExt:
+                case llvm::Instruction::SExt:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        // The width of `v` when it is an integer narrower than the tree, else
+        // zero. Such a value is held zero-extended and masked back to its own
+        // width wherever an operation could carry into the bits above it.
+        uint32_t NarrowWidth(const llvm::Value *v, uint32_t bw) {
+            const auto *ty = v->getType();
+            if (!ty->isIntegerTy() || ty->getIntegerBitWidth() >= bw) {
+                return 0;
+            }
+            return ty->getIntegerBitWidth();
         }
 
         // Predicates the evaluator can reproduce from a value masked to the
@@ -241,20 +283,35 @@ namespace cobra {
                     && IsSupportedPredicate(cmp->getPredicate());
             }
 
-            // A widening cast is modelled as a no-op, so the operand subtree is
-            // evaluated under the tree's mask rather than the narrower source
-            // one. That is only faithful when nothing is discarded: either the
-            // cast changes no bits, or the source is an i1 whose 0/1 value the
-            // model already reproduces exactly. A genuine widening (i8 -> i32,
-            // say) would drop the source's wrap-around, so it stays a leaf.
-            if (inst->getOpcode() == llvm::Instruction::ZExt
-                || inst->getOpcode() == llvm::Instruction::SExt)
-            {
-                if (!IsTreeWidthInt(inst, bw)) {
-                    return false;
-                }
+            // Everything else is held at its own width inside a tree evaluated
+            // at the root's. A narrower node is zero-extended and masked back
+            // to its width after every operation that can carry into the bits
+            // above it, which is exact: reducing a ring computation modulo 2^n
+            // commutes with computing it, the logical shift and the bitwise
+            // operators keep an in-range value in range, and a constant is
+            // already the value its own width gives it. A wider node has no
+            // reading at the root's width, so it stays a leaf.
+            const auto *ty = inst->getType();
+            if (!ty->isIntegerTy() || ty->getIntegerBitWidth() > bw) {
+                return false;
+            }
+
+            // A zero extension is the identity on a value held zero-extended.
+            // A sign extension is only modelled from an i1, whose 0/1 the
+            // model reproduces exactly and whose extension is a negation; from
+            // anything wider it stays a leaf.
+            if (inst->getOpcode() == llvm::Instruction::ZExt) {
+                return inst->getOperand(0)->getType()->isIntegerTy();
+            }
+            if (inst->getOpcode() == llvm::Instruction::SExt) {
+                return inst->getOperand(0)->getType()->isIntegerTy(1);
+            }
+
+            // A truncation is a mask, provided the value it narrows has a
+            // reading at the root's width at all.
+            if (inst->getOpcode() == llvm::Instruction::Trunc) {
                 const auto *src = inst->getOperand(0)->getType();
-                return src->isIntegerTy(1) || src->isIntegerTy(bw);
+                return src->isIntegerTy() && src->getIntegerBitWidth() <= bw;
             }
 
             return true;
@@ -313,19 +370,35 @@ namespace cobra {
         // leaf rather than expanded. The walk is breadth-first, so the budget
         // buys the nodes nearest the root and the result is a connected prefix
         // of the full tree.
+        //
+        // `cut_arith_under_bitwise` keeps every arithmetic value that a bitwise
+        // operator reads as a leaf, whatever it is computed from. That is the
+        // boundary the semilinear reading needs: an atom is a bitwise function
+        // of its variables, so `(a + b) ^ c` has one only with `a + b` as the
+        // variable, and an expansion past it dissolves the identity it takes
+        // part in rather than exposing another.
         void CollectTree(
             llvm::Instruction *root, uint32_t bw,
             llvm::SmallVector< llvm::Instruction *, 16 > &tree_insts,
             std::vector< llvm::Value * > &leaves,
             llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
-            bool try_phi_transparency = true, uint32_t max_nodes = 0
+            bool try_phi_transparency = true, uint32_t max_nodes = 0,
+            bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0
         ) {
+            // A re-cut's budget and the cap on any collection are both
+            // budgets on the same walk; the tighter one applies.
+            const uint32_t budget = max_nodes == 0 ? max_tree_nodes
+                : max_tree_nodes == 0                ? max_nodes
+                                                     : std::min(max_nodes, max_tree_nodes);
+
             llvm::DenseSet< llvm::Value * > visited;
-            std::queue< llvm::Value * > work;
-            work.push(root);
+            // Each entry says whether the value was reached through a bitwise
+            // reader, which is what decides the boundary cut.
+            std::queue< std::pair< llvm::Value *, bool > > work;
+            work.push({ root, false });
 
             while (!work.empty()) {
-                auto *v = work.front();
+                auto [v, from_bitwise] = work.front();
                 work.pop();
                 if (!visited.insert(v).second) {
                     continue;
@@ -337,7 +410,7 @@ namespace cobra {
                 // computes it. Constants stay constants — turning one into a
                 // variable would only widen the signature with a column that
                 // never varies.
-                if (max_nodes != 0 && tree_insts.size() >= max_nodes
+                if (budget != 0 && tree_insts.size() >= budget
                     && !llvm::isa< llvm::Constant >(v))
                 {
                     if (std::find(leaves.begin(), leaves.end(), v) == leaves.end()) {
@@ -360,9 +433,19 @@ namespace cobra {
                         continue;
                     }
 
+                    if (cut_arith_under_bitwise && from_bitwise
+                        && IsArithmeticOpcode(inst->getOpcode()))
+                    {
+                        if (std::find(leaves.begin(), leaves.end(), v) == leaves.end()) {
+                            leaves.push_back(v);
+                        }
+                        continue;
+                    }
+
                     tree_insts.push_back(inst);
+                    const bool kReadsBitwise = IsBitwiseReaderOpcode(inst->getOpcode());
                     for (auto &op : inst->operands()) {
-                        work.push(op.get());
+                        work.push({ op.get(), kReadsBitwise });
                     }
                 } else if (auto *phi = llvm::dyn_cast< llvm::PHINode >(v)) {
                     // Check if every incoming value is an MBA opcode
@@ -386,7 +469,7 @@ namespace cobra {
                     if (all_mba && try_phi_transparency && !PhiIsLoopCarried(phi)) {
                         auto *chosen       = phi->getIncomingValue(0);
                         phi_redirects[phi] = chosen;
-                        work.push(chosen);
+                        work.push({ chosen, from_bitwise });
                     } else {
                         if (std::find(leaves.begin(), leaves.end(), v) == leaves.end()) {
                             leaves.push_back(v);
@@ -634,7 +717,9 @@ namespace cobra {
 
                 auto leaf = leaf_index.find(v);
                 if (leaf != leaf_index.end()) {
-                    const uint32_t slot = Emit(Op::kInput, leaf->second, 0);
+                    // Probes hand a leaf any word; a narrow leaf only ever
+                    // holds its own width of it, and the Expr says the same.
+                    const uint32_t slot = MaskToWidth(v, Emit(Op::kInput, leaf->second, 0));
                     slot_of[v]          = slot;
                     return slot;
                 }
@@ -684,9 +769,17 @@ namespace cobra {
                     if (inst->getOpcode() == llvm::Instruction::SExt
                         && inst->getOperand(0)->getType()->isIntegerTy(1))
                     {
-                        return Emit(Op::kSub, kZeroSlot, child);
+                        return MaskToWidth(v, Emit(Op::kSub, kZeroSlot, child));
                     }
                     return Emit(Op::kMask, child, 0);
+                }
+
+                // A truncation keeps the low bits of a value held at a wider
+                // width: a mask, at the width it narrows to.
+                if (inst->getOpcode() == llvm::Instruction::Trunc) {
+                    const uint32_t child = lower(inst->getOperand(0));
+                    const auto width     = inst->getType()->getIntegerBitWidth();
+                    return Emit(Op::kAnd, child, ConstSlot(Bitmask(width)));
                 }
 
                 if (inst->getOpcode() == llvm::Instruction::Select) {
@@ -705,13 +798,16 @@ namespace cobra {
                 const uint32_t lhs = lower(inst->getOperand(0));
                 const uint32_t rhs = lower(inst->getOperand(1));
 
+                // The ring operations and the left shift can carry into the
+                // bits above a narrow node's width; the bitwise ones and the
+                // logical right shift keep in-range operands in range.
                 switch (inst->getOpcode()) {
                     case llvm::Instruction::Add:
-                        return Emit(Op::kAdd, lhs, rhs);
+                        return MaskToWidth(v, Emit(Op::kAdd, lhs, rhs));
                     case llvm::Instruction::Sub:
-                        return Emit(Op::kSub, lhs, rhs);
+                        return MaskToWidth(v, Emit(Op::kSub, lhs, rhs));
                     case llvm::Instruction::Mul:
-                        return Emit(Op::kMul, lhs, rhs);
+                        return MaskToWidth(v, Emit(Op::kMul, lhs, rhs));
                     case llvm::Instruction::And:
                         return Emit(Op::kAnd, lhs, rhs);
                     case llvm::Instruction::Or:
@@ -721,10 +817,26 @@ namespace cobra {
                     case llvm::Instruction::LShr:
                         return Emit(Op::kLShr, lhs, rhs);
                     case llvm::Instruction::Shl:
-                        return Emit(Op::kShl, lhs, rhs);
+                        return MaskToWidth(v, Emit(Op::kShl, lhs, rhs));
                     default:
                         return kZeroSlot;
                 }
+            }
+
+            uint32_t ConstSlot(uint64_t value) {
+                const auto index = static_cast< uint32_t >(consts_.size());
+                consts_.push_back(value & mask_);
+                return Emit(Op::kConst, index, 0);
+            }
+
+            // Mask `slot` back to the width of `v` when that is narrower than
+            // the tree; a node at the tree's width is already masked by its op.
+            uint32_t MaskToWidth(const llvm::Value *v, uint32_t slot) {
+                const uint32_t width = NarrowWidth(v, bits_);
+                if (width == 0) {
+                    return slot;
+                }
+                return Emit(Op::kAnd, slot, ConstSlot(Bitmask(width)));
             }
 
             static constexpr uint32_t kZeroSlot = 0;
@@ -877,12 +989,25 @@ namespace cobra {
             llvm::Value *key_;
         };
 
+        // An Expr spells the operand graph out as a tree, so a value with two
+        // readers appears twice in it and a chain of such values doubles at
+        // every level. Past this many nodes the tree is nothing the solver
+        // could use, and building it is what runs out of memory; the
+        // candidate then carries no Expr, like one holding a select, and only
+        // its signature is worked on.
+        constexpr size_t kMaxExprNodes = 4096;
+
         std::unique_ptr< Expr > BuildExprFromIRImpl(
             llvm::Value *v, const std::vector< llvm::Value * > &leaves,
             const llvm::DenseSet< llvm::Value * > &tree_set, uint64_t mask,
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
-            llvm::DenseSet< llvm::Value * > &in_progress
+            llvm::DenseSet< llvm::Value * > &in_progress, size_t &budget
         ) {
+            if (budget == 0) {
+                return nullptr;
+            }
+            --budget;
+
             // Following a transparent phi can lead back to a value already on
             // the current path, so the operand graph is not necessarily a tree.
             // TreeEvalPlan folds such a back edge to literal zero; do the same
@@ -897,7 +1022,7 @@ namespace cobra {
             auto pit = phi_redirects.find(v);
             if (pit != phi_redirects.end()) {
                 return BuildExprFromIRImpl(
-                    pit->second, leaves, tree_set, mask, phi_redirects, in_progress
+                    pit->second, leaves, tree_set, mask, phi_redirects, in_progress, budget
                 );
             }
 
@@ -906,11 +1031,23 @@ namespace cobra {
                 return Expr::Constant(ci->getZExtValue() & mask);
             }
 
+            const auto tree_width = static_cast< uint32_t >(std::popcount(mask));
+            // The Expr must describe the same function the evaluator probes,
+            // so a value narrower than the tree is masked exactly where the
+            // plan masks it.
+            const auto mask_to_width = [&](std::unique_ptr< Expr > expr) {
+                const uint32_t width = NarrowWidth(v, tree_width);
+                if (width == 0) {
+                    return expr;
+                }
+                return Expr::BitwiseAnd(std::move(expr), Expr::Constant(Bitmask(width)));
+            };
+
             // Leaf (variable)
             auto leaf_it = std::find(leaves.begin(), leaves.end(), v);
             if (leaf_it != leaves.end()) {
                 auto idx = static_cast< uint32_t >(leaf_it - leaves.begin());
-                return Expr::Variable(idx);
+                return mask_to_width(Expr::Variable(idx));
             }
 
             auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
@@ -923,7 +1060,7 @@ namespace cobra {
                 || inst->getOpcode() == llvm::Instruction::SExt)
             {
                 auto child = BuildExprFromIRImpl(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
                 );
                 if (child == nullptr) {
                     return nullptr;
@@ -934,17 +1071,30 @@ namespace cobra {
                 if (inst->getOpcode() == llvm::Instruction::SExt
                     && inst->getOperand(0)->getType()->isIntegerTy(1))
                 {
-                    return Expr::Negate(std::move(child));
+                    return mask_to_width(Expr::Negate(std::move(child)));
                 }
                 return child;
             }
 
+            // Trunc keeps the low bits: a mask at the width it narrows to.
+            if (inst->getOpcode() == llvm::Instruction::Trunc) {
+                auto child = BuildExprFromIRImpl(
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                );
+                if (child == nullptr) {
+                    return nullptr;
+                }
+                return Expr::BitwiseAnd(
+                    std::move(child), Expr::Constant(Bitmask(inst->getType()->getIntegerBitWidth()))
+                );
+            }
+
             if (auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
                 auto lhs = BuildExprFromIRImpl(
-                    cmp->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                    cmp->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
                 );
                 auto rhs = BuildExprFromIRImpl(
-                    cmp->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress
+                    cmp->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget
                 );
                 if (lhs == nullptr || rhs == nullptr) {
                     return nullptr;
@@ -954,13 +1104,13 @@ namespace cobra {
 
             if (inst->getOpcode() == llvm::Instruction::Select) {
                 auto cond = BuildExprFromIRImpl(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
                 );
                 auto then_arm = BuildExprFromIRImpl(
-                    inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress
+                    inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget
                 );
                 auto else_arm = BuildExprFromIRImpl(
-                    inst->getOperand(2), leaves, tree_set, mask, phi_redirects, in_progress
+                    inst->getOperand(2), leaves, tree_set, mask, phi_redirects, in_progress, budget
                 );
                 if (cond == nullptr || then_arm == nullptr || else_arm == nullptr) {
                     return nullptr;
@@ -982,7 +1132,7 @@ namespace cobra {
                     return nullptr;
                 }
                 auto child = BuildExprFromIRImpl(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
                 );
                 if (child == nullptr) {
                     return nullptr;
@@ -997,21 +1147,21 @@ namespace cobra {
                     return nullptr;
                 }
                 auto child = BuildExprFromIRImpl(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
                 );
                 if (child == nullptr) {
                     return nullptr;
                 }
                 uint64_t mul_val = 1ULL << shift_amt->getZExtValue();
-                return Expr::Mul(std::move(child), Expr::Constant(mul_val));
+                return mask_to_width(Expr::Mul(std::move(child), Expr::Constant(mul_val)));
             }
 
             // Binary operations
             auto lhs = BuildExprFromIRImpl(
-                inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress
+                inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
             );
             auto rhs = BuildExprFromIRImpl(
-                inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress
+                inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget
             );
             if (lhs == nullptr || rhs == nullptr) {
                 return nullptr;
@@ -1019,25 +1169,33 @@ namespace cobra {
 
             switch (inst->getOpcode()) {
                 case llvm::Instruction::Add:
-                    return Expr::Add(std::move(lhs), std::move(rhs));
+                    return mask_to_width(Expr::Add(std::move(lhs), std::move(rhs)));
                 case llvm::Instruction::Sub:
-                    return Expr::Add(std::move(lhs), Expr::Negate(std::move(rhs)));
+                    return mask_to_width(
+                        Expr::Add(std::move(lhs), Expr::Negate(std::move(rhs)))
+                    );
                 case llvm::Instruction::Mul:
-                    return Expr::Mul(std::move(lhs), std::move(rhs));
+                    return mask_to_width(Expr::Mul(std::move(lhs), std::move(rhs)));
                 case llvm::Instruction::And:
                     return Expr::BitwiseAnd(std::move(lhs), std::move(rhs));
                 case llvm::Instruction::Or:
                     return Expr::BitwiseOr(std::move(lhs), std::move(rhs));
                 case llvm::Instruction::Xor: {
-                    // Detect NOT: xor %x, -1
-                    if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1))) {
-                        if (ci->isAllOnesValue()) {
-                            return Expr::BitwiseNot(std::move(lhs));
+                    // Detect NOT: xor %x, -1. Only at the tree's width: a NOT
+                    // there sets every bit, whereas a narrower all-ones
+                    // constant is the mask of its own width and stays an xor.
+                    if (NarrowWidth(v, tree_width) == 0) {
+                        if (auto *ci =
+                                llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1))) {
+                            if (ci->isAllOnesValue()) {
+                                return Expr::BitwiseNot(std::move(lhs));
+                            }
                         }
-                    }
-                    if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(0))) {
-                        if (ci->isAllOnesValue()) {
-                            return Expr::BitwiseNot(std::move(rhs));
+                        if (auto *ci =
+                                llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(0))) {
+                            if (ci->isAllOnesValue()) {
+                                return Expr::BitwiseNot(std::move(rhs));
+                            }
                         }
                     }
                     return Expr::BitwiseXor(std::move(lhs), std::move(rhs));
@@ -1053,7 +1211,10 @@ namespace cobra {
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
         ) {
             llvm::DenseSet< llvm::Value * > in_progress;
-            return BuildExprFromIRImpl(v, leaves, tree_set, mask, phi_redirects, in_progress);
+            size_t budget = kMaxExprNodes;
+            return BuildExprFromIRImpl(
+                v, leaves, tree_set, mask, phi_redirects, in_progress, budget
+            );
         }
 
         // Check that every leaf dependency of an alternative phi arm
@@ -1198,7 +1359,8 @@ namespace cobra {
         void BuildCandidates(
             llvm::ArrayRef< llvm::Instruction * > roots, uint32_t min_ast_size,
             uint32_t max_vars, MbaCostModel cost_model, uint64_t options_tag,
-            std::vector< MBACandidate > &candidates, uint32_t max_nodes = 0
+            std::vector< MBACandidate > &candidates, uint32_t max_nodes = 0,
+            bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0
         ) {
             llvm::DenseSet< llvm::Instruction * > already_in_tree;
 
@@ -1221,7 +1383,8 @@ namespace cobra {
                 llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
                 CollectTree(
                     &inst, bw, tree_insts, leaves, phi_redirects,
-                    /*try_phi_transparency=*/true, max_nodes
+                    /*try_phi_transparency=*/true, max_nodes, cut_arith_under_bitwise,
+                    max_tree_nodes
                 );
 
                 if (tree_insts.size() < min_ast_size) {
@@ -1263,7 +1426,9 @@ namespace cobra {
                 // already been tried and rejected in this very run.
                 const MbaFingerprint fingerprint =
                     FingerprintTree(&inst, leaves, tree_set, phi_redirects);
-                if (max_nodes == 0 && FingerprintUnchanged(inst, fingerprint, options_tag)) {
+                if (max_nodes == 0 && !cut_arith_under_bitwise
+                    && FingerprintUnchanged(inst, fingerprint, options_tag))
+                {
                     ++NumFingerprintSkips;
                     for (auto *ti : tree_insts) {
                         already_in_tree.insert(ti);
@@ -1279,7 +1444,8 @@ namespace cobra {
                     phi_redirects.clear();
                     CollectTree(
                         &inst, bw, tree_insts, leaves, phi_redirects,
-                        /*try_phi_transparency=*/false, max_nodes
+                        /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
+                        max_tree_nodes
                     );
 
                     if (tree_insts.size() < min_ast_size) {
@@ -1411,8 +1577,10 @@ namespace cobra {
                                   .fingerprint = fingerprint,
                                   .inner_roots = std::move(inner_roots),
                                   .dying_count = static_cast< uint32_t >(dying.size()),
-                                  .node_limit  = max_nodes,
-                                  .tree_size   = static_cast< uint32_t >(tree_insts.size()) }
+                                  .node_limit = cut_arith_under_bitwise ? kBoundaryCutLimit
+                                                                        : max_nodes,
+                                  .tree_size    = static_cast< uint32_t >(tree_insts.size()),
+                                  .boundary_cut = cut_arith_under_bitwise }
                 );
             }
         }
@@ -1421,7 +1589,7 @@ namespace cobra {
 
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
-        MbaCostModel cost_model
+        MbaCostModel cost_model, uint32_t max_tree_nodes
     ) {
         // Post-order: process uses before defs across blocks. Within each block,
         // reverse iteration hits outermost roots first, so the largest MBA tree
@@ -1436,17 +1604,22 @@ namespace cobra {
         }
 
         std::vector< MBACandidate > candidates;
-        BuildCandidates(roots, min_ast_size, max_vars, cost_model, options_tag, candidates);
+        BuildCandidates(
+            roots, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
+            max_tree_nodes
+        );
         return candidates;
     }
 
     std::vector< MBACandidate > ExpandMbaCandidate(
         llvm::ArrayRef< llvm::Instruction * > inner_roots, uint32_t min_ast_size,
-        uint32_t max_vars, uint64_t options_tag, MbaCostModel cost_model
+        uint32_t max_vars, uint64_t options_tag, MbaCostModel cost_model,
+        uint32_t max_tree_nodes
     ) {
         std::vector< MBACandidate > candidates;
         BuildCandidates(
-            inner_roots, min_ast_size, max_vars, cost_model, options_tag, candidates
+            inner_roots, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
+            max_tree_nodes
         );
         return candidates;
     }
@@ -1496,6 +1669,25 @@ namespace cobra {
         return candidates;
     }
 
+    std::vector< MBACandidate > BoundaryCutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model, uint32_t max_tree_nodes
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr || cand.node_limit != 0) {
+            return candidates;
+        }
+        BuildCandidates(
+            { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0,
+            /*cut_arith_under_bitwise=*/true, max_tree_nodes
+        );
+        // A cut that took nothing out is the full collection again.
+        if (!candidates.empty() && candidates.front().tree_size >= cand.tree_size) {
+            candidates.clear();
+        }
+        return candidates;
+    }
+
     void RecordMbaFingerprint(
         llvm::Instruction *inst, const MbaFingerprint &fp, uint64_t options_tag
     ) {
@@ -1522,7 +1714,8 @@ namespace cobra {
         );
     }
 
-    std::optional< MbaFingerprint > ComputeMbaFingerprint(llvm::Instruction *inst) {
+    std::optional< MbaFingerprint >
+    ComputeMbaFingerprint(llvm::Instruction *inst, uint32_t max_tree_nodes) {
         if (inst == nullptr || !IsMbaRootOpcode(inst->getOpcode())
             || !inst->getType()->isIntegerTy() || inst->getType()->getIntegerBitWidth() > 64)
         {
@@ -1533,7 +1726,8 @@ namespace cobra {
         std::vector< llvm::Value * > leaves;
         llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
         CollectTree(
-            inst, inst->getType()->getIntegerBitWidth(), tree_insts, leaves, phi_redirects
+            inst, inst->getType()->getIntegerBitWidth(), tree_insts, leaves, phi_redirects,
+            /*try_phi_transparency=*/true, 0, false, max_tree_nodes
         );
 
         const llvm::DenseSet< llvm::Value * > tree_set(tree_insts.begin(), tree_insts.end());

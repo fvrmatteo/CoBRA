@@ -6,7 +6,9 @@
 #include "cobra/core/Classification.h"
 #include "cobra/core/Classifier.h"
 #include "cobra/core/Expr.h"
+#include "cobra/core/ExprCost.h"
 #include "cobra/core/MaskedAtomReconstructor.h"
+#include "cobra/core/PartitionSolver.h"
 #include "cobra/core/SelfCheck.h"
 #include "cobra/core/SemilinearNormalizer.h"
 #include "cobra/core/SignatureChecker.h"
@@ -39,9 +41,24 @@ static std::unique_ptr< Expr > run_semilinear(
         EXPECT_TRUE(check.passed) << "Self-check failed: " << check.mismatch_detail;
     }
 
-    RecoverStructure(ir);
-    RefineTerms(ir);
-    CoalesceTerms(ir);
+    // The same two readings RunSemilinearRewrite weighs against each other:
+    // the term-level chain, and the per-class linear solve followed by that
+    // chain, the cheaper reconstruction going on.
+    const auto rewrite_chain = [](SemilinearIR &target) {
+        if (FlattenComplexAtoms(target)) { CoalesceTerms(target); }
+        RecoverStructure(target);
+        RefineTerms(target);
+        CoalesceTerms(target);
+    };
+    auto solved = SolvePartitionsLinearly(ir);
+    rewrite_chain(ir);
+    if (solved.has_value()) {
+        SimplifyStructure(*solved);
+        rewrite_chain(*solved);
+        const auto chain_cost  = ComputeCost(*ReconstructMaskedAtoms(ir, {})).cost;
+        const auto solved_cost = ComputeCost(*ReconstructMaskedAtoms(*solved, {})).cost;
+        if (IsBetter(solved_cost, chain_cost)) { ir = std::move(*solved); }
+    }
 
     // Post-rewrite probe check: verify equivalence at random full-width inputs.
     {
@@ -57,7 +74,9 @@ static std::unique_ptr< Expr > run_semilinear(
     CompactAtomTable(ir);
     auto partitions = ComputePartitions(ir);
     auto result     = ReconstructMaskedAtoms(ir, partitions);
-    return result;
+    // As RunSemilinearReconstruct does: absorb an additive constant back into
+    // the XOR it came from, so a test sees the candidate the orchestrator sees.
+    return NormalizeLateCandidateExpr(std::move(result), bitwidth);
 }
 
 // Test 1: carry erasure
@@ -586,4 +605,203 @@ TEST(SemilinearIntegration, Issue7NotAndElision) {
     auto verify = Z3VerifyExprs(*input, *result, { "x" }, 8);
     EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Partition solve: a variable under a constant inside a multi-variable atom.
+//
+// The term-level chain only relates atoms that share a basis, so every one of
+// these was returned unchanged before the per-class solve: the constant sits
+// inside the atom, and the atoms `(y ^ c) & ~x` and `(y ^ c) & x` have no
+// common basis to recover on. Solved one bit class at a time they are plain
+// linear identities.
+// ---------------------------------------------------------------------------
+
+// The masked sum: ((y ^ 5) & ~x) + ((y ^ 5) & x) = y ^ 5
+TEST(SemilinearPartitionSolve, MaskedSumOfXoredVariable) {
+    auto y_xor = [] { return Expr::BitwiseXor(Expr::Variable(1), Expr::Constant(5)); };
+    auto input = Expr::Add(
+        Expr::BitwiseAnd(y_xor(), Expr::BitwiseNot(Expr::Variable(0))),
+        Expr::BitwiseAnd(y_xor(), Expr::Variable(0))
+    );
+    EXPECT_EQ(ClassifyStructural(*input).semantic, SemanticClass::kSemilinear);
+
+    auto result = run_semilinear(*input, { "x", "y" }, 8);
+    ASSERT_NE(result, nullptr);
+
+    auto rendered = Render(*result, { "x", "y" }, 8);
+    EXPECT_EQ(rendered.find("x"), std::string::npos) << "x should cancel, got: " << rendered;
+    EXPECT_EQ(rendered.find("&"), std::string::npos) << "Expected no AND, got: " << rendered;
+    EXPECT_LE(ComputeCost(*result).cost.weighted_size, 3U) << "got: " << rendered;
+
+#ifdef COBRA_HAS_Z3
+    auto verify = Z3VerifyExprs(*input, *result, { "x", "y" }, 8);
+    EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
+#endif
+}
+
+// The identity x - (z ^ x) + 2*(z & ~x) = z, with z = y ^ c hidden under the
+// constant: (x - ((y ^ c) ^ x)) + 2*((y ^ c) & ~x) = y ^ c
+TEST(SemilinearPartitionSolve, TwoVariableIdentityOverXoredOperand) {
+    constexpr uint64_t kC = 1775482468;
+    auto z = [] { return Expr::BitwiseXor(Expr::Variable(1), Expr::Constant(kC)); };
+    auto input = Expr::Add(
+        Expr::Add(
+            Expr::Variable(0), Expr::Negate(Expr::BitwiseXor(z(), Expr::Variable(0)))
+        ),
+        Expr::Mul(
+            Expr::Constant(2), Expr::BitwiseAnd(z(), Expr::BitwiseNot(Expr::Variable(0)))
+        )
+    );
+    EXPECT_EQ(ClassifyStructural(*input).semantic, SemanticClass::kSemilinear);
+
+    auto result = run_semilinear(*input, { "x", "y" }, 32);
+    ASSERT_NE(result, nullptr);
+
+    auto rendered = Render(*result, { "x", "y" }, 32);
+    EXPECT_EQ(rendered.find("x"), std::string::npos) << "x should cancel, got: " << rendered;
+    EXPECT_LE(ComputeCost(*result).cost.weighted_size, 3U) << "got: " << rendered;
+
+#ifdef COBRA_HAS_Z3
+    auto verify = Z3VerifyExprs(*input, *result, { "x", "y" }, 32);
+    EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
+#endif
+}
+
+// (~a | b) ^ (a & b) = ~a, spelled with the complement pair of constants:
+// ((a ^ c) | b) ^ ((a ^ ~c) & b) = a ^ ~c
+TEST(SemilinearPartitionSolve, ComplementConstantPairOverSharedVariable) {
+    constexpr uint64_t kC    = 3115;
+    constexpr uint64_t kNotC = (~kC) & 0xFFFF;
+    auto input = Expr::BitwiseXor(
+        Expr::BitwiseOr(
+            Expr::BitwiseXor(Expr::Variable(0), Expr::Constant(kNotC)), Expr::Variable(1)
+        ),
+        Expr::BitwiseAnd(
+            Expr::BitwiseXor(Expr::Variable(0), Expr::Constant(kC)), Expr::Variable(1)
+        )
+    );
+    EXPECT_EQ(ClassifyStructural(*input).semantic, SemanticClass::kSemilinear);
+
+    auto result = run_semilinear(*input, { "a", "b" }, 16);
+    ASSERT_NE(result, nullptr);
+
+    auto rendered = Render(*result, { "a", "b" }, 16);
+    EXPECT_EQ(rendered.find("b"), std::string::npos) << "b should cancel, got: " << rendered;
+    EXPECT_LE(ComputeCost(*result).cost.weighted_size, 3U) << "got: " << rendered;
+
+#ifdef COBRA_HAS_Z3
+    auto verify = Z3VerifyExprs(*input, *result, { "a", "b" }, 16);
+    EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
+#endif
+}
+
+// (x + z) - 2*(x & z) = x ^ z with z = y ^ c: the answer keeps the constant,
+// x ^ y ^ c, and the solve must not lose it on the way through the classes.
+TEST(SemilinearPartitionSolve, XorViaSumOfXoredOperand) {
+    auto z = [] { return Expr::BitwiseXor(Expr::Variable(1), Expr::Constant(5)); };
+    auto input = Expr::Add(
+        Expr::Add(Expr::Variable(0), z()),
+        Expr::Negate(Expr::Mul(Expr::Constant(2), Expr::BitwiseAnd(Expr::Variable(0), z())))
+    );
+    EXPECT_EQ(ClassifyStructural(*input).semantic, SemanticClass::kSemilinear);
+
+    auto result = run_semilinear(*input, { "x", "y" }, 8);
+    ASSERT_NE(result, nullptr);
+
+    auto rendered = Render(*result, { "x", "y" }, 8);
+    EXPECT_EQ(rendered.find("&"), std::string::npos) << "Expected no AND, got: " << rendered;
+    EXPECT_LE(ComputeCost(*result).cost.weighted_size, 5U) << "got: " << rendered;
+
+#ifdef COBRA_HAS_Z3
+    auto verify = Z3VerifyExprs(*input, *result, { "x", "y" }, 8);
+    EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
+#endif
+}
+
+// A sum that is already as small as it gets stays as it is: the chain's answer
+// wins ties, so the solve never rewrites an expression it cannot shorten.
+TEST(SemilinearPartitionSolve, LeavesDisjointMasksAlone) {
+    auto input = Expr::Add(
+        Expr::BitwiseAnd(Expr::Variable(0), Expr::Constant(0xFF)),
+        Expr::BitwiseAnd(Expr::Variable(1), Expr::Constant(0xFF00))
+    );
+    auto ir = NormalizeToSemilinear(*input, { "x", "y" }, 16);
+    ASSERT_TRUE(ir.has_value());
+    auto solved = SolvePartitionsLinearly(*ir);
+    ASSERT_TRUE(solved.has_value());
+    EXPECT_EQ(solved->terms.size(), 2U);
+
+    auto result = run_semilinear(*input, { "x", "y" }, 16);
+    ASSERT_NE(result, nullptr);
+    EXPECT_LE(ComputeCost(*result).cost.weighted_size, 7U)
+        << "got: " << Render(*result, { "x", "y" }, 16);
+}
+
+// A value split into halves, each half hidden under its own constant, and
+// the halves put back together: 2^16 * ((((u ^ c) >> 16) & 0xFFFF) ^ k1) +
+// (((u ^ c) & 0xFFFF) ^ k0) is u ^ (c ^ (k1 << 16 | k0)). The shifted atom
+// sits under a coefficient of 2^16, which puts its bits back where they came
+// from, so the term has a bit-local reading after all.
+TEST(SemilinearPartitionSolve, RealignsShiftedHalves) {
+    constexpr uint64_t kC  = 0x1234ABCD;
+    constexpr uint64_t kK1 = 0x5A5A;
+    constexpr uint64_t kK0 = 0x1111;
+    auto hidden = [] { return Expr::BitwiseXor(Expr::Variable(0), Expr::Constant(kC)); };
+    auto high   = Expr::BitwiseXor(
+        Expr::BitwiseAnd(Expr::LogicalShr(hidden(), 16), Expr::Constant(0xFFFF)),
+        Expr::Constant(kK1)
+    );
+    auto low = Expr::BitwiseXor(
+        Expr::BitwiseAnd(hidden(), Expr::Constant(0xFFFF)), Expr::Constant(kK0)
+    );
+    auto input = Expr::Add(Expr::Mul(Expr::Constant(0x10000), std::move(high)), std::move(low));
+    EXPECT_EQ(ClassifyStructural(*input).semantic, SemanticClass::kSemilinear);
+
+    auto result = run_semilinear(*input, { "u" }, 32);
+    ASSERT_NE(result, nullptr);
+
+    auto rendered = Render(*result, { "u" }, 32);
+    EXPECT_EQ(rendered.find(">>"), std::string::npos) << "Expected no shift, got: " << rendered;
+    EXPECT_EQ(rendered.find("&"), std::string::npos) << "Expected no AND, got: " << rendered;
+    EXPECT_LE(ComputeCost(*result).cost.weighted_size, 3U) << "got: " << rendered;
+
+#ifdef COBRA_HAS_Z3
+    auto verify = Z3VerifyExprs(*input, *result, { "u" }, 32);
+    EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
+#endif
+}
+
+// 4 * ((x & y) >> 2) is (x & y) with its two low bits cleared: a shifted
+// atom whose coefficient realigns it is read, and the shift is gone.
+TEST(SemilinearPartitionSolve, ShiftedAtomUnderRealigningCoefficient) {
+    auto input = Expr::Add(
+        Expr::Mul(
+            Expr::Constant(4),
+            Expr::LogicalShr(Expr::BitwiseAnd(Expr::Variable(0), Expr::Variable(1)), 2)
+        ),
+        Expr::BitwiseAnd(Expr::BitwiseAnd(Expr::Variable(0), Expr::Variable(1)), Expr::Constant(3))
+    );
+    auto result = run_semilinear(*input, { "x", "y" }, 16);
+    ASSERT_NE(result, nullptr);
+    auto rendered = Render(*result, { "x", "y" }, 16);
+    EXPECT_EQ(rendered.find(">>"), std::string::npos) << "Expected no shift, got: " << rendered;
+    EXPECT_LE(ComputeCost(*result).cost.weighted_size, 3U) << "got: " << rendered;
+
+#ifdef COBRA_HAS_Z3
+    auto verify = Z3VerifyExprs(*input, *result, { "x", "y" }, 16);
+    EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
+#endif
+}
+
+// A shifted atom whose coefficient does not realign it has no bit-local
+// reading, so the solve declines rather than guessing.
+TEST(SemilinearPartitionSolve, DeclinesShiftedAtoms) {
+    auto input = Expr::Add(
+        Expr::LogicalShr(Expr::BitwiseAnd(Expr::Variable(0), Expr::Variable(1)), 2),
+        Expr::BitwiseAnd(Expr::Variable(0), Expr::Constant(3))
+    );
+    auto ir = NormalizeToSemilinear(*input, { "x", "y" }, 16);
+    ASSERT_TRUE(ir.has_value());
+    EXPECT_FALSE(SolvePartitionsLinearly(*ir).has_value());
 }

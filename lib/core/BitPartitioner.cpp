@@ -93,24 +93,21 @@ namespace cobra {
             std::unreachable();
         }
 
-        /// Build the 1-bit truth table for an atom at a specific
-        /// bit position. Returns a packed uint64_t where bit i holds
-        /// the atom's single-bit output for Boolean assignment i.
-        uint64_t EvalAtomAtBit(
-            const Expr &atom, const std::vector< GlobalVarIdx > &support, uint32_t bit_pos,
-            uint32_t bitwidth
-        ) {
-            const size_t kN   = support.size();
-            const size_t kLen = size_t{ 1 } << kN;
-            uint64_t packed   = 0;
-            for (size_t i = 0; i < kLen; ++i) {
-                const uint64_t kVal  = EvalAtomAtBitImpl(atom, support, i, bit_pos, bitwidth);
-                packed              |= (kVal & 1) << i;
-            }
-            return packed;
-        }
-
     } // namespace
+
+    uint64_t EvalAtomAtBit(
+        const Expr &atom, const std::vector< GlobalVarIdx > &support, uint32_t bit_pos,
+        uint32_t bitwidth
+    ) {
+        const size_t kN   = support.size();
+        const size_t kLen = size_t{ 1 } << kN;
+        uint64_t packed   = 0;
+        for (size_t i = 0; i < kLen; ++i) {
+            const uint64_t kVal  = EvalAtomAtBitImpl(atom, support, i, bit_pos, bitwidth);
+            packed              |= (kVal & 1) << i;
+        }
+        return packed;
+    }
 
     std::vector< PartitionClass > ComputePartitions(const SemilinearIR &ir) {
         COBRA_TRACE("BitPartitioner", "ComputePartitions: atoms={}", ir.atom_table.size());

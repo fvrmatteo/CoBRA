@@ -70,7 +70,16 @@ namespace cobra {
         // that was read to build `expr`, so it is what a rewrite is measured
         // against under `MbaCostModel::kTreeInstructions`.
         uint32_t tree_size = 0;
+
+        // Collected with every arithmetic value under a bitwise reader kept
+        // as a leaf (see `BoundaryCutMbaCandidate`). Like a re-cut it is a
+        // partial view of the root, and `node_limit` says so too.
+        bool boundary_cut = false;
     };
+
+    // The `node_limit` a boundary cut carries: past any re-cut ladder, so the
+    // driver treats it as the partial view it is and never cuts it again.
+    constexpr uint32_t kBoundaryCutLimit = UINT32_MAX;
 
     // Find MBA candidates across a function.  Blocks are scanned in
     // post-order (uses before defs) with reverse instruction iteration
@@ -84,9 +93,12 @@ namespace cobra {
     // since it was last examined, so neither would the outcome. The tag
     // covers the settings the outcome depends on, so changing them
     // invalidates every record without needing to rewrite the IR.
+    //
+    // `max_tree_nodes`, when non-zero, caps how many instructions a collection
+    // may hold; past it the walk keeps what remains as leaves.
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
-        MbaCostModel cost_model = MbaCostModel::kTreeInstructions
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0
     );
 
     // Candidates for `inner_roots`, to be used once the tree enclosing them has
@@ -102,7 +114,7 @@ namespace cobra {
     std::vector< MBACandidate > ExpandMbaCandidate(
         llvm::ArrayRef< llvm::Instruction * > inner_roots, uint32_t min_ast_size,
         uint32_t max_vars, uint64_t options_tag,
-        MbaCostModel cost_model = MbaCostModel::kTreeInstructions
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0
     );
 
     // The same root as `cand`, re-collected with the tree cut short so that
@@ -140,6 +152,26 @@ namespace cobra {
         MbaCostModel cost_model = MbaCostModel::kTreeInstructions
     );
 
+    // The same root as `cand`, re-collected with every arithmetic value that a
+    // bitwise operator reads kept as a leaf.
+    //
+    // The semilinear reading of a tree is a sum of bitwise atoms over its
+    // variables, and an arithmetic value under a bitwise operator can only be
+    // a variable to it: `(a + b) ^ c` is no sum of atoms over `a` and `b`. The
+    // exhaustive collection expands `a + b` anyway and hands the solver a
+    // tree it can only reject, and the breadth-first re-cuts cannot get the
+    // boundary right either - the sum sits deeper than the bitwise operators
+    // that read it on one path and shallower than those on another. This is
+    // the cut at that boundary, tried once the full tree has been rejected.
+    //
+    // Returns nothing for a candidate that is itself a cut, or when the cut
+    // takes nothing out of the full collection.
+    std::vector< MBACandidate > BoundaryCutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
+        uint32_t max_tree_nodes = 0
+    );
+
     // Record `fp` on `inst` so a later run can skip the tree rooted there.
     void RecordMbaFingerprint(
         llvm::Instruction *inst, const MbaFingerprint &fp, uint64_t options_tag
@@ -147,6 +179,7 @@ namespace cobra {
 
     // Fingerprint the tree rooted at `inst` the way the detector would.
     // Returns nothing when `inst` does not root a tree it would consider.
-    std::optional< MbaFingerprint > ComputeMbaFingerprint(llvm::Instruction *inst);
+    std::optional< MbaFingerprint >
+    ComputeMbaFingerprint(llvm::Instruction *inst, uint32_t max_tree_nodes = 0);
 
 } // namespace cobra
