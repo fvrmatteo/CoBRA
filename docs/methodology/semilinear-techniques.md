@@ -163,9 +163,20 @@ Bit positions with identical profiles across all atoms are grouped into the same
 - Partition 1: bits 0-7 (where `0xFF` is active, reduces to 1)
 - Partition 2: bits 8-15 (where `0xFF00` is active, reduces to 1)
 
-Within each partition, all constants reduce to 0 or 1, so standard linear simplification (signature vector + CoB butterfly) can solve each partition independently via SiMBA re-invocation.
+Within each partition, all constants reduce to 0 or 1, so standard linear simplification (signature vector + CoB butterfly) can solve each partition independently. That solve is the pass below; here the partitions only decide which coefficient-1 terms may be assembled with OR.
 
 **Reference:** Skees, [Deobfuscation of Semi-Linear Mixed Boolean-Arithmetic Expressions](https://arxiv.org/abs/2406.10016) (MSiMBA, 2024)
+
+## Partition Solve
+
+**Part of pass:** `kSemilinearRewrite`
+**Source:** [PartitionSolver.cpp](../../lib/core/PartitionSolver.cpp)
+
+The rewrite stages above all work term by term: XOR recovery and mask elimination relate two atoms that share a basis, and coalescing needs a single-variable basis. A variable that sits under a constant *inside* a multi-variable atom is invisible to them. `((y ^ c) & ~x) + ((y ^ c) & x)` is `y ^ c`, but its two atoms have no common basis to recover on, so the chain returns it unchanged - and the same goes for every identity written over such an operand, such as `x - ((y ^ c) ^ x) + 2*((y ^ c) & ~x)` or `((a ^ c) | b) ^ ((a ^ ~c) & b)`.
+
+`SolvePartitionsLinearly` reads the checked sum through those constants. For each partition class it forms the *bit-slice function* of the whole sum - what one bit of the result contributes as a function of that bit of every variable, which is `sum(coeff_t * profile_t)` over the class's per-atom truth tables - and hands its signature to the linear machinery (`InterpolateCoefficients` followed by `BuildCobExpr`), which returns the cheapest linear form `c + sum(d_k * H_k)`. A linear MBA with bit-slice function `s` takes the value `s(a) - 2*s(0)` at a Boolean point `a`, since bit 0 contributes `s(a)`, every other bit `s(0)`, and `sum(2^j, j >= 1)` is `-2` in the ring; that is the signature the interpolation is given. On the class's bits the sum then equals `-c * mask + sum(d_k * (H_k & mask))`: the constant is the all-ones word times `-c` bit by bit, and each atom keeps its coefficient and is masked to the class. Adding the classes and normalizing the assembly (so the constant lowerings run over the masked answers) yields a fresh IR on which a class solved as `~y` and one solved as `y` share the basis `y`, which is exactly what XOR recovery needs.
+
+The solve competes with the term-level chain rather than replacing it: both readings go through the same chain and whichever reconstructs cheaper goes on, the chain's own answer winning ties. It declines when an atom has a shift or a support beyond the truth-table limit (neither has a bit-local reading), or when the sum reads more variables than a signature can hold.
 
 ## Reconstruction
 

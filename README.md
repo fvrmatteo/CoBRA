@@ -213,10 +213,14 @@ lib/core/                Core simplification engine (~50 source files)
   StructureRecovery        XOR recovery, mask elimination, term coalescing
   TermRefiner              Dead-bit mask reduction, same-coefficient merge
   BitPartitioner           Group bit positions by semantic profile
+  PartitionSolver          Solve each bit class as a linear MBA, realigning shifted atoms
   MaskedAtomReconstructor  Reassemble with OR-rewrite for disjoint masks
   Evaluator                Compiled expression evaluator
 
-lib/llvm/                LLVM pass plugin (CobraPass, MBADetector, IRReconstructor)
+lib/llvm/                LLVM pass plugin (CobraPass, MBADetector, IRReconstructor). The
+                         detector holds values narrower than the root at their own width
+                         (a trunc is a mask, a zext the identity), and re-cuts a rejected
+                         tree at the arithmetic-under-bitwise boundary
 lib/verify/              Z3-based equivalence verification
 include/cobra/           Public headers
 tools/cobra-cli/         CLI frontend and expression parser

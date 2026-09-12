@@ -20,6 +20,7 @@ target_sources(cobra-core PRIVATE
     AtomSimplifier.cpp
     ExprUtils.cpp
     BitPartitioner.cpp
+    PartitionSolver.cpp
     MaskedAtomReconstructor.cpp
     TermRefiner.cpp
     SelfCheck.cpp

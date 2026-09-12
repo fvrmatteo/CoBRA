@@ -47,6 +47,18 @@ namespace cobra {
         // twenty-eight.
         uint32_t max_recut_vars = 6;
 
+        // How many instructions a collection may hold before the walk stops
+        // expanding and keeps what remains as leaves. Values narrower than the
+        // root join a tree through their casts, so a tree is no longer bounded
+        // by the width changes in the code it reads; without a cap a
+        // flag-word computation of eighty instructions and two variables is
+        // collected once per bit that reads it, and every one of those
+        // collections is solved and rejected at a hundred milliseconds apiece.
+        // The expressions a rewrite comes from are far smaller: a word split
+        // into four masked halves and put back together is under thirty.
+        // Zero leaves the walk unbounded.
+        uint32_t max_tree_nodes = 48;
+
         bool z3_verify = false;
         Z3VerificationSettings z3_settings;
         TechniqueFamily enabled_families = TechniqueFamily::kAll;
