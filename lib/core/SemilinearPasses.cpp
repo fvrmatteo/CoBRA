@@ -6,6 +6,7 @@
 #include "cobra/core/ExprCost.h"
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/MaskedAtomReconstructor.h"
+#include "cobra/core/PartitionSolver.h"
 #include "cobra/core/PatternMatcher.h"
 #include "cobra/core/Profile.h"
 #include "cobra/core/SelfCheck.h"
@@ -310,10 +311,33 @@ namespace cobra {
         const auto &local_eval =
             payload.ctx.evaluator.has_value() ? payload.ctx.evaluator : ctx.evaluator;
 
-        if (FlattenComplexAtoms(ir)) { CoalesceTerms(ir); }
-        RecoverStructure(ir);
-        RefineTerms(ir);
-        CoalesceTerms(ir);
+        const auto rewrite_chain = [](SemilinearIR &target) {
+            if (FlattenComplexAtoms(target)) { CoalesceTerms(target); }
+            RecoverStructure(target);
+            RefineTerms(target);
+            CoalesceTerms(target);
+        };
+        rewrite_chain(ir);
+
+        // The chain above compares atoms that share a basis, so a variable
+        // sitting under a constant inside a multi-variable atom is invisible
+        // to it. Re-solving the checked sum one bit class at a time reads
+        // through such constants; the result then takes the same chain, and
+        // whichever of the two reconstructs cheaper goes on. The chain's own
+        // answer wins ties, so nothing it already handled changes.
+        if (auto solved = SolvePartitionsLinearly(payload.ctx.ir); solved.has_value()) {
+            SimplifyStructure(*solved);
+            rewrite_chain(*solved);
+            const auto kChainCost  = ComputeCost(*ReconstructMaskedAtoms(ir, {})).cost;
+            const auto kSolvedCost = ComputeCost(*ReconstructMaskedAtoms(*solved, {})).cost;
+            if (IsBetter(kSolvedCost, kChainCost)) {
+                COBRA_TRACE(
+                    "Simplifier", "RunSemilinearRewrite: partition solve wins ({} < {})",
+                    kSolvedCost.weighted_size, kChainCost.weighted_size
+                );
+                ir = std::move(*solved);
+            }
+        }
 
         if (local_eval) {
             const auto kNumVars = static_cast< uint32_t >(vars.size());

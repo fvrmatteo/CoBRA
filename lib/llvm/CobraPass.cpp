@@ -498,6 +498,7 @@ namespace cobra {
             tag          = mix(tag, options.min_ast_size);
             tag          = mix(tag, options.max_recut_nodes);
             tag          = mix(tag, options.max_recut_vars);
+            tag          = mix(tag, options.max_tree_nodes);
             tag          = mix(tag, options.z3_verify ? 1 : 0);
             tag          = mix(tag, options.z3_settings.timeout_ms);
             tag = mix(tag, static_cast< uint64_t >(options.z3_settings.unknown_result_mode));
@@ -519,6 +520,22 @@ namespace cobra {
             // Pass AST when available — unlocks semilinear,
             // MixedRewrite, and decomposition pipelines.
             const Expr *ast = cand.expr.get();
+
+            // A comparison is true on a vanishing fraction of its inputs - an
+            // equality of two words on one in 2^64 - so no probe, Boolean or
+            // random, will ever see both sides of it, and a result fitted to
+            // the probes is a guess about the side they missed. With the
+            // narrow-width reading of trees such chains reach the values they
+            // compare, and the guess folds a loop's exit test to a constant.
+            // Only a proof can accept such a rewrite, so without one the
+            // candidate is declined.
+            if (!options.z3_verify && ast != nullptr && ContainsComparison(*ast)) {
+                ++NumSkippedUnsupported;
+                LLVM_DEBUG(
+                    llvm::dbgs() << "CoBRA: skipping — a comparison needs solver verification\n"
+                );
+                return nullptr;
+            }
 
             auto result = Simplify(cand.sig, cand.var_names, ast, opts);
             if (!result.has_value()) {
@@ -622,7 +639,8 @@ namespace cobra {
         const uint64_t options_tag = OptionsTag(options_);
 
         auto candidates = DetectMbaCandidates(
-            f, options_.min_ast_size, options_.max_vars, options_tag, options_.cost_model
+            f, options_.min_ast_size, options_.max_vars, options_tag, options_.cost_model,
+            options_.max_tree_nodes
         );
 
         NumCandidates += candidates.size();
@@ -651,6 +669,13 @@ namespace cobra {
         for (size_t index = 0; index < candidates.size(); ++index) {
             auto &cand = candidates[index];
 
+            // A root an earlier rewrite replaced has no readers left. Its
+            // re-cuts and inner roots were queued before that happened, and
+            // solving them now buys nothing.
+            if (cand.root->use_empty()) {
+                continue;
+            }
+
             // Only a full collection speaks for the tree rooted at an
             // instruction; a re-cut saw part of it, so recording its verdict
             // would tell the next run the whole tree was examined.
@@ -667,6 +692,12 @@ namespace cobra {
             // Both lists are built before either is queued: pushing can
             // reallocate `candidates`, and `cand` is a reference into it.
             const auto requeue_retries = [&] {
+                // The boundary cut first: it is the one reading of the root
+                // the ladder below cannot reach, and it costs a single solve.
+                auto boundary = BoundaryCutMbaCandidate(
+                    cand, options_.min_ast_size, options_.max_vars, options_tag,
+                    options_.cost_model, options_.max_tree_nodes
+                );
                 auto recuts = RecutMbaCandidate(
                     cand, options_.min_ast_size, options_.max_vars, options_.max_recut_nodes,
                     options_.max_recut_vars, options_tag, options_.cost_model
@@ -688,8 +719,13 @@ namespace cobra {
                 }
                 auto inners = ExpandMbaCandidate(
                     fresh, options_.min_ast_size, options_.max_vars, options_tag,
-                    options_.cost_model
+                    options_.cost_model, options_.max_tree_nodes
                 );
+                for (auto &cut : boundary) {
+                    if (attempted.insert({ cut.root, cut.node_limit }).second) {
+                        candidates.push_back(std::move(cut));
+                    }
+                }
                 for (auto &recut : recuts) {
                     if (attempted.insert({ recut.root, recut.node_limit }).second) {
                         candidates.push_back(std::move(recut));
@@ -810,7 +846,7 @@ namespace cobra {
             // that into a lookup; if a later pass reshapes it the recorded
             // shape stops matching and it is examined again.
             if (auto *new_inst = llvm::dyn_cast< llvm::Instruction >(new_val)) {
-                if (auto new_fp = ComputeMbaFingerprint(new_inst)) {
+                if (auto new_fp = ComputeMbaFingerprint(new_inst, options_.max_tree_nodes)) {
                     RecordMbaFingerprint(new_inst, *new_fp, options_tag);
                 }
             }
