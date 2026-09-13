@@ -11,6 +11,8 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Type.h"
@@ -182,6 +184,36 @@ namespace cobra {
             }
         }
 
+        // A funnel shift by a constant: what a rotate lifts to, and a bitwise
+        // operator like any other once the amount is known -
+        // `fshl(a, b, s) = (a << s) | (b >> (w - s))`. Left as a leaf it cuts
+        // the value it rotates off from everything read through it, which is
+        // where an obfuscator's identities over the same value then fail.
+        const llvm::IntrinsicInst *FunnelShiftOf(const llvm::Value *v) {
+            const auto *intrinsic = llvm::dyn_cast< llvm::IntrinsicInst >(v);
+            if (intrinsic == nullptr
+                || (intrinsic->getIntrinsicID() != llvm::Intrinsic::fshl
+                    && intrinsic->getIntrinsicID() != llvm::Intrinsic::fshr)
+                || !intrinsic->getType()->isIntegerTy()
+                || !llvm::isa< llvm::ConstantInt >(intrinsic->getArgOperand(2)))
+            {
+                return nullptr;
+            }
+            return intrinsic;
+        }
+
+        // The rotate amount reduced to the type's width, and the width itself.
+        std::pair< uint64_t, uint64_t > FunnelShiftAmount(const llvm::IntrinsicInst &fsh) {
+            const uint64_t width = fsh.getType()->getIntegerBitWidth();
+            const uint64_t amount =
+                llvm::cast< llvm::ConstantInt >(fsh.getArgOperand(2))->getValue().urem(width);
+            return { amount, width };
+        }
+
+        bool IsMbaInstruction(const llvm::Instruction *inst) {
+            return IsMbaOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr;
+        }
+
         // `icmp` produces i1, which is useless as a candidate root: it is only
         // worth following as the condition feeding a `select` in a wider tree.
         // A truncation is no better: the value it narrows is wider than the
@@ -190,6 +222,10 @@ namespace cobra {
         bool IsMbaRootOpcode(unsigned opcode) {
             return opcode != llvm::Instruction::ICmp && opcode != llvm::Instruction::Trunc
                 && IsMbaOpcode(opcode);
+        }
+
+        bool IsMbaRoot(const llvm::Instruction *inst) {
+            return IsMbaRootOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr;
         }
 
         // The operators that read their operands bit by bit, and the ones that
@@ -419,9 +455,7 @@ namespace cobra {
                     continue;
                 }
 
-                if ((inst != nullptr) && IsMbaOpcode(inst->getOpcode())
-                    && FitsTreeWidth(inst, bw))
-                {
+                if ((inst != nullptr) && IsMbaInstruction(inst) && FitsTreeWidth(inst, bw)) {
                     // LShr with variable shift amount is unsupported —
                     // treat the whole instruction as a leaf.
                     if (inst->getOpcode() == llvm::Instruction::LShr
@@ -443,6 +477,12 @@ namespace cobra {
                     }
 
                     tree_insts.push_back(inst);
+                    if (const auto *fsh = FunnelShiftOf(inst)) {
+                        // The callee and the amount are not values to follow.
+                        work.push({ fsh->getArgOperand(0), true });
+                        work.push({ fsh->getArgOperand(1), true });
+                        continue;
+                    }
                     const bool kReadsBitwise = IsBitwiseReaderOpcode(inst->getOpcode());
                     for (auto &op : inst->operands()) {
                         work.push({ op.get(), kReadsBitwise });
@@ -793,6 +833,21 @@ namespace cobra {
 
                 if (auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
                     return LowerCompare(*cmp, lower);
+                }
+
+                if (const auto *fsh = FunnelShiftOf(inst)) {
+                    const auto [amount, width] = FunnelShiftAmount(*fsh);
+                    const uint32_t a           = lower(fsh->getArgOperand(0));
+                    const uint32_t b           = lower(fsh->getArgOperand(1));
+                    const bool kLeft           = fsh->getIntrinsicID() == llvm::Intrinsic::fshl;
+                    if (amount == 0) {
+                        return kLeft ? a : b;
+                    }
+                    const uint64_t left  = kLeft ? amount : width - amount;
+                    const uint64_t right = width - left;
+                    const uint32_t high  = MaskToWidth(v, Emit(Op::kShl, a, ConstSlot(left)));
+                    const uint32_t low   = Emit(Op::kLShr, b, ConstSlot(right));
+                    return Emit(Op::kOr, high, low);
                 }
 
                 const uint32_t lhs = lower(inst->getOperand(0));
@@ -1154,6 +1209,30 @@ namespace cobra {
                 }
                 uint64_t mul_val = 1ULL << shift_amt->getZExtValue();
                 return mask_to_width(Expr::Mul(std::move(child), Expr::Constant(mul_val)));
+            }
+
+            // A funnel shift by a constant: the high part shifted up, masked to
+            // the width, or'd with the low part shifted down.
+            if (const auto *fsh = FunnelShiftOf(inst)) {
+                const auto [amount, width] = FunnelShiftAmount(*fsh);
+                const bool kLeft           = fsh->getIntrinsicID() == llvm::Intrinsic::fshl;
+                auto a                     = BuildExprFromIRImpl(
+                    fsh->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                );
+                auto b = BuildExprFromIRImpl(
+                    fsh->getArgOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                );
+                if (a == nullptr || b == nullptr) {
+                    return nullptr;
+                }
+                if (amount == 0) {
+                    return kLeft ? std::move(a) : std::move(b);
+                }
+                const uint64_t left  = kLeft ? amount : width - amount;
+                const uint64_t right = width - left;
+                auto high = mask_to_width(Expr::Mul(std::move(a), Expr::Constant(1ULL << left)));
+                auto low  = Expr::LogicalShr(std::move(b), right);
+                return Expr::BitwiseOr(std::move(high), std::move(low));
             }
 
             // Binary operations
@@ -1558,8 +1637,7 @@ namespace cobra {
                 // reducible expression can still be hiding.
                 std::vector< llvm::Instruction * > inner_roots;
                 for (auto *ti : tree_insts) {
-                    if (ti != &inst && IsMbaRootOpcode(ti->getOpcode())
-                        && ti->getType()->isIntegerTy()
+                    if (ti != &inst && IsMbaRoot(ti) && ti->getType()->isIntegerTy()
                         && ti->getType()->getIntegerBitWidth() <= 64)
                     {
                         inner_roots.push_back(ti);
@@ -1597,7 +1675,7 @@ namespace cobra {
         std::vector< llvm::Instruction * > roots;
         for (auto *bb : post_order(&f)) {
             for (auto &inst : llvm::reverse(*bb)) {
-                if (IsMbaRootOpcode(inst.getOpcode())) {
+                if (IsMbaRoot(&inst)) {
                     roots.push_back(&inst);
                 }
             }
@@ -1716,7 +1794,7 @@ namespace cobra {
 
     std::optional< MbaFingerprint >
     ComputeMbaFingerprint(llvm::Instruction *inst, uint32_t max_tree_nodes) {
-        if (inst == nullptr || !IsMbaRootOpcode(inst->getOpcode())
+        if (inst == nullptr || !IsMbaRoot(inst)
             || !inst->getType()->isIntegerTy() || inst->getType()->getIntegerBitWidth() > 64)
         {
             return std::nullopt;
