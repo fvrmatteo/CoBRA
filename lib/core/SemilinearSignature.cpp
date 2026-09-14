@@ -225,6 +225,9 @@ namespace cobra {
 
     } // namespace
 
+    // Rows over more variables than this are sampled one variable at a time.
+    constexpr uint32_t kMaxFullRowVars = 8;
+
     bool IsLinearShortcut(const Expr &expr, uint32_t num_vars, uint32_t bitwidth) {
         COBRA_TRACE(
             "SemilinearSig", "IsLinearShortcut: vars={} bitwidth={}", num_vars, bitwidth
@@ -234,6 +237,42 @@ namespace cobra {
         const uint64_t kMask = Bitmask(bitwidth);
         std::vector< uint64_t > assignment(num_vars, 0);
         const uint64_t kFZero = EvalAtPoint(expr, assignment, kMask);
+
+        // The whole row, when it is small enough to evaluate: every subset of
+        // the variables set to bit `b` must move the result by 2^b times what
+        // the same subset does at bit 0. Setting one variable at a time is not
+        // enough - `a + (b & m) - (a ^ (b & m))` is `2 * (a & b & m)`, which is
+        // zero whenever only one of them is set and nowhere near linear.
+        if (num_vars <= kMaxFullRowVars) {
+            const size_t kLen = size_t{ 1 } << num_vars;
+            std::vector< uint64_t > base_row(kLen);
+            const auto delta_at = [&](size_t subset, uint64_t value) {
+                for (uint32_t j = 0; j < num_vars; ++j) {
+                    assignment[j] = ((subset >> j) & 1) != 0 ? value : 0;
+                }
+                const uint64_t kDelta = (EvalAtPoint(expr, assignment, kMask) - kFZero) & kMask;
+                std::fill(assignment.begin(), assignment.end(), 0);
+                return kDelta;
+            };
+            for (size_t subset = 1; subset < kLen; ++subset) {
+                base_row[subset] = delta_at(subset, 1);
+            }
+            for (uint32_t bit = 1; bit < bitwidth; ++bit) {
+                const uint64_t kBitVal = 1ULL << bit;
+                for (size_t subset = 1; subset < kLen; ++subset) {
+                    const uint64_t kExpect = (base_row[subset] * kBitVal) & kMask;
+                    if (delta_at(subset, kBitVal) != kExpect) {
+                        COBRA_TRACE(
+                            "SemilinearSig", "IsLinearShortcut: false (subset={} bit={})",
+                            subset, bit
+                        );
+                        return false;
+                    }
+                }
+            }
+            COBRA_TRACE("SemilinearSig", "IsLinearShortcut: true");
+            return true;
+        }
 
         // Extract per-variable coefficient from bit 0.
         std::vector< uint64_t > coeff(num_vars);

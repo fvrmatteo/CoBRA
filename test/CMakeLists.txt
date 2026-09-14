@@ -42,6 +42,7 @@ cobra_add_test(test_singleton_power_recovery core/test_singleton_power_recovery.
 cobra_add_test(test_singleton_power_expr_builder core/test_singleton_power_expr_builder.cpp)
 cobra_add_test(test_signature_eval core/test_signature_eval.cpp)
 cobra_add_test(test_dynamic_mask core/test_dynamic_mask.cpp)
+cobra_add_test(test_shift_lifting core/test_shift_lifting.cpp)
 cobra_add_test(test_mixed_product_rewriter core/test_mixed_product_rewriter.cpp)
 cobra_add_test(test_expr_cost core/test_expr_cost.cpp)
 cobra_add_test(test_multivar_poly_recovery core/test_multivar_poly_recovery.cpp)

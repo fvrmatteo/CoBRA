@@ -127,11 +127,7 @@ if(COBRA_NONRECURSIVE)
     # Off by default because it is measurably slower on real input: this library
     # is called on very many small expressions, where a recursive call stays in
     # registers and an explicit stack pays a frame push, a thread-local lookup
-    # and an indirect call at every node. On the ActionRPG sample the same
-    # source costs 187.5 s recursive against 199.5 s iterative - 6.4% - for the
-    # same result and the same peak memory. Turn it on for input deep enough to
-    # threaten the stack; the two paths share one combine step per walk, so they
-    # compute the same thing by construction and either can check the other.
+    # and an indirect call at every node.
     target_compile_definitions(cobra-core PUBLIC COBRA_NONRECURSIVE=1)
 endif()
 

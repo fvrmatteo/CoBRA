@@ -61,6 +61,13 @@ namespace cobra {
         StructuralFlag structural_flags   = static_cast< StructuralFlag >(0);
         TechniqueFamily enabled_families  = TechniqueFamily::kAll;
         Evaluator evaluator;
+
+        // The bits of the result the caller reads, as a mask over `bitwidth`.
+        // A result need only agree with the input on these. With the top bits
+        // free, an expression without right shifts is solved in the narrower
+        // ring, and one whose shifts sit over sums has them lifted out (see
+        // ShiftLifting.h). All ones asks for every bit.
+        uint64_t demanded_mask = UINT64_MAX;
     };
 
     Result< SimplifyOutcome > Simplify(

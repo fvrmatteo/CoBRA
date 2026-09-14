@@ -103,6 +103,18 @@ TEST(SemilinearSignatureTest, LinearShortcutTrueForComplementSum) {
     EXPECT_TRUE(IsLinearShortcut(*e, 1, 8));
 }
 
+TEST(SemilinearSignatureTest, LinearShortcutFalseForMaskedInteraction) {
+    // a + (b & 0xF) - (a ^ (b & 0xF)) is 2 * (a & b & 0xF): zero whenever a
+    // single variable is set, so only a point setting both tells it apart
+    // from a linear sum.
+    auto masked = [] { return Expr::BitwiseAnd(Expr::Variable(1), Expr::Constant(0x0F)); };
+    auto e      = Expr::Add(
+        Expr::Add(Expr::Variable(0), masked()),
+        Expr::Negate(Expr::BitwiseXor(Expr::Variable(0), masked()))
+    );
+    EXPECT_FALSE(IsLinearShortcut(*e, 2, 8));
+}
+
 TEST(SemilinearSignatureTest, LinearShortcutFalseForSemilinear) {
     // 3*(x & 0x0F) is genuinely semilinear in 8-bit
     auto e =

@@ -339,6 +339,25 @@ namespace cobra {
             }
         }
 
+        // Solved per class, a sum whose classes are one function read through
+        // different constants comes back as one masked answer per class. Read
+        // as a single linear form over the translated variables it is one
+        // answer; that reading goes on only when it reconstructs cheaper, and
+        // it takes the same probe below as the others.
+        if (auto translated = SolvePartitionsByTranslation(payload.ctx.ir);
+            translated.has_value())
+        {
+            const auto kCurrentCost    = ComputeCost(*ReconstructMaskedAtoms(ir, {})).cost;
+            const auto kTranslatedCost = ComputeCost(*ReconstructMaskedAtoms(*translated, {})).cost;
+            if (IsBetter(kTranslatedCost, kCurrentCost)) {
+                COBRA_TRACE(
+                    "Simplifier", "RunSemilinearRewrite: translation wins ({} < {})",
+                    kTranslatedCost.weighted_size, kCurrentCost.weighted_size
+                );
+                ir = std::move(*translated);
+            }
+        }
+
         if (local_eval) {
             const auto kNumVars = static_cast< uint32_t >(vars.size());
             auto probe_expr     = ReconstructMaskedAtoms(ir, {});
