@@ -4,6 +4,7 @@
 #include "cobra/core/Simplifier.h"
 #include "cobra/llvm/CobraPass.h"
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,6 +34,16 @@ namespace cobra {
 
         bool operator==(const MbaFingerprint &other) const = default;
     };
+
+    // Which bits of a root's value its readers look at, as a mask over its
+    // width; all ones when unknown. What can be made of a tree depends on it -
+    // a shift over a sum has a semilinear reading on the low bits only - so it
+    // is as much a part of a tree's identity as its shape.
+    using DemandedMaskFn = std::function< uint64_t(llvm::Instruction *) >;
+
+    // `fp` for a root read under `mask`. A full mask leaves it as it is, so a
+    // record written for a root that is read whole keeps matching.
+    MbaFingerprint WithDemandedMask(MbaFingerprint fp, uint64_t mask, uint32_t bitwidth);
 
     struct MBACandidate
     {
@@ -75,6 +86,10 @@ namespace cobra {
         // as a leaf (see `BoundaryCutMbaCandidate`). Like a re-cut it is a
         // partial view of the root, and `node_limit` says so too.
         bool boundary_cut = false;
+
+        // The bits of the root its readers look at, as a mask over `bitwidth`.
+        // A rewrite has to agree with the tree on these alone.
+        uint64_t demanded_mask = UINT64_MAX;
     };
 
     // The `node_limit` a boundary cut carries: past any re-cut ladder, so the
@@ -96,9 +111,13 @@ namespace cobra {
     //
     // `max_tree_nodes`, when non-zero, caps how many instructions a collection
     // may hold; past it the walk keeps what remains as leaves.
+    //
+    // `demanded`, when given, says which bits of a root its readers look at;
+    // the candidate carries the answer and its fingerprint is taken under it.
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
-        MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,
+        const DemandedMaskFn &demanded = {}
     );
 
     // Candidates for `inner_roots`, to be used once the tree enclosing them has
@@ -114,7 +133,8 @@ namespace cobra {
     std::vector< MBACandidate > ExpandMbaCandidate(
         llvm::ArrayRef< llvm::Instruction * > inner_roots, uint32_t min_ast_size,
         uint32_t max_vars, uint64_t options_tag,
-        MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,
+        const DemandedMaskFn &demanded = {}
     );
 
     // The same root as `cand`, re-collected with the tree cut short so that
@@ -149,7 +169,8 @@ namespace cobra {
     std::vector< MBACandidate > RecutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint32_t max_recut_nodes, uint32_t max_recut_vars, uint64_t options_tag,
-        MbaCostModel cost_model = MbaCostModel::kTreeInstructions
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
+        const DemandedMaskFn &demanded = {}
     );
 
     // The same root as `cand`, re-collected with every arithmetic value that a
@@ -169,7 +190,7 @@ namespace cobra {
     std::vector< MBACandidate > BoundaryCutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
-        uint32_t max_tree_nodes = 0
+        uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
     );
 
     // Record `fp` on `inst` so a later run can skip the tree rooted there.

@@ -35,6 +35,7 @@ target_sources(cobra-core PRIVATE
     MultivarPolyRecovery.cpp
     SignatureEval.cpp
     DynamicMask.cpp
+    ShiftLifting.cpp
     MixedProductRewriter.cpp
     ExprCost.cpp
     SignatureSimplifier.cpp

@@ -10,9 +10,9 @@ These passes handle MBA expressions where bitwise atoms involve constant masks -
 
 **Source:** [SemilinearSignature.cpp](../../lib/core/SemilinearSignature.cpp)
 
-Before full semilinear processing, a shortcut check determines whether the expression is linear in disguise. The check evaluates the expression at `{0, 2^i}` for each variable at each bit position and extracts per-variable coefficients from the bit-0 evaluation. It then verifies that the delta at every other bit position matches `coeff[j] * 2^bit`. If all deltas match, the constant masks don't create bit-dependent behavior and the expression can be routed to the signature-based linear techniques instead, avoiding the overhead of full semilinear normalization.
+Before full semilinear processing, a shortcut check determines whether the expression is linear in disguise. The check evaluates the expression with every subset of the variables set to `2^bit` and the rest to zero, and compares each such row with the bit-0 row scaled by `2^bit`. If all rows match, the constant masks don't create bit-dependent behavior and the expression can be routed to the signature-based linear techniques instead, avoiding the overhead of full semilinear normalization.
 
-The check is O(num_vars * bitwidth) evaluations and bails out on the first mismatch.
+Every subset has to be tried, not only the single variables: `a + (b & m) - (a ^ (b & m))` is `2 * (a & b & m)`, zero whenever one variable is set alone, and a check on single variables takes it for linear and hands it to techniques that cannot express the mask. The full rows are compared up to eight variables, `2^num_vars * bitwidth` evaluations; past that the check falls back to the single-variable points. It bails out on the first mismatch.
 
 ## Normalization
 
@@ -178,6 +178,19 @@ The rewrite stages above all work term by term: XOR recovery and mask eliminatio
 
 The solve competes with the term-level chain rather than replacing it: both readings go through the same chain and whichever reconstructs cheaper goes on, the chain's own answer winning ties. It declines when an atom has a shift or a support beyond the truth-table limit (neither has a bit-local reading), or when the sum reads more variables than a signature can hold.
 
+## Partition Translation
+
+**Part of pass:** `kSemilinearRewrite`
+**Source:** [PartitionSolver.cpp](../../lib/core/PartitionSolver.cpp)
+
+The partition solve answers each class separately, so a sum whose constants move from bit to bit comes back as one masked answer per class even when every class is the same function. `(a ^ c1) & (b ^ c2)` is `a & b` on the bits where both constants are clear, `~a & b` where only `c1` is set, and so on; the assembly spells out all four, and nothing in the term-level chain puts them back together. An optimizer makes this worse by folding the constants of the operands into each other: `(a ^ c1) + (b ^ c2) - (a ^ b ^ (c1 ^ c2))` is `2 * ((a ^ c1) & (b ^ c2))`, but no `(a ^ c1) ^ (b ^ c2)` is left in it for anything syntactic to find.
+
+`SolvePartitionsByTranslation` looks for the function the classes share. Each class's bit-slice function is compared with a reference class's through every way of reading each variable - kept, complemented, cleared or set, `4^n` maps over `2^n` points. When every class matches the reference `g` through some map `sigma_j`, bit `j` of the sum is `2^j * g(sigma_j(v_j))`, so the sum is the linear MBA with slice `g` - found by the same interpolation and CoB builder as a class - applied to `(v & keep) ^ flip` for each variable, where `keep` holds the bits on which the variable is read and `flip` those on which it is complemented or set. A masked operand `b & m` is the same thing, cleared above `m`.
+
+The slices are matched up to an additive constant per class. The sum's constant is one word in which the constants lowered out of the atoms have already carried into each other, so its bits are not what any class contributes; instead, with the reference slice `t_r` carrying `c_r`, a class matched through `sigma` carries `c_r + (t_r(sigma(0)) - t(0))`, and since the class masks cover the word, which is `-1` in the ring, requiring the classes to add up to the sum's constant fixes `c_r`.
+
+The translated form competes with the other two readings on reconstruction cost and takes the same post-rewrite probe. It declines a sum with a single class (the plain solve already covers it), more than four variables, or classes with no common slice.
+
 ## Reconstruction
 
 **Part of pass:** `kSemilinearReconstruct`
@@ -192,3 +205,20 @@ After reconstruction, `SimplifyXorConstant` applies a final pattern match: `k + 
 ## Shift Handling
 
 Constant left shifts (`x << 3`) are desugared to multiplication (`8 * x`) before simplification. Right shifts on bitwise subtrees (`(x & y) >> 2`) route through the semilinear techniques since the shift creates a constant mask selecting the upper bits. The `EvalAtomAtBit` function in the bit partitioner handles shifts by offsetting the source bit position (`bit_pos + shift_amount`), mapping the shifted result back to the correct partition.
+
+A right shift over a sum, `(a + b) >> s`, has no semilinear reading at all: the bits shifted in carry into every lower position, so no sum of bitwise atoms reproduces it, and the normalizer declines the expression. Read whole that is the right answer - `((x + y + ((x ^ y) & 1)) >> 1) + ((x ^ y) >> 1) - (x ^ y)` is `x & y` in every bit but the top one, which carries the overflow of the sum, so there is nothing to rewrite it to. Read on the low bits only there is, and that is what a caller usually does with such a value: a flag chain that computes in 16-bit lanes reads one bit of it.
+
+## Demanded Bits and Shift Lifting
+
+**Part of:** `Simplify` (before any technique runs)
+**Source:** [ShiftLifting.cpp](../../lib/core/ShiftLifting.cpp), [Orchestrator.cpp](../../lib/core/Orchestrator.cpp)
+
+`Options::demanded_mask` says which bits of the result the caller reads; a rewrite need only agree with the input on those. The LLVM pass fills it from LLVM's demanded-bits analysis of the root's readers, and a root written as `(2^m - 1) & g` supplies it for `g` on its own.
+
+Without right shifts every operator is a homomorphism of the ring, so the low `m` bits of the result are the result computed at width `m`, and the expression is solved there - the dynamic-masking shortcut, now reached from a demanded mask as well as from a root mask. With shifts over sums the ring cannot be narrowed, because the shifted-in bits come from above it, but the shifts can be lifted out: `2^s * (L >> s)` is `L - (L mod 2^s)` exactly, so `2^s * expr` is free of them, and for `s = 1` the remainder `L mod 2` is the parity of the sum's odd-coefficient terms and its constant - a bitwise atom. The scaled expression is solved below the top `s` bits of the demanded width, its answer divided back by `2^s` term by term (every coefficient must carry the factor, or the lift is abandoned), and the quotient agrees with the input on the demanded bits. On the identity above that turns `2 * expr` into `x + y - (x ^ y)`, which is `2 * (x & y)`, and the answer is `x & y`.
+
+The scaled expression is where the operands of the identity usually carry constants of their own, folded into each other by the optimizer that produced them; the partition translation above is what reads such a sum as `2 * ((a ^ c1) & (b ^ c2))` rather than as a masked answer per bit class.
+
+A shift that already is an atom - one over a purely bitwise subtree, `(z >> 16) ^ c` - is left where it is but read as a variable of its own while solving: over the Boolean points a shifted variable evaluates to nothing and takes the identity written over it down with it, whereas as a variable it is visible again. The substitution is undone before the check, which is on the original expression, on the demanded bits, at full width; and the LLVM pass proves the rewrite on those same bits when a solver is on.
+
+What is declined: a sum shifted by more than one (its remainder is not an atom), a shift over a shift over a sum, and a shift over a sum under a bitwise operator or a comparison, which scaling cannot distribute into. Nothing found on the demanded bits costs nothing - the full-width solve runs next, and an answer for every bit serves the demanded ones too.

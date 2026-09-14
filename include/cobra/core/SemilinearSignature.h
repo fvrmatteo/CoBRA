@@ -15,6 +15,8 @@ namespace cobra {
 
     /// Check if a syntactically semilinear expression is actually linear.
     /// Compares semi-linear signature rows: if all identical, it's linear.
+    /// The full rows are compared up to eight variables; past that only the
+    /// points with a single variable set are, which misses interactions.
     bool IsLinearShortcut(const Expr &expr, uint32_t num_vars, uint32_t bitwidth);
 
 } // namespace cobra

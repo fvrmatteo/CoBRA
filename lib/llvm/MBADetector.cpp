@@ -1,5 +1,6 @@
 #include "MBADetector.h"
 #include "cobra/core/BitWidth.h"
+#include "cobra/core/BitWidth.h"
 #include "cobra/core/Expr.h"
 #include "cobra/core/Simplifier.h"
 #include "llvm/ADT/DenseMap.h"
@@ -1439,7 +1440,8 @@ namespace cobra {
             llvm::ArrayRef< llvm::Instruction * > roots, uint32_t min_ast_size,
             uint32_t max_vars, MbaCostModel cost_model, uint64_t options_tag,
             std::vector< MBACandidate > &candidates, uint32_t max_nodes = 0,
-            bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0
+            bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
+            const DemandedMaskFn &demanded = {}
         ) {
             llvm::DenseSet< llvm::Instruction * > already_in_tree;
 
@@ -1456,6 +1458,8 @@ namespace cobra {
                 if (bw > 64) {
                     continue;
                 }
+                const uint64_t demanded_mask =
+                    demanded ? (demanded(&inst) & Bitmask(bw)) : Bitmask(bw);
 
                 llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
                 std::vector< llvm::Value * > leaves;
@@ -1503,8 +1507,9 @@ namespace cobra {
                 // which is written for the full tree — compares two different
                 // things, and it is only ever built because the full tree has
                 // already been tried and rejected in this very run.
-                const MbaFingerprint fingerprint =
-                    FingerprintTree(&inst, leaves, tree_set, phi_redirects);
+                const MbaFingerprint fingerprint = WithDemandedMask(
+                    FingerprintTree(&inst, leaves, tree_set, phi_redirects), demanded_mask, bw
+                );
                 if (max_nodes == 0 && !cut_arith_under_bitwise
                     && FingerprintUnchanged(inst, fingerprint, options_tag))
                 {
@@ -1658,7 +1663,8 @@ namespace cobra {
                                   .node_limit = cut_arith_under_bitwise ? kBoundaryCutLimit
                                                                         : max_nodes,
                                   .tree_size    = static_cast< uint32_t >(tree_insts.size()),
-                                  .boundary_cut = cut_arith_under_bitwise }
+                                  .boundary_cut  = cut_arith_under_bitwise,
+                                  .demanded_mask = demanded_mask }
                 );
             }
         }
@@ -1667,7 +1673,7 @@ namespace cobra {
 
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
-        MbaCostModel cost_model, uint32_t max_tree_nodes
+        MbaCostModel cost_model, uint32_t max_tree_nodes, const DemandedMaskFn &demanded
     ) {
         // Post-order: process uses before defs across blocks. Within each block,
         // reverse iteration hits outermost roots first, so the largest MBA tree
@@ -1684,7 +1690,7 @@ namespace cobra {
         std::vector< MBACandidate > candidates;
         BuildCandidates(
             roots, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
-            max_tree_nodes
+            max_tree_nodes, demanded
         );
         return candidates;
     }
@@ -1692,12 +1698,12 @@ namespace cobra {
     std::vector< MBACandidate > ExpandMbaCandidate(
         llvm::ArrayRef< llvm::Instruction * > inner_roots, uint32_t min_ast_size,
         uint32_t max_vars, uint64_t options_tag, MbaCostModel cost_model,
-        uint32_t max_tree_nodes
+        uint32_t max_tree_nodes, const DemandedMaskFn &demanded
     ) {
         std::vector< MBACandidate > candidates;
         BuildCandidates(
             inner_roots, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
-            max_tree_nodes
+            max_tree_nodes, demanded
         );
         return candidates;
     }
@@ -1705,7 +1711,7 @@ namespace cobra {
     std::vector< MBACandidate > RecutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint32_t max_recut_nodes, uint32_t max_recut_vars, uint64_t options_tag,
-        MbaCostModel cost_model
+        MbaCostModel cost_model, const DemandedMaskFn &demanded
     ) {
         std::vector< MBACandidate > candidates;
         if (cand.root == nullptr || cand.node_limit >= max_recut_nodes) {
@@ -1729,7 +1735,7 @@ namespace cobra {
         for (uint32_t nodes = cand.node_limit + 1; nodes <= max_recut_nodes; ++nodes) {
             BuildCandidates(
                 { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates,
-                nodes
+                nodes, false, 0, demanded
             );
             if (candidates.empty()) {
                 continue;
@@ -1749,7 +1755,8 @@ namespace cobra {
 
     std::vector< MBACandidate > BoundaryCutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
-        uint64_t options_tag, MbaCostModel cost_model, uint32_t max_tree_nodes
+        uint64_t options_tag, MbaCostModel cost_model, uint32_t max_tree_nodes,
+        const DemandedMaskFn &demanded
     ) {
         std::vector< MBACandidate > candidates;
         if (cand.root == nullptr || cand.node_limit != 0) {
@@ -1757,13 +1764,20 @@ namespace cobra {
         }
         BuildCandidates(
             { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0,
-            /*cut_arith_under_bitwise=*/true, max_tree_nodes
+            /*cut_arith_under_bitwise=*/true, max_tree_nodes, demanded
         );
         // A cut that took nothing out is the full collection again.
         if (!candidates.empty() && candidates.front().tree_size >= cand.tree_size) {
             candidates.clear();
         }
         return candidates;
+    }
+
+    MbaFingerprint WithDemandedMask(MbaFingerprint fp, uint64_t mask, uint32_t bitwidth) {
+        if (mask != Bitmask(bitwidth)) {
+            fp.structure = MixFingerprint(fp.structure, mask);
+        }
+        return fp;
     }
 
     void RecordMbaFingerprint(

@@ -1,6 +1,7 @@
 #include "cobra/llvm/CobraPass.h"
 #include "IRReconstructor.h"
 #include "MBADetector.h"
+#include "cobra/core/BitWidth.h"
 #include "cobra/core/ExprCost.h"
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/SignatureChecker.h"
@@ -12,7 +13,10 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/DemandedBits.h"
 #include "llvm/IR/Analysis.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PassManager.h"
@@ -52,6 +56,41 @@ namespace cobra {
         {
             std::unique_ptr< Expr > expr;
             std::vector< std::string > real_vars;
+        };
+
+        // Which bits of a value its readers look at, from LLVM's demanded-bits
+        // analysis. A rewrite only has to agree with the tree on those, and
+        // for a shift over a sum that is the difference between a semilinear
+        // reading and none. The analysis covers the whole function and goes
+        // stale the moment a rewrite lands - the new tree reads its leaves
+        // through different operators than the old one did - so it is dropped
+        // after every one and rebuilt on the next question.
+        class DemandedBitsOracle
+        {
+          public:
+            explicit DemandedBitsOracle(llvm::Function &f)
+                : f_(f), assumptions_(f), dominators_(f) {}
+
+            uint64_t MaskOf(llvm::Instruction *inst) {
+                if (inst == nullptr || !inst->getType()->isIntegerTy()
+                    || inst->getType()->getIntegerBitWidth() > 64)
+                {
+                    return UINT64_MAX;
+                }
+                if (!analysis_.has_value()) {
+                    analysis_.emplace(f_, assumptions_, dominators_);
+                }
+                const llvm::APInt bits = analysis_->getDemandedBits(inst);
+                return bits.getZExtValue() & Bitmask(inst->getType()->getIntegerBitWidth());
+            }
+
+            void Invalidate() { analysis_.reset(); }
+
+          private:
+            llvm::Function &f_;
+            llvm::AssumptionCache assumptions_;
+            llvm::DominatorTree dominators_;
+            std::optional< llvm::DemandedBits > analysis_;
         };
 
 
@@ -418,6 +457,8 @@ namespace cobra {
             std::string key;
             key += std::to_string(cand.bitwidth);
             key += '|';
+            key += std::to_string(cand.demanded_mask);
+            key += '|';
             key += std::to_string(options.max_vars);
             key += options.z3_verify ? "|z" : "|-";
             key += std::to_string(options.z3_settings.timeout_ms);
@@ -515,7 +556,8 @@ namespace cobra {
                           .max_vars         = options.max_vars,
                           .spot_check       = true,
                           .enabled_families = options.enabled_families,
-                          .evaluator        = cand.evaluator };
+                          .evaluator        = cand.evaluator,
+                          .demanded_mask    = cand.demanded_mask };
 
             // Pass AST when available — unlocks semilinear,
             // MixedRewrite, and decomposition pipelines.
@@ -602,8 +644,17 @@ namespace cobra {
                     RemapVarIndices(*z3_expr, *idx_map);
                 }
 
+                // A rewrite found for the demanded bits is proved on those:
+                // both sides are masked to them.
+                auto proved_ast = CloneExpr(*ast);
+                if (cand.demanded_mask != Bitmask(cand.bitwidth)) {
+                    proved_ast =
+                        Expr::BitwiseAnd(std::move(proved_ast), Expr::Constant(cand.demanded_mask));
+                    z3_expr =
+                        Expr::BitwiseAnd(std::move(z3_expr), Expr::Constant(cand.demanded_mask));
+                }
                 auto z3_result = Z3VerifyExprs(
-                    *ast, *z3_expr, cand.var_names, cand.bitwidth, options.z3_settings
+                    *proved_ast, *z3_expr, cand.var_names, cand.bitwidth, options.z3_settings
                 );
                 if (!z3_result.equivalent) {
                     ++NumSkippedUnsupported;
@@ -638,9 +689,14 @@ namespace cobra {
 
         const uint64_t options_tag = OptionsTag(options_);
 
+        DemandedBitsOracle demanded_bits(f);
+        const DemandedMaskFn demanded = [&](llvm::Instruction *inst) {
+            return demanded_bits.MaskOf(inst);
+        };
+
         auto candidates = DetectMbaCandidates(
             f, options_.min_ast_size, options_.max_vars, options_tag, options_.cost_model,
-            options_.max_tree_nodes
+            options_.max_tree_nodes, demanded
         );
 
         NumCandidates += candidates.size();
@@ -696,11 +752,11 @@ namespace cobra {
                 // the ladder below cannot reach, and it costs a single solve.
                 auto boundary = BoundaryCutMbaCandidate(
                     cand, options_.min_ast_size, options_.max_vars, options_tag,
-                    options_.cost_model, options_.max_tree_nodes
+                    options_.cost_model, options_.max_tree_nodes, demanded
                 );
                 auto recuts = RecutMbaCandidate(
                     cand, options_.min_ast_size, options_.max_vars, options_.max_recut_nodes,
-                    options_.max_recut_vars, options_tag, options_.cost_model
+                    options_.max_recut_vars, options_tag, options_.cost_model, demanded
                 );
 
                 // Only a full collection speaks for what the tree holds. A
@@ -719,7 +775,7 @@ namespace cobra {
                 }
                 auto inners = ExpandMbaCandidate(
                     fresh, options_.min_ast_size, options_.max_vars, options_tag,
-                    options_.cost_model, options_.max_tree_nodes
+                    options_.cost_model, options_.max_tree_nodes, demanded
                 );
                 for (auto &cut : boundary) {
                     if (attempted.insert({ cut.root, cut.node_limit }).second) {
@@ -839,6 +895,7 @@ namespace cobra {
             cand.root->replaceAllUsesWith(new_val);
             ++NumSimplified;
             changed = true;
+            demanded_bits.Invalidate();
 
             // The replacement is itself an MBA tree the detector will find next
             // run, and re-solving it almost always just reproves that CoBRA's
@@ -847,7 +904,12 @@ namespace cobra {
             // shape stops matching and it is examined again.
             if (auto *new_inst = llvm::dyn_cast< llvm::Instruction >(new_val)) {
                 if (auto new_fp = ComputeMbaFingerprint(new_inst, options_.max_tree_nodes)) {
-                    RecordMbaFingerprint(new_inst, *new_fp, options_tag);
+                    // The replacement has the root's readers, so its demand is
+                    // the root's.
+                    RecordMbaFingerprint(
+                        new_inst, WithDemandedMask(*new_fp, cand.demanded_mask, cand.bitwidth),
+                        options_tag
+                    );
                 }
             }
 

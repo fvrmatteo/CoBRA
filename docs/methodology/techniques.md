@@ -211,7 +211,7 @@ Extract-and-recurse at signature level via structured operation. Identifies a do
 
 ### Linear Shortcut Detection
 
-Pre-check that evaluates a semilinear-classified expression at `{0, 2^i}` per bit position. If all semilinear signature rows are identical, the expression is linear in disguise and can stay on the cheaper signature-based path instead of entering full semilinear normalization.
+Pre-check that evaluates a semilinear-classified expression with every subset of its variables set to `2^i`, per bit position. If all semilinear signature rows are identical, the expression is linear in disguise and can stay on the cheaper signature-based path instead of entering full semilinear normalization. Full rows are compared up to eight variables; setting one variable at a time misses interactions such as `2 * (a & b & m)`.
 
 **Source:** [SemilinearSignature.cpp](../../lib/core/SemilinearSignature.cpp)
 **Used in:** [Semilinear Techniques](semilinear-techniques.md#linear-shortcut)
@@ -280,6 +280,24 @@ Solves a semilinear sum one bit class at a time. On each class the sum is an ord
 **Source:** [PartitionSolver.cpp](../../lib/core/PartitionSolver.cpp)
 **Used in:** [Semilinear Techniques](semilinear-techniques.md#partition-solve)
 **Reference:** Skees, [Deobfuscation of Semi-Linear Mixed Boolean-Arithmetic Expressions](https://arxiv.org/abs/2406.10016) (MSiMBA, 2024)
+
+---
+
+### Partition Translation
+
+Reads a semilinear sum whose bit classes are one function seen through different constants as a single linear MBA over translated variables. Each class's bit-slice function is matched against a reference class's through every way of keeping, complementing, clearing or setting each variable, up to an additive constant; when all match, the sum is the reference's linear form applied to `(v & keep) ^ flip`. This is what reads `(a ^ c1) + (b ^ c2) - (a ^ b ^ (c1 ^ c2))` as `2 * ((a ^ c1) & (b ^ c2))`, where the per-class solve assembles one masked answer per combination of the constants' bits.
+
+**Source:** [PartitionSolver.cpp](../../lib/core/PartitionSolver.cpp)
+**Used in:** [Semilinear Techniques](semilinear-techniques.md#partition-translation)
+
+---
+
+### Demanded Bits and Shift Lifting
+
+Solves an expression on the bits its readers look at. Without right shifts that is the expression solved at the demanded width; with a shift over a sum, which has no semilinear reading, the expression is scaled by `2^s` so that `2^s * (L >> s)` becomes `L - (L mod 2^s)` - for `s = 1` the parity of the sum, a bitwise atom - solved, and divided back. The answer is right below the top `s` bits, which is all that was asked. This is what reads the add-and-shift identities `((x + y + ((x ^ y) & 1)) >> 1) + ((x ^ y) >> 1) [- (x ^ y)]` as `x | y` and `x & y` for the flag bit that consumes them, where read whole they are neither.
+
+**Source:** [ShiftLifting.cpp](../../lib/core/ShiftLifting.cpp), [Orchestrator.cpp](../../lib/core/Orchestrator.cpp)
+**Used in:** [Semilinear Techniques](semilinear-techniques.md#demanded-bits-and-shift-lifting)
 
 ---
 
