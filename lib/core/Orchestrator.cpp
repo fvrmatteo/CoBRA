@@ -10,6 +10,7 @@
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/PatternMatcher.h"
 #include "cobra/core/Profile.h"
+#include "cobra/core/ShiftLifting.h"
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/core/SignatureEval.h"
 #include "cobra/core/SignatureSimplifier.h"
@@ -1039,6 +1040,203 @@ namespace cobra {
     // the 16-var default opts.max_vars policy.
     inline constexpr uint32_t kMaxInputVars = 24;
 
+    namespace {
+
+        // The right shifts over bitwise atoms in `expr`, each replaced by a
+        // fresh variable numbered from `first`, equal shifts sharing one. To
+        // the solver such a shift is an atom like any other, but over the
+        // Boolean points a shifted variable evaluates to nothing and takes the
+        // identity written over it down with it; as a variable of its own it
+        // is visible again. The proof afterwards is over the original, so
+        // what the substitution loses is at most a rewrite, never soundness.
+        std::unique_ptr< Expr > HideAtomShifts(
+            const Expr &expr, uint32_t first, std::vector< std::unique_ptr< Expr > > &hidden
+        ) {
+            if (expr.kind == Expr::Kind::kShr && IsBitwiseAtom(*expr.children[0])) {
+                for (size_t index = 0; index < hidden.size(); ++index) {
+                    if (ExprStructurallyEqual(*hidden[index], expr)) {
+                        return Expr::Variable(first + static_cast< uint32_t >(index));
+                    }
+                }
+                hidden.push_back(CloneExpr(expr));
+                return Expr::Variable(first + static_cast< uint32_t >(hidden.size() - 1));
+            }
+            auto copy          = std::make_unique< Expr >();
+            copy->kind         = expr.kind;
+            copy->constant_val = expr.constant_val;
+            copy->var_index    = expr.var_index;
+            for (const auto &child : expr.children) {
+                copy->children.push_back(HideAtomShifts(*child, first, hidden));
+            }
+            return copy;
+        }
+
+        // `expr` with every variable numbered from `first` replaced by the
+        // subtree it stands for - recursively, since a hidden subtree may
+        // itself stand on earlier ones.
+        std::unique_ptr< Expr > RevealHidden(
+            const Expr &expr, uint32_t first, const std::vector< std::unique_ptr< Expr > > &hidden
+        ) {
+            if (expr.kind == Expr::Kind::kVariable && expr.var_index >= first) {
+                return RevealHidden(*hidden[expr.var_index - first], first, hidden);
+            }
+            auto copy          = std::make_unique< Expr >();
+            copy->kind         = expr.kind;
+            copy->constant_val = expr.constant_val;
+            copy->var_index    = expr.var_index;
+            for (const auto &child : expr.children) {
+                copy->children.push_back(RevealHidden(*child, first, hidden));
+            }
+            return copy;
+        }
+
+        // The variables `candidate` reads, in the original index space, and
+        // the expression rewritten into the index space of just those - the
+        // `real_vars` contract of an outcome.
+        std::vector< std::string >
+        CompressToSupport(Expr &candidate, const std::vector< std::string > &vars) {
+            std::vector< uint32_t > used;
+            CollectVariables(candidate, used);
+            std::ranges::sort(used);
+            used.erase(std::unique(used.begin(), used.end()), used.end());
+            std::vector< uint32_t > compress(vars.size(), 0);
+            std::vector< std::string > real_vars;
+            for (size_t position = 0; position < used.size(); ++position) {
+                compress[used[position]] = static_cast< uint32_t >(position);
+                real_vars.push_back(vars[used[position]]);
+            }
+            RemapVarIndices(candidate, compress);
+            return real_vars;
+        }
+
+        // `candidate`, in the index space of `real_vars`, as a verified outcome
+        // when it agrees with `expr` on the bits of `mask` at full width.
+        std::optional< SimplifyOutcome > VerifiedOnMask(
+            const std::vector< std::string > &vars, const Expr &expr,
+            std::unique_ptr< Expr > candidate, std::vector< std::string > real_vars, uint64_t mask,
+            uint32_t bitwidth
+        ) {
+            CheckResult check{ .passed = false, .failing_input = {} };
+            if (mask == Bitmask(bitwidth)) {
+                auto eval = Evaluator::FromExpr(expr, bitwidth);
+                check     = internal::VerifyInOriginalSpace(eval, vars, real_vars, *candidate, bitwidth);
+            } else {
+                auto masked_input = Expr::BitwiseAnd(CloneExpr(expr), Expr::Constant(mask));
+                auto masked_candidate =
+                    Expr::BitwiseAnd(CloneExpr(*candidate), Expr::Constant(mask));
+                auto eval = Evaluator::FromExpr(*masked_input, bitwidth);
+                check     = internal::VerifyInOriginalSpace(
+                    eval, vars, real_vars, *masked_candidate, bitwidth
+                );
+            }
+            if (!check.passed) { return std::nullopt; }
+
+            SimplifyOutcome outcome;
+            outcome.kind       = SimplifyOutcome::Kind::kSimplified;
+            outcome.sig_vector = EvaluateBooleanSignature(
+                *candidate, static_cast< uint32_t >(real_vars.size()), bitwidth
+            );
+            outcome.expr      = std::move(candidate);
+            outcome.real_vars = std::move(real_vars);
+            outcome.verified  = true;
+            return outcome;
+        }
+
+        // A rewrite of `expr` that agrees with it on the bits of `mask`, with
+        // the bits above free.
+        //
+        // Every operator but a right shift is a homomorphism of the ring, so
+        // without shifts the low bits of the result are the result computed in
+        // the narrower ring, and the expression is solved there. With shifts
+        // over sums the ring cannot be narrowed - the shifted-in bits come from
+        // above it - but the shifts can be lifted out: `2^s * (L >> s)` is
+        // `L - (L mod 2^s)`, so `2^s * expr` is shift-free, and its solution
+        // divided back by `2^s` is right on every bit below the top `s`. The
+        // outcome's expression is in the index space of its `real_vars`, as
+        // `Simplify` returns it, and it has been checked against the input on
+        // the demanded bits at full width.
+        std::optional< SimplifyOutcome > SolveUnderDemandedMask(
+            const std::vector< std::string > &vars, const Expr &expr, uint64_t mask,
+            const Options &opts
+        ) {
+            const uint32_t bitwidth = opts.bitwidth;
+            const uint32_t width    = DemandedWidth(mask, bitwidth);
+            if (width == 0) { return std::nullopt; }
+            const auto num_vars = static_cast< uint32_t >(vars.size());
+
+            // A comparison is no homomorphism of the ring: narrowed, it compares
+            // the low bits alone, and a check at random points almost never
+            // lands where the two readings part.
+            if (ContainsComparison(expr)) { return std::nullopt; }
+
+            std::unique_ptr< Expr > candidate;
+            std::vector< std::string > real_vars;
+
+            if (!ContainsType(expr, Expr::Kind::kShr)) {
+                if (width >= bitwidth) { return std::nullopt; }
+                Options inner       = opts;
+                inner.bitwidth      = width;
+                inner.demanded_mask = UINT64_MAX;
+                inner.evaluator     = Evaluator{};
+                auto sig            = EvaluateBooleanSignature(expr, num_vars, width);
+                auto result         = Simplify(sig, vars, &expr, inner);
+                if (!result.has_value()
+                    || result->kind != SimplifyOutcome::Kind::kSimplified) {
+                    return std::nullopt;
+                }
+                candidate = std::move(result->expr);
+                real_vars = std::move(result->real_vars);
+            } else {
+                auto lifted = LiftShifts(expr, bitwidth);
+                if (!lifted.has_value() || width + lifted->shift > bitwidth) {
+                    return std::nullopt;
+                }
+
+                std::vector< std::unique_ptr< Expr > > hidden;
+                auto scaled = HideAtomShifts(*lifted->scaled, num_vars, hidden);
+                std::vector< std::string > extended = vars;
+                for (size_t index = 0; index < hidden.size(); ++index) {
+                    extended.push_back("$shr" + std::to_string(index));
+                }
+                if (extended.size() > kMaxInputVars) { return std::nullopt; }
+
+                // The scaled expression is only needed below the top `shift`
+                // bits of the demanded width, and the recursion narrows to that.
+                Options inner       = opts;
+                inner.demanded_mask = Bitmask(width + lifted->shift);
+                inner.evaluator     = Evaluator{};
+                auto sig            = EvaluateBooleanSignature(
+                    *scaled, static_cast< uint32_t >(extended.size()), bitwidth
+                );
+                auto result = Simplify(sig, extended, scaled.get(), inner);
+                if (!result.has_value()
+                    || result->kind != SimplifyOutcome::Kind::kSimplified) {
+                    return std::nullopt;
+                }
+
+                // Back in the extended index space, divided, the shifts put
+                // back, and the variables compressed onto those still read.
+                auto solved = std::move(result->expr);
+                if (!result->real_vars.empty()) {
+                    auto support = TryBuildVarSupport(extended, result->real_vars);
+                    if (!support.has_value()) { return std::nullopt; }
+                    RemapVarIndices(*solved, *support);
+                }
+                auto quotient = DivideByPowerOfTwo(*solved, lifted->shift, bitwidth);
+                if (!quotient) { return std::nullopt; }
+                candidate = RevealHidden(*quotient, num_vars, hidden);
+                real_vars = CompressToSupport(*candidate, vars);
+            }
+
+            // The check is on the demanded bits alone, at full width and in the
+            // original variable space.
+            return VerifiedOnMask(
+                vars, expr, std::move(candidate), std::move(real_vars), mask, bitwidth
+            );
+        }
+
+    } // namespace
+
     Result< SimplifyOutcome > Simplify(
         const std::vector< uint64_t > &sig, const std::vector< std::string > &vars,
         const Expr *input_expr, const Options &opts
@@ -1072,6 +1270,19 @@ namespace cobra {
                 CobraError::kInvalidArgument,
                 "bitwidth must be in [1, 64]; got " + std::to_string(opts.bitwidth)
             );
+        }
+
+        // Demanded bits: when the caller reads only some of the result's
+        // bits, agreement on those is all a rewrite needs. Finding nothing
+        // there costs nothing - an answer for every bit serves them too.
+        if (input_expr != nullptr) {
+            const uint64_t kFull    = Bitmask(opts.bitwidth);
+            const uint64_t demanded = opts.demanded_mask & kFull;
+            if (demanded != 0 && demanded != kFull) {
+                if (auto masked = SolveUnderDemandedMask(vars, *input_expr, demanded, opts)) {
+                    return Ok< SimplifyOutcome >(std::move(*masked));
+                }
+            }
         }
 
         // Dynamic masking: if the root is (2^m - 1) & g and g contains
@@ -1116,6 +1327,30 @@ namespace cobra {
                     }
                 }
                 // Mask reduction failed — fall through to full-width solve.
+            } else if (mask.has_value()) {
+                // The inner expression shifts, so its ring cannot be narrowed;
+                // the bits the mask keeps are a demanded mask on it instead,
+                // under which its shifts over sums can be lifted out.
+                Options inner_opts       = opts;
+                inner_opts.demanded_mask = UINT64_MAX;
+                inner_opts.evaluator     = Evaluator{};
+                const uint64_t kKept     = Bitmask(mask->effective_width);
+                if (auto solved = SolveUnderDemandedMask(vars, *mask->inner, kKept, inner_opts)) {
+                    auto wrapped = Expr::BitwiseAnd(std::move(solved->expr), Expr::Constant(kKept));
+                    auto eval    = Evaluator::FromExpr(*input_expr, opts.bitwidth);
+                    auto check   = internal::VerifyInOriginalSpace(
+                        eval, vars, solved->real_vars, *wrapped, opts.bitwidth
+                    );
+                    if (check.passed) {
+                        solved->expr       = std::move(wrapped);
+                        solved->sig_vector = EvaluateBooleanSignature(
+                            *solved->expr, static_cast< uint32_t >(solved->real_vars.size()),
+                            opts.bitwidth
+                        );
+                        solved->verified = true;
+                        return Ok< SimplifyOutcome >(std::move(*solved));
+                    }
+                }
             }
         }
 

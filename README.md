@@ -99,7 +99,7 @@ Input Expression
 - **Subexpression lifting** — replace complex subtrees with virtual variables to reduce problem dimension
 - **Worklist orchestrator** — DAG-aware pass scheduling with deduplication and bounded search
 - **Competition groups** — local alternative branches and child solves use cost-based winner selection with continuations
-- **Constant shifts** — `<<` desugars to multiplication, `>>` simplifies via semilinear techniques
+- **Constant shifts** — `<<` desugars to multiplication, `>>` simplifies via semilinear techniques, and a `>>` over a sum is lifted out when only the low bits of the result are read (demanded bits)
 - **ANF cleanup** — absorption, common-cube factoring, and OR recognition
 - **Configurable bitwidth** — 1-bit to 64-bit modular arithmetic
 - **Auxiliary variable elimination** — reduces variable count when terms cancel
@@ -213,7 +213,9 @@ lib/core/                Core simplification engine (~50 source files)
   StructureRecovery        XOR recovery, mask elimination, term coalescing
   TermRefiner              Dead-bit mask reduction, same-coefficient merge
   BitPartitioner           Group bit positions by semantic profile
-  PartitionSolver          Solve each bit class as a linear MBA, realigning shifted atoms
+  PartitionSolver          Solve each bit class as a linear MBA, realigning shifted atoms,
+                           or all classes as one over translated variables
+  ShiftLifting             Lift a right shift over a sum out when only low bits are read
   MaskedAtomReconstructor  Reassemble with OR-rewrite for disjoint masks
   Evaluator                Compiled expression evaluator
 

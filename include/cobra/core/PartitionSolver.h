@@ -29,4 +29,29 @@ namespace cobra {
     /// or when the sum reads more variables than a signature can hold.
     std::optional< SemilinearIR > SolvePartitionsLinearly(const SemilinearIR &ir);
 
+    /// Solve a semilinear sum as one linear MBA over translated variables.
+    ///
+    /// Solved class by class, a sum whose constants move from bit to bit is
+    /// assembled from as many masked answers as it has classes, even when
+    /// every class is the same function: `(a ^ c1) & (b ^ c2)` is `a & b` on
+    /// one class, `~a & b` on the next, `a & ~b` on another, and the
+    /// assembly spells all of them out. What those classes share is one
+    /// bit-slice function read through a different map of each variable -
+    /// kept, complemented, cleared or set. When there is such a slice `g`,
+    /// with `sigma_j` the maps class of bit `j` reads it through, bit `j` of
+    /// the sum is `2^j * g(sigma_j(v_j))`, so the sum is the linear MBA with
+    /// slice `g` applied to `(v & keep) ^ flip` for every variable, where
+    /// `keep` has the bits on which the variable is read and `flip` those on
+    /// which it is complemented or set. A masked operand `b & m` is the same
+    /// thing, cleared above `m`.
+    ///
+    /// Classes are matched up to an additive constant per class, since the
+    /// sum's constant is one word in which the constants lowered out of the
+    /// atoms have already carried into each other; the reference slice's own
+    /// constant is then the one that makes the classes add up to it. Returns the
+    /// translated linear form as an IR whose atoms are registered as they
+    /// stand, or nothing when the sum has one class, reads more than four
+    /// variables, or its classes share no slice.
+    std::optional< SemilinearIR > SolvePartitionsByTranslation(const SemilinearIR &ir);
+
 } // namespace cobra
