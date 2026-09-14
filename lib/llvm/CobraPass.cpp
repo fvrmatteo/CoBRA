@@ -56,6 +56,16 @@ namespace cobra {
         {
             std::unique_ptr< Expr > expr;
             std::vector< std::string > real_vars;
+            // Where each of `real_vars` sits among the variables of the candidate
+            // that was solved. The outcome is shared by every candidate with the
+            // same key, and the key describes variables by position only, so a
+            // position is the one thing about them that holds for all of those
+            // candidates. Their names do not: the same name can stand at another
+            // position in another tree - a VM's handlers read the same register
+            // and frame slots in different roles - and binding a rewrite by name
+            // there hands it the wrong leaves, with nothing on a cache hit to
+            // catch it.
+            std::vector< uint32_t > real_var_positions;
         };
 
         // Which bits of a value its readers look at, from LLVM's demanded-bits
@@ -619,6 +629,22 @@ namespace cobra {
                 }
             }
 
+            // Resolved against the candidate the rewrite was found for, while its
+            // names still mean what the solve meant by them.
+            std::vector< uint32_t > positions;
+            if (!result.value().real_vars.empty()) {
+                auto support = TryBuildVarSupport(cand.var_names, result.value().real_vars);
+                if (!support.has_value()) {
+                    ++NumSkippedUnsupported;
+                    LLVM_DEBUG(
+                        llvm::dbgs() << "CoBRA: skipping — real_vars not contained in "
+                                        "candidate variable set\n"
+                    );
+                    return nullptr;
+                }
+                positions = std::move(*support);
+            }
+
 #ifdef COBRA_HAS_Z3
             if (options.z3_verify) {
                 if (ast == nullptr) {
@@ -631,17 +657,8 @@ namespace cobra {
                 }
 
                 auto z3_expr = CloneExpr(*result.value().expr);
-                auto idx_map = TryBuildVarSupport(cand.var_names, result.value().real_vars);
-                if (!idx_map.has_value()) {
-                    ++NumSkippedUnsupported;
-                    LLVM_DEBUG(
-                        llvm::dbgs() << "CoBRA: skipping — real_vars not contained in "
-                                        "candidate variable set\n"
-                    );
-                    return nullptr;
-                }
-                if (!idx_map->empty()) {
-                    RemapVarIndices(*z3_expr, *idx_map);
+                if (!positions.empty()) {
+                    RemapVarIndices(*z3_expr, positions);
                 }
 
                 // A rewrite found for the demanded bits is proved on those:
@@ -677,8 +694,9 @@ namespace cobra {
 #endif
 
             return std::make_shared< const CandidateOutcome >(CandidateOutcome{
-                .expr      = std::move(result.value().expr),
-                .real_vars = std::move(result.value().real_vars) });
+                .expr               = std::move(result.value().expr),
+                .real_vars          = std::move(result.value().real_vars),
+                .real_var_positions = std::move(positions) });
         }
 
     } // namespace
@@ -834,20 +852,16 @@ namespace cobra {
             // Build variable index map for aux var elimination.
             // real_vars may be a subset of var_names with
             // reindexed positions.
+            // By position, never by name: see `CandidateOutcome::real_var_positions`.
             std::vector< uint32_t > var_map;
-            const auto &real_vars = outcome->real_vars;
-            if (!real_vars.empty() && real_vars.size() != cand.var_names.size()) {
-                auto checked_var_map = TryBuildVarSupport(cand.var_names, real_vars);
-                if (!checked_var_map.has_value()) {
-                    ++NumSkippedUnsupported;
-                    LLVM_DEBUG(
-                        llvm::dbgs() << "CoBRA: skipping — real_vars not contained in "
-                                        "candidate variable set\n"
-                    );
-                    record_rejection();
-                    continue;
-                }
-                var_map = std::move(*checked_var_map);
+            const auto &real_vars  = outcome->real_vars;
+            const auto &positions  = outcome->real_var_positions;
+            bool identity          = positions.size() == cand.var_names.size();
+            for (uint32_t i = 0; identity && i < positions.size(); ++i) {
+                identity = positions[i] == i;
+            }
+            if (!real_vars.empty() && !identity) {
+                var_map = positions;
             }
 
             // Everything the builder emits lands between `mark` and the root, so
