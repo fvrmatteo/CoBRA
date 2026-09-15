@@ -211,8 +211,27 @@ namespace cobra {
             return { amount, width };
         }
 
+        // A `freeze` over an integer, which is the identity on every value its
+        // operand can actually take. Left as a leaf it does to a tree what a
+        // funnel shift left as a leaf does: everything above it reads an opaque
+        // variable in place of the value below, so an identity written across
+        // it - and an obfuscator has no reason to avoid one - cannot be seen.
+        // Worse, the value below becomes a *second* variable standing for an
+        // expression the one above is a function of, so the tree claims an
+        // independence the program does not have and no rewrite of it can hold.
+        //
+        // Following it costs nothing in the model: the evaluator and the AST
+        // probe leaves over the whole width, so they already describe `freeze`
+        // on a defined operand. What it costs in the IR is a guarantee, and
+        // `CandidateNeedsFrozenLeaves` is where that is paid back.
+        bool IsTransparentFreeze(const llvm::Value *v) {
+            const auto *freeze = llvm::dyn_cast< llvm::FreezeInst >(v);
+            return freeze != nullptr && freeze->getType()->isIntegerTy();
+        }
+
         bool IsMbaInstruction(const llvm::Instruction *inst) {
-            return IsMbaOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr;
+            return IsMbaOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
+                || IsTransparentFreeze(inst);
         }
 
         // `icmp` produces i1, which is useless as a candidate root: it is only
@@ -482,6 +501,13 @@ namespace cobra {
                         // The callee and the amount are not values to follow.
                         work.push({ fsh->getArgOperand(0), true });
                         work.push({ fsh->getArgOperand(1), true });
+                        continue;
+                    }
+                    // A freeze is not an operator, so it neither starts nor
+                    // stops a bitwise reading: the boundary cut has to see the
+                    // same thing through it that it would see without it.
+                    if (IsTransparentFreeze(inst)) {
+                        work.push({ inst->getOperand(0), from_bitwise });
                         continue;
                     }
                     const bool kReadsBitwise = IsBitwiseReaderOpcode(inst->getOpcode());
@@ -834,6 +860,10 @@ namespace cobra {
 
                 if (auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
                     return LowerCompare(*cmp, lower);
+                }
+
+                if (IsTransparentFreeze(inst)) {
+                    return lower(inst->getOperand(0));
                 }
 
                 if (const auto *fsh = FunnelShiftOf(inst)) {
@@ -1212,6 +1242,15 @@ namespace cobra {
                 return mask_to_width(Expr::Mul(std::move(child), Expr::Constant(mul_val)));
             }
 
+            // A freeze is the identity on a defined operand, and the model
+            // only ever hands it defined operands.
+            if (IsTransparentFreeze(inst)) {
+                return BuildExprFromIRImpl(
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
+                    budget
+                );
+            }
+
             // A funnel shift by a constant: the high part shifted up, masked to
             // the width, or'd with the low part shifted down.
             if (const auto *fsh = FunnelShiftOf(inst)) {
@@ -1323,7 +1362,9 @@ namespace cobra {
                 }
 
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
-                if ((inst == nullptr) || !IsMbaOpcode(inst->getOpcode())) {
+                if ((inst == nullptr)
+                    || (!IsMbaOpcode(inst->getOpcode()) && !IsTransparentFreeze(inst)))
+                {
                     return false;
                 }
 
@@ -1649,6 +1690,11 @@ namespace cobra {
                     }
                 }
 
+                const bool spans_freeze =
+                    llvm::any_of(tree_insts, [](const llvm::Instruction *ti) {
+                        return IsTransparentFreeze(ti);
+                    });
+
                 candidates.push_back(
                     MBACandidate{ .root        = &inst,
                                   .leaf_values = std::move(leaves),
@@ -1664,7 +1710,8 @@ namespace cobra {
                                                                         : max_nodes,
                                   .tree_size    = static_cast< uint32_t >(tree_insts.size()),
                                   .boundary_cut  = cut_arith_under_bitwise,
-                                  .demanded_mask = demanded_mask }
+                                  .demanded_mask = demanded_mask,
+                                  .spans_freeze  = spans_freeze }
                 );
             }
         }
