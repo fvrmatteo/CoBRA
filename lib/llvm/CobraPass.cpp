@@ -15,6 +15,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/DemandedBits.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Analysis.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -90,11 +91,50 @@ namespace cobra {
                 if (!analysis_.has_value()) {
                     analysis_.emplace(f_, assumptions_, dominators_);
                 }
-                const llvm::APInt bits = analysis_->getDemandedBits(inst);
-                return bits.getZExtValue() & Bitmask(inst->getType()->getIntegerBitWidth());
+                return Through(inst, 0);
             }
 
             void Invalidate() { analysis_.reset(); }
+
+          private:
+            // What the readers of `inst` look at, following `freeze`.
+            //
+            // LLVM's demanded-bits analysis has no rule for `freeze` and falls
+            // back to giving the operand every bit. That is the safe answer for
+            // a transform that has to preserve the freeze, and the wrong one
+            // for a reader that is asking what the value is *used* for: a
+            // `freeze` is the identity bit for bit, so what its readers look at
+            // is exactly what it looks at. One `freeze` between an expression
+            // and the single bit that reads it is enough to make the expression
+            // look read in full, which is the difference between a rewrite
+            // costed on one bit and one that has to reproduce all sixty-four.
+            uint64_t Through(llvm::Instruction *inst, unsigned depth) {
+                const uint64_t own =
+                    analysis_->getDemandedBits(inst).getZExtValue()
+                    & Bitmask(inst->getType()->getIntegerBitWidth());
+
+                // Only worth asking when the analysis gave up, which for this
+                // shape it does by handing back every bit.
+                if (depth >= kMaxFreezeDepth || inst->use_empty()
+                    || own != Bitmask(inst->getType()->getIntegerBitWidth()))
+                {
+                    return own;
+                }
+
+                uint64_t through = 0;
+                for (llvm::User *user : inst->users()) {
+                    auto *freeze = llvm::dyn_cast< llvm::FreezeInst >(user);
+                    if (freeze == nullptr || freeze->getType() != inst->getType()) {
+                        return own;
+                    }
+                    through |= Through(freeze, depth + 1);
+                }
+                return through & own;
+            }
+
+            // A chain of freezes over one value is degenerate; this only has to
+            // be deep enough that the ordinary one or two do not hit it.
+            static constexpr unsigned kMaxFreezeDepth = 8;
 
           private:
             llvm::Function &f_;
@@ -872,7 +912,32 @@ namespace cobra {
             const auto kMark    = kAtFront ? block->end() : std::prev(cand.root->getIterator());
 
             llvm::IRBuilder<> builder(cand.root);
-            auto *new_val = ReconstructIr(*outcome->expr, cand, builder, var_map);
+
+            // A tree collected through a `freeze` is rewritten without it: the
+            // replacement reads the leaves directly. The `freeze` was what made
+            // the root defined when the value under it was not, so dropping it
+            // would let poison reach a reader that used to be safe from it -
+            // the one direction a rewrite may not take.
+            //
+            // Freezing the leaves restores it at the other end. Reconstruction
+            // emits no poison-generating flag of its own, so a replacement built
+            // from defined leaves is defined for every input, and a defined
+            // value refines whatever the original produced. Leaves already known
+            // not to be poison are left alone, which is most of them - a load
+            // carrying `!noundef`, an argument declared `noundef` - so this
+            // usually costs nothing at all.
+            std::vector< llvm::Value * > frozen_leaves;
+            if (cand.spans_freeze) {
+                frozen_leaves = cand.leaf_values;
+                for (auto *&leaf : frozen_leaves) {
+                    if (!llvm::isGuaranteedNotToBePoison(leaf)) {
+                        leaf = builder.CreateFreeze(leaf, "cobra.freeze");
+                    }
+                }
+            }
+
+            auto *new_val =
+                ReconstructIr(*outcome->expr, cand, builder, var_map, frozen_leaves);
 
             llvm::SmallVector< llvm::Instruction *, 16 > emitted;
             for (auto it = kAtFront ? block->begin() : std::next(kMark); &*it != cand.root;
