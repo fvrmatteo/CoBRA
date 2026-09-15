@@ -90,6 +90,13 @@ namespace cobra {
         // The bits of the root its readers look at, as a mask over `bitwidth`.
         // A rewrite has to agree with the tree on these alone.
         uint64_t demanded_mask = UINT64_MAX;
+
+        // Whether the collected tree holds a `freeze`. A rewrite reads the
+        // leaves directly, so it no longer has the `freeze` between them and
+        // the root, and a leaf that can be poison would reach a reader that the
+        // original had made defined. Restoring that is `leaf_override`'s job at
+        // reconstruction time; this is the flag that says it is owed.
+        bool spans_freeze = false;
     };
 
     // The `node_limit` a boundary cut carries: past any re-cut ladder, so the
