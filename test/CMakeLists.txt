@@ -420,6 +420,13 @@ target_include_directories(bench_signature_pipeline PRIVATE
 target_compile_definitions(bench_signature_pipeline PRIVATE
     DATASET_DIR="${PROJECT_SOURCE_DIR}/test/datasets")
 
+# Prints Simplify()'s result for every dataset expression, for diffing two
+# builds or two settings (see the file). Not part of the suite.
+add_executable(diff_simplify EXCLUDE_FROM_ALL bench/diff_simplify.cpp
+               ${PROJECT_SOURCE_DIR}/tools/cobra-cli/ExprParser.cpp)
+target_link_libraries(diff_simplify PRIVATE cobra-core)
+target_include_directories(diff_simplify PRIVATE ${PROJECT_SOURCE_DIR}/tools/cobra-cli)
+
 # LLVM pass FileCheck tests (only when pass is built)
 if(COBRA_BUILD_LLVM_PASS)
     add_subdirectory(llvm)

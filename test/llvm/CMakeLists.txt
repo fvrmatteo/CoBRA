@@ -30,3 +30,22 @@ foreach(LL_FILE ${LL_TEST_FILES})
     get_filename_component(LL_NAME "${LL_FILE}" NAME)
     cobra_add_ll_test("${LL_NAME}")
 endforeach()
+
+# The demanded bits the pass answers from a value's readers have to be the ones
+# LLVM's whole-function analysis gives. Every file here is run with each
+# question answered both ways (`COBRA_DEMANDED_CHECK`), and a disagreement - or
+# the pass failing - fails the test.
+function(cobra_add_demanded_check_test TEST_FILE)
+    get_filename_component(TEST_NAME "${TEST_FILE}" NAME_WE)
+    set(FULL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/${TEST_FILE}")
+    add_test(
+        NAME "LLVMPass.demanded_check.${TEST_NAME}"
+        COMMAND sh -c "out=$(COBRA_DEMANDED_CHECK=1 ${OPT_BIN} -load-pass-plugin=$<TARGET_FILE:CobraPass> -passes=cobra-simplify -disable-output '${FULL_PATH}' 2>&1) || { echo \"$out\"; exit 1; }; if echo \"$out\" | grep COBRA_DEMANDED_CHECK: ; then exit 1; fi"
+    )
+    set_tests_properties("LLVMPass.demanded_check.${TEST_NAME}" PROPERTIES LABELS "llvm")
+endfunction()
+
+foreach(LL_FILE ${LL_TEST_FILES})
+    get_filename_component(LL_NAME "${LL_FILE}" NAME)
+    cobra_add_demanded_check_test("${LL_NAME}")
+endforeach()

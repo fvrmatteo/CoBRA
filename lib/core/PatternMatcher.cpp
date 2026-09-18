@@ -10,8 +10,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1609,22 +1612,171 @@ namespace cobra {
         return result;
     }
 
+    namespace {
+
+        // The rewrite of a subtree depends on nothing but the subtree and the
+        // width: every check it makes probes with inputs seeded from the width
+        // alone. And the trees this is handed are an operand graph spelled out
+        // as a tree - a value the IR computes once and reads four times appears
+        // four times - so the same subtree is simplified over and over, each
+        // time with its own support scan, signature and full-width check.
+        //
+        // Each distinct subtree is therefore given an id, bottom-up from the
+        // ids of its children, and its rewrite is kept under that id. Ids are
+        // assigned by exact comparison of a node's kind, constant, variable and
+        // children's ids, so two subtrees share one exactly when they are the
+        // same tree. `COBRA_PATTERN_MEMO=0` turns this off.
+        struct SubtreeShape
+        {
+            Expr::Kind kind;
+            uint64_t constant_val;
+            uint32_t var_index;
+            uint32_t bitwidth;
+            std::vector< uint32_t > children;
+
+            bool operator==(const SubtreeShape &other) const = default;
+        };
+
+        struct SubtreeShapeHash
+        {
+            size_t operator()(const SubtreeShape &shape) const {
+                uint64_t hash = 0x9E3779B97F4A7C15ULL ^ static_cast< uint64_t >(shape.kind);
+                const auto mix = [&hash](uint64_t value) {
+                    hash ^= value + 0x9E3779B97F4A7C15ULL + (hash << 6) + (hash >> 2);
+                };
+                mix(shape.constant_val);
+                mix(shape.var_index);
+                mix(shape.bitwidth);
+                for (uint32_t child : shape.children) { mix(child); }
+                return static_cast< size_t >(hash);
+            }
+        };
+
+        class SubtreeMemo
+        {
+          public:
+            using Ids = std::unordered_map< const Expr *, uint32_t >;
+
+            static bool Enabled() {
+                static const bool enabled = [] {
+                    const char *choice = std::getenv("COBRA_PATTERN_MEMO");
+                    return choice == nullptr || std::string_view(choice) != "0";
+                }();
+                return enabled;
+            }
+
+            // The id of `expr`, recording the id of every node under it.
+            uint32_t Intern(const Expr &expr, uint32_t bitwidth, Ids &ids) {
+                SubtreeShape shape{ expr.kind, expr.constant_val, expr.var_index, bitwidth, {} };
+                shape.children.reserve(expr.children.size());
+                for (const auto &child : expr.children) {
+                    shape.children.push_back(Intern(*child, bitwidth, ids));
+                }
+                auto [it, inserted] =
+                    shapes_.try_emplace(std::move(shape), static_cast< uint32_t >(results_.size()));
+                if (inserted) { results_.emplace_back(); }
+                ids[&expr] = it->second;
+                return it->second;
+            }
+
+            const Expr *Find(uint32_t id) const { return results_[id].get(); }
+
+            void Record(uint32_t id, const Expr &result) {
+                results_[id] = CloneExpr(result);
+                stored_nodes_ += CountNodes(result);
+            }
+
+            // Called only between top-level calls, when no id is in use.
+            void TrimIfLarge() {
+                if (stored_nodes_ + shapes_.size() > kMaxNodes) {
+                    shapes_.clear();
+                    results_.clear();
+                    stored_nodes_ = 0;
+                }
+            }
+
+            unsigned depth = 0;
+
+          private:
+            static size_t CountNodes(const Expr &expr) {
+                size_t count = 1;
+                for (const auto &child : expr.children) { count += CountNodes(*child); }
+                return count;
+            }
+
+            // A bound on what the memo holds, in tree nodes: a few tens of
+            // megabytes.
+            static constexpr size_t kMaxNodes = size_t{ 1 } << 19;
+
+            std::unordered_map< SubtreeShape, uint32_t, SubtreeShapeHash > shapes_;
+            std::vector< std::unique_ptr< Expr > > results_;
+            size_t stored_nodes_ = 0;
+        };
+
+        SubtreeMemo &PatternMemo() {
+            static thread_local SubtreeMemo memo;
+            return memo;
+        }
+
+        std::unique_ptr< Expr > SimplifyPatternSubtreesUncached(
+            std::unique_ptr< Expr > expr, uint32_t bitwidth
+        ) {
+            for (auto &child : expr->children) {
+                child = SimplifyPatternSubtreesUncached(std::move(child), bitwidth);
+            }
+
+            auto rewritten = TrySimplifyPatternSubtree(*expr, bitwidth);
+            if (rewritten.has_value()) {
+                return SimplifyPatternSubtreesUncached(std::move(*rewritten), bitwidth);
+            }
+
+            auto recovered = TryRecoverInclusionExclusion(*expr, bitwidth);
+            if (recovered.has_value()) {
+                return SimplifyPatternSubtreesUncached(std::move(*recovered), bitwidth);
+            }
+            return expr;
+        }
+
+        std::unique_ptr< Expr > SimplifyPatternSubtreesMemo(
+            std::unique_ptr< Expr > expr, uint32_t bitwidth, SubtreeMemo &memo,
+            const SubtreeMemo::Ids &ids
+        ) {
+            const uint32_t id = ids.at(expr.get());
+            if (const Expr *known = memo.Find(id)) { return CloneExpr(*known); }
+
+            for (auto &child : expr->children) {
+                child = SimplifyPatternSubtreesMemo(std::move(child), bitwidth, memo, ids);
+            }
+
+            std::unique_ptr< Expr > result;
+            if (auto rewritten = TrySimplifyPatternSubtree(*expr, bitwidth); rewritten.has_value()) {
+                result = SimplifyPatternSubtrees(std::move(*rewritten), bitwidth);
+            } else if (auto recovered = TryRecoverInclusionExclusion(*expr, bitwidth);
+                       recovered.has_value())
+            {
+                result = SimplifyPatternSubtrees(std::move(*recovered), bitwidth);
+            } else {
+                result = std::move(expr);
+            }
+            memo.Record(id, *result);
+            return result;
+        }
+
+    } // namespace
+
     std::unique_ptr< Expr >
     SimplifyPatternSubtrees(std::unique_ptr< Expr > expr, uint32_t bitwidth) {
-        for (auto &child : expr->children) {
-            child = SimplifyPatternSubtrees(std::move(child), bitwidth);
+        if (!SubtreeMemo::Enabled()) {
+            return SimplifyPatternSubtreesUncached(std::move(expr), bitwidth);
         }
-
-        auto rewritten = TrySimplifyPatternSubtree(*expr, bitwidth);
-        if (rewritten.has_value()) {
-            return SimplifyPatternSubtrees(std::move(*rewritten), bitwidth);
-        }
-
-        auto recovered = TryRecoverInclusionExclusion(*expr, bitwidth);
-        if (recovered.has_value()) {
-            return SimplifyPatternSubtrees(std::move(*recovered), bitwidth);
-        }
-        return expr;
+        auto &memo = PatternMemo();
+        if (memo.depth == 0) { memo.TrimIfLarge(); }
+        ++memo.depth;
+        SubtreeMemo::Ids ids;
+        memo.Intern(*expr, bitwidth, ids);
+        auto result = SimplifyPatternSubtreesMemo(std::move(expr), bitwidth, memo, ids);
+        --memo.depth;
+        return result;
     }
 
     std::unique_ptr< Expr > SimplifyXorChains(std::unique_ptr< Expr > expr, uint32_t bitwidth) {

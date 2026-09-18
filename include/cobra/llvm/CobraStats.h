@@ -91,6 +91,9 @@ namespace cobra {
         uint64_t rejected_cost     = 0; // one was, and it was not cheaper
         uint64_t rejected_budget   = 0; // the rebuilt IR was not cheaper
         uint64_t rejected_cached   = 0; // an earlier run had already rejected it
+        // A rewrite that fits the budget and then failed verification. The
+        // proof runs after the budget check, so these are the only refutations.
+        uint64_t rejected_unverified = 0;
 
         uint64_t solved_nanoseconds   = 0;
         uint64_t rejected_nanoseconds = 0;
@@ -103,6 +106,66 @@ namespace cobra {
         uint64_t reaching_pointer_offset        = 0;
         uint64_t solved_reaching_pointer_offset = 0;
         uint64_t pointer_offset_nanoseconds     = 0;
+
+        // Where a solve's time goes, for the candidates actually solved rather
+        // than served from the cache: the search for a rewrite, then the two
+        // ways of proving one.
+        uint64_t search_nanoseconds         = 0;
+        uint64_t search_found               = 0; // the search proposed a rewrite
+        uint64_t search_found_nanoseconds   = 0;
+        uint64_t enumeration_nanoseconds    = 0;
+        uint64_t solver_calls               = 0;
+        uint64_t solver_nanoseconds         = 0;
+        uint64_t solver_proved_nanoseconds  = 0;
+        uint64_t solver_refuted_nanoseconds = 0;
+        uint64_t solver_unknown_nanoseconds = 0;
+
+        // A rewrite that was found, and then lost to the instruction budget
+        // when it was built into the IR: the search bought nothing. Counted
+        // apart for fresh solves and for cache hits.
+        uint64_t proved_over_budget             = 0;
+        uint64_t proved_over_budget_nanoseconds = 0;
+        uint64_t cached_over_budget             = 0;
+
+        // Solves of a candidate the outcome cache had held once and dropped
+        // when it filled up.
+        uint64_t resolved_after_eviction             = 0;
+        uint64_t resolved_after_eviction_nanoseconds = 0;
+
+        // The demanded-bits analysis: how often it was computed over the whole
+        // function, and what the questions put to it cost, computing included.
+        uint64_t demanded_builds      = 0;
+        uint64_t demanded_nanoseconds = 0;
+        // Instructions whose demanded bits were settled from their readers
+        // instead; of those, the ones settled by a fixpoint over a cycle of
+        // readers, the cycles, and the cycles too large to settle that way.
+        uint64_t demanded_local_settled  = 0;
+        uint64_t demanded_local_regions  = 0;
+        uint64_t demanded_local_nodes    = 0;
+        uint64_t demanded_local_declined = 0;
+        // With `COBRA_DEMANDED_CHECK`: answers compared against the
+        // whole-function analysis, and how many of them differed.
+        uint64_t demanded_check_compared   = 0;
+        uint64_t demanded_check_mismatches = 0;
+
+        // Solving ahead of the loop on worker threads: candidates handed over,
+        // solved (with the workers' time), left unproved because the rewrite
+        // could not fit, answers the loop took and the time it waited for
+        // them, tasks it withdrew and solved itself, and the time spent at the
+        // end of each run waiting for workers to finish.
+        uint64_t background_submitted         = 0;
+        uint64_t background_solved            = 0;
+        uint64_t background_proofs_skipped    = 0;
+        uint64_t background_settled           = 0;
+        uint64_t background_withdrawn         = 0;
+        uint64_t background_wait_nanoseconds  = 0;
+        uint64_t background_drain_nanoseconds = 0;
+        uint64_t background_nanoseconds       = 0;
+
+        // The ladder, by the kind of second look.
+        uint64_t boundary_nanoseconds = 0;
+        uint64_t recut_nanoseconds    = 0;
+        uint64_t inner_nanoseconds    = 0;
 
         CandidateClass by_consumer[static_cast< unsigned >(CandidateConsumer::kCount)];
         CandidateClass by_origin[static_cast< unsigned >(CandidateOrigin::kCount)];

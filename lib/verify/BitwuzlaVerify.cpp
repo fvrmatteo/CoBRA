@@ -220,7 +220,7 @@ namespace cobra {
 
         auto key =
             CoeffQueryKey(cob_coeffs, simplified, var_names, num_vars, bitwidth, settings);
-        if (const auto *cached = Cache().Find(key)) {
+        if (const auto cached = Cache().Find(key)) {
             return *cached;
         }
 
@@ -244,7 +244,7 @@ namespace cobra {
         using namespace verify_detail;
 
         auto key = ExprQueryKey(original, simplified, var_names, bitwidth, settings);
-        if (const auto *cached = Cache().Find(key)) {
+        if (const auto cached = Cache().Find(key)) {
             return *cached;
         }
 

@@ -6,6 +6,7 @@ set(cobra_llvm_sources
     CobraPass.cpp
     MBADetector.cpp
     IRReconstructor.cpp
+    LocalDemandedBits.cpp
 )
 
 set(cobra_llvm_compile_definitions)

@@ -10,6 +10,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -92,15 +94,25 @@ namespace cobra::verify_detail {
     // key spans both trees, the width, and the settings that decide how an
     // UNKNOWN is reported, so a hit is the same question and not merely a
     // similar one.
+    //
+    // Callers may ask from several threads at once (CoBRA's LLVM pass solves
+    // queued candidates on worker threads), so the table is locked and hands
+    // answers out by value: a reference into it would not survive another
+    // thread's insertion clearing it.
     class QueryCache
     {
       public:
-        const Z3VerifyResult *Find(const std::string &key) const {
+        std::optional< Z3VerifyResult > Find(const std::string &key) const {
+            const std::lock_guard< std::mutex > lock(mutex_);
             const auto kEntry = entries_.find(key);
-            return kEntry == entries_.end() ? nullptr : &kEntry->second;
+            if (kEntry == entries_.end()) {
+                return std::nullopt;
+            }
+            return kEntry->second;
         }
 
-        const Z3VerifyResult &Insert(std::string key, const Z3VerifyResult &result) {
+        Z3VerifyResult Insert(std::string key, const Z3VerifyResult &result) {
+            const std::lock_guard< std::mutex > lock(mutex_);
             // Bounded because a run keeps producing new expressions; dropping
             // the table costs re-solving, not correctness.
             if (entries_.size() >= kMaxEntries) {
@@ -111,6 +123,7 @@ namespace cobra::verify_detail {
 
       private:
         static constexpr size_t kMaxEntries = size_t{ 1 } << 16;
+        mutable std::mutex mutex_;
         std::unordered_map< std::string, Z3VerifyResult > entries_;
     };
 
