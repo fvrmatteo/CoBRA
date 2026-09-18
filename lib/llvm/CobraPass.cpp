@@ -1,5 +1,6 @@
 #include "cobra/llvm/CobraPass.h"
 #include "IRReconstructor.h"
+#include "LocalDemandedBits.h"
 #include "MBADetector.h"
 #include "cobra/llvm/CobraStats.h"
 #include "cobra/core/BitWidth.h"
@@ -15,6 +16,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -34,6 +36,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstdint>
@@ -42,7 +45,13 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#include <pthread.h>
 #include <utility>
 #include <vector>
 
@@ -59,7 +68,7 @@ namespace cobra {
     namespace {
 
         // What solving a candidate produced: either a replacement expression
-        // that cleared every verification and cost gate, or nothing.
+        // that cleared the cost gate, or nothing.
         struct CandidateOutcome
         {
             std::unique_ptr< Expr > expr;
@@ -79,20 +88,41 @@ namespace cobra {
             // is what the cache hands back: every rewrite it serves later stands
             // on the same unknown answer, and is counted as such.
             bool accepted_unknown = false;
+            // Whether the rewrite has been through verification and passed it.
+            // A rewrite is verified only once a candidate has shown it fits the
+            // instruction budget: that check needs the rewrite built into the IR,
+            // the proof does not need the IR at all, and the two are
+            // independent - so a rewrite the budget turns down never has to be
+            // proved, and one that fits is proved exactly as before. Until then
+            // the cache holds it unverified, and the next candidate with the
+            // same key that fits the budget pays for the proof.
+            bool verified = false;
         };
 
-        // Which bits of a value its readers look at, from LLVM's demanded-bits
-        // analysis. A rewrite only has to agree with the tree on those, and
+        // Which bits of a value its readers look at, as LLVM's demanded-bits
+        // analysis says. A rewrite only has to agree with the tree on those, and
         // for a shift over a sum that is the difference between a semilinear
-        // reading and none. The analysis covers the whole function and goes
-        // stale the moment a rewrite lands - the new tree reads its leaves
-        // through different operators than the old one did - so it is dropped
-        // after every one and rebuilt on the next question.
+        // reading and none. The answer goes stale the moment a rewrite lands -
+        // the new tree reads its leaves through different operators than the
+        // old one did - so everything known is dropped after every one.
+        //
+        // The whole-function analysis is what it used to be rebuilt from, and
+        // that rebuild was more than a quarter of the pass: a walk over every
+        // instruction per rewrite. The question is almost always about a value
+        // with a few readers, so it is answered over those readers instead
+        // (`LocalDemandedBits`), and the whole-function analysis is kept for a
+        // value whose readers reach much of the function.
+        //
+        // `COBRA_DEMANDED=global` answers everything from the whole-function
+        // analysis, as before; `COBRA_DEMANDED_CHECK=1` answers every question
+        // both ways and counts the ones where they disagree.
         class DemandedBitsOracle
         {
           public:
-            explicit DemandedBitsOracle(llvm::Function &f)
-                : f_(f), assumptions_(f), dominators_(f) {}
+            DemandedBitsOracle(llvm::Function &f, CobraStatistics &stats)
+                : f_(f), stats_(stats), assumptions_(f), dominators_(f),
+                  local_(assumptions_, dominators_, kMaxLocalRegion),
+                  function_size_(f.getInstructionCount()) {}
 
             uint64_t MaskOf(llvm::Instruction *inst) {
                 if (inst == nullptr || !inst->getType()->isIntegerTy()
@@ -100,15 +130,99 @@ namespace cobra {
                 {
                     return UINT64_MAX;
                 }
-                if (!analysis_.has_value()) {
-                    analysis_.emplace(f_, assumptions_, dominators_);
-                }
-                return Through(inst, 0);
+                const auto begin    = std::chrono::steady_clock::now();
+                const auto before   = Counters();
+                const uint64_t mask = Through(inst, 0);
+                const auto after    = Counters();
+                stats_.demanded_local_settled += after[0] - before[0];
+                stats_.demanded_local_regions += after[1] - before[1];
+                stats_.demanded_local_nodes += after[2] - before[2];
+                stats_.demanded_local_declined += after[3] - before[3];
+                stats_.demanded_nanoseconds += static_cast< uint64_t >(
+                    std::chrono::duration_cast< std::chrono::nanoseconds >(
+                        std::chrono::steady_clock::now() - begin
+                    )
+                        .count()
+                );
+                return mask;
             }
 
-            void Invalidate() { analysis_.reset(); }
+            void Invalidate() {
+                analysis_.reset();
+                local_.Invalidate();
+            }
 
           private:
+            enum class Mode : uint8_t { kLocal, kGlobal, kCheck };
+
+            static Mode Configured() {
+                static const Mode mode = [] {
+                    if (const char *check = std::getenv("COBRA_DEMANDED_CHECK");
+                        check != nullptr && *check != '\0' && *check != '0')
+                    {
+                        return Mode::kCheck;
+                    }
+                    const char *choice = std::getenv("COBRA_DEMANDED");
+                    return choice != nullptr && std::string_view(choice) == "global"
+                        ? Mode::kGlobal
+                        : Mode::kLocal;
+                }();
+                return mode;
+            }
+
+            std::array< uint64_t, 4 > Counters() const {
+                return { local_.settled, local_.regions, local_.region_nodes, local_.declined };
+            }
+
+            // `DemandedBits::getDemandedBits(inst)` over the function as it is.
+            //
+            // Answered from the readers while that is cheap. Once the questions
+            // since the last rewrite have visited as many instructions as the
+            // function holds - which the detection sweep, asking about every
+            // root, does - one whole-function build answers the rest of them
+            // for less.
+            llvm::APInt Demanded(llvm::Instruction *inst) {
+                const Mode mode = Configured();
+                const bool local_is_cheaper =
+                    !analysis_.has_value() && local_.work_this_epoch < function_size_;
+                if (mode == Mode::kCheck || (mode == Mode::kLocal && local_is_cheaper)) {
+                    if (auto local = local_.Get(inst)) {
+                        if (mode == Mode::kCheck) {
+                            const llvm::APInt global = Global(inst);
+                            if (global != *local) {
+                                ++stats_.demanded_check_mismatches;
+                                ReportMismatch(inst, *local, global);
+                            }
+                            ++stats_.demanded_check_compared;
+                        }
+                        return *local;
+                    }
+                }
+                return Global(inst);
+            }
+
+            llvm::APInt Global(llvm::Instruction *inst) {
+                if (!analysis_.has_value()) {
+                    analysis_.emplace(f_, assumptions_, dominators_);
+                    ++stats_.demanded_builds;
+                }
+                return analysis_->getDemandedBits(inst);
+            }
+
+            void ReportMismatch(
+                llvm::Instruction *inst, const llvm::APInt &local, const llvm::APInt &global
+            ) {
+                static unsigned printed = 0;
+                if (printed >= 20) {
+                    return;
+                }
+                ++printed;
+                llvm::errs() << "COBRA_DEMANDED_CHECK: " << f_.getName() << ": local 0x"
+                             << llvm::utohexstr(local.getZExtValue()) << ", global 0x"
+                             << llvm::utohexstr(global.getZExtValue()) << " for" << *inst
+                             << "\n";
+            }
+
             // What the readers of `inst` look at, following `freeze`.
             //
             // LLVM's demanded-bits analysis has no rule for `freeze` and falls
@@ -121,8 +235,7 @@ namespace cobra {
             // look read in full, which is the difference between a rewrite
             // costed on one bit and one that has to reproduce all sixty-four.
             uint64_t Through(llvm::Instruction *inst, unsigned depth) {
-                const uint64_t own =
-                    analysis_->getDemandedBits(inst).getZExtValue()
+                const uint64_t own = Demanded(inst).getZExtValue()
                     & Bitmask(inst->getType()->getIntegerBitWidth());
 
                 // Only worth asking when the analysis gave up, which for this
@@ -148,10 +261,21 @@ namespace cobra {
             // be deep enough that the ordinary one or two do not hit it.
             static constexpr unsigned kMaxFreezeDepth = 8;
 
+            // How many readers, transitively, a value may have before the
+            // question is put to the whole-function analysis instead. A region
+            // costs about what the whole-function analysis costs on that many
+            // instructions, so past a few thousand the local answer stops
+            // paying, and one whole-function build answers every question
+            // until the next rewrite.
+            static constexpr size_t kMaxLocalRegion = 4096;
+
           private:
             llvm::Function &f_;
+            CobraStatistics &stats_;
             llvm::AssumptionCache assumptions_;
             llvm::DominatorTree dominators_;
+            LocalDemandedBits local_;
+            uint64_t function_size_;
             std::optional< llvm::DemandedBits > analysis_;
         };
 
@@ -344,9 +468,10 @@ namespace cobra {
             CobraStatistics totals;
         };
 
+        // Never destroyed: worker threads report into it (see `Speculation`).
         StatisticsState &Stats() {
-            static StatisticsState state;
-            return state;
+            static auto *state = new StatisticsState;
+            return *state;
         }
 
         // The verification ledger of `CobraStats.h`. Separate from the report's
@@ -358,8 +483,8 @@ namespace cobra {
         };
 
         VerificationState &VerificationLedger() {
-            static VerificationState state;
-            return state;
+            static auto *state = new VerificationState;
+            return *state;
         }
 
         template< typename Update > void CountVerification(Update &&update) {
@@ -376,10 +501,15 @@ namespace cobra {
 
         // A run accumulates into its own copy and merges once, so nothing on
         // the hot path touches shared state.
+        void Accumulate(CobraStatistics &into, const CobraStatistics &run);
+
         void MergeStatistics(const CobraStatistics &run) {
             auto &state = Stats();
             const std::lock_guard< std::mutex > lock(state.mutex);
-            auto &into = state.totals;
+            Accumulate(state.totals, run);
+        }
+
+        void Accumulate(CobraStatistics &into, const CobraStatistics &run) {
             into.runs += run.runs;
             into.nanoseconds += run.nanoseconds;
             into.detect_nanoseconds += run.detect_nanoseconds;
@@ -395,12 +525,46 @@ namespace cobra {
             into.rejected_cost += run.rejected_cost;
             into.rejected_budget += run.rejected_budget;
             into.rejected_cached += run.rejected_cached;
+            into.rejected_unverified += run.rejected_unverified;
             into.solved_nanoseconds += run.solved_nanoseconds;
             into.rejected_nanoseconds += run.rejected_nanoseconds;
             into.cache_nanoseconds += run.cache_nanoseconds;
             into.reaching_pointer_offset += run.reaching_pointer_offset;
             into.solved_reaching_pointer_offset += run.solved_reaching_pointer_offset;
             into.pointer_offset_nanoseconds += run.pointer_offset_nanoseconds;
+            into.search_nanoseconds += run.search_nanoseconds;
+            into.search_found += run.search_found;
+            into.search_found_nanoseconds += run.search_found_nanoseconds;
+            into.enumeration_nanoseconds += run.enumeration_nanoseconds;
+            into.solver_calls += run.solver_calls;
+            into.solver_nanoseconds += run.solver_nanoseconds;
+            into.solver_proved_nanoseconds += run.solver_proved_nanoseconds;
+            into.solver_refuted_nanoseconds += run.solver_refuted_nanoseconds;
+            into.solver_unknown_nanoseconds += run.solver_unknown_nanoseconds;
+            into.proved_over_budget += run.proved_over_budget;
+            into.proved_over_budget_nanoseconds += run.proved_over_budget_nanoseconds;
+            into.cached_over_budget += run.cached_over_budget;
+            into.resolved_after_eviction += run.resolved_after_eviction;
+            into.resolved_after_eviction_nanoseconds += run.resolved_after_eviction_nanoseconds;
+            into.demanded_builds += run.demanded_builds;
+            into.demanded_nanoseconds += run.demanded_nanoseconds;
+            into.demanded_local_settled += run.demanded_local_settled;
+            into.demanded_local_regions += run.demanded_local_regions;
+            into.demanded_local_nodes += run.demanded_local_nodes;
+            into.demanded_local_declined += run.demanded_local_declined;
+            into.demanded_check_compared += run.demanded_check_compared;
+            into.demanded_check_mismatches += run.demanded_check_mismatches;
+            into.boundary_nanoseconds += run.boundary_nanoseconds;
+            into.recut_nanoseconds += run.recut_nanoseconds;
+            into.inner_nanoseconds += run.inner_nanoseconds;
+            into.background_submitted += run.background_submitted;
+            into.background_solved += run.background_solved;
+            into.background_proofs_skipped += run.background_proofs_skipped;
+            into.background_settled += run.background_settled;
+            into.background_withdrawn += run.background_withdrawn;
+            into.background_wait_nanoseconds += run.background_wait_nanoseconds;
+            into.background_drain_nanoseconds += run.background_drain_nanoseconds;
+            into.background_nanoseconds += run.background_nanoseconds;
             for (unsigned index = 0;
                  index < static_cast< unsigned >(CandidateConsumer::kCount); ++index)
             {
@@ -465,6 +629,7 @@ namespace cobra {
                 }
                 out.enabled   = true;
                 out.directory = directory;
+                llvm::sys::fs::create_directories(out.directory + "/verify", true);
                 if (const char *threshold = std::getenv("COBRA_SLOW_MS")) {
                     out.threshold_ms = std::strtoull(threshold, nullptr, 10);
                 }
@@ -747,34 +912,73 @@ namespace cobra {
 
             std::optional< Entry > Find(const std::string &key) const {
                 const std::lock_guard< std::mutex > lock(mutex_);
-                auto it = entries_.find(key);
-                if (it == entries_.end()) {
-                    return std::nullopt;
+                if (auto it = young_.find(key); it != young_.end()) {
+                    return it->second;
                 }
-                return it->second;
+                if (auto it = old_.find(key); it != old_.end()) {
+                    return it->second;
+                }
+                return std::nullopt;
             }
 
             Entry Insert(const std::string &key, Entry entry) {
                 const std::lock_guard< std::mutex > lock(mutex_);
-                if (entries_.size() >= kMaxEntries) {
-                    entries_.clear();
+                if (young_.size() >= Generation()) {
+                    // `COBRA_OUTCOME_CACHE=legacy`: one generation of 8192,
+                    // cleared when it fills, as the cache used to be.
+                    old_ = Legacy() ? decltype(old_){} : std::move(young_);
+                    young_.clear();
                 }
-                entries_.insert_or_assign(key, entry);
+                young_.insert_or_assign(key, entry);
+                // Report-only bookkeeping; bounded like the entries themselves.
+                if (ever_inserted_.size() >= kMaxTracked) {
+                    ever_inserted_.clear();
+                }
+                ever_inserted_.insert(std::hash< std::string >{}(key));
                 return entry;
             }
 
+            // Whether `key` was inserted once and has since been dropped. Only
+            // the report asks, to say what the size limit costs in re-solves.
+            bool WasEvicted(const std::string &key) const {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                return !young_.contains(key) && !old_.contains(key)
+                    && ever_inserted_.contains(std::hash< std::string >{}(key));
+            }
+
           private:
-            // Bound the footprint on very large modules; the working set for a
-            // single function is orders of magnitude smaller than this.
-            static constexpr size_t kMaxEntries = 8192;
+            // Bound the footprint on very large modules. The cache is two
+            // generations: when the young one fills up it becomes the old one
+            // and the previous old one is dropped, so an entry survives at
+            // least one whole generation after it was written. Clearing
+            // everything at once, as the cache used to, dropped the entries
+            // the pass was about to ask for together with the stale ones - over
+            // a VM exploration a third of every solve was a candidate solved
+            // before and forgotten. An entry is a key of a few hundred bytes
+            // and a small expression, so this is tens of megabytes at most.
+            static constexpr size_t kGeneration = 32768;
+            static constexpr size_t kMaxTracked = size_t{ 1 } << 20;
+
+            static bool Legacy() {
+                static const bool legacy = [] {
+                    const char *choice = std::getenv("COBRA_OUTCOME_CACHE");
+                    return choice != nullptr && std::string_view(choice) == "legacy";
+                }();
+                return legacy;
+            }
+
+            static size_t Generation() { return Legacy() ? 8192 : kGeneration; }
 
             mutable std::mutex mutex_;
-            std::unordered_map< std::string, Entry > entries_;
+            std::unordered_map< std::string, Entry > young_;
+            std::unordered_map< std::string, Entry > old_;
+            std::unordered_set< size_t > ever_inserted_;
         };
 
+        // Never destroyed: worker threads write to it (see `Speculation`).
         OutcomeCache &SharedOutcomeCache() {
-            static OutcomeCache cache;
-            return cache;
+            static auto *cache = new OutcomeCache;
+            return *cache;
         }
 
         // Fingerprints recorded in the IR outlive the pass instance that wrote
@@ -904,11 +1108,21 @@ namespace cobra {
             return true;
         }
 
-        // Run the full solve-and-verify pipeline for one candidate. Returns
-        // null when any gate rejects it.
-        OutcomeCache::Entry SolveCandidate(
-            const MBACandidate &cand, const CobraPassOptions &options, SolveVerdict &verdict
+        // Search for a rewrite of one candidate and put it through the cost
+        // gate. Returns null when either rejects it, and otherwise a rewrite that
+        // still has to be verified (`VerifyCandidate`).
+        OutcomeCache::Entry ProposeRewrite(
+            const MBACandidate &cand, const CobraPassOptions &options, SolveVerdict &verdict,
+            CobraStatistics &stats
         ) {
+            const auto since = [](std::chrono::steady_clock::time_point begin) {
+                return static_cast< uint64_t >(
+                    std::chrono::duration_cast< std::chrono::nanoseconds >(
+                        std::chrono::steady_clock::now() - begin
+                    )
+                        .count()
+                );
+            };
             verdict = SolveVerdict::kUnsolved;
             Options opts{ .bitwidth         = cand.bitwidth,
                           .max_vars         = options.max_vars,
@@ -937,7 +1151,14 @@ namespace cobra {
                 return nullptr;
             }
 
-            auto result = Simplify(cand.sig, cand.var_names, ast, opts);
+            const auto search_begin = std::chrono::steady_clock::now();
+            auto result             = Simplify(cand.sig, cand.var_names, ast, opts);
+            const uint64_t searching = since(search_begin);
+            stats.search_nanoseconds += searching;
+            if (result.has_value() && result.value().kind == SimplifyOutcome::Kind::kSimplified) {
+                ++stats.search_found;
+                stats.search_found_nanoseconds += searching;
+            }
             if (!result.has_value()) {
                 ++NumSkippedUnsupported;
                 LLVM_DEBUG(
@@ -994,6 +1215,36 @@ namespace cobra {
                 positions = std::move(*support);
             }
 
+            verdict = SolveVerdict::kSolved;
+            return std::make_shared< const CandidateOutcome >(CandidateOutcome{
+                .expr               = std::move(result.value().expr),
+                .real_vars          = std::move(result.value().real_vars),
+                .real_var_positions = std::move(positions),
+                .accepted_unknown   = false,
+                .verified           = false });
+        }
+
+        // Prove `proposal` equal to the tree of `cand` on the bits its readers
+        // look at. `cand` need not be the candidate the rewrite was found for:
+        // any candidate with the same key has the same tree, width, demanded
+        // bits and variable count, which is everything the proof reads, and the
+        // rewrite names its variables by position. Returns the rewrite marked
+        // verified, or null when the proof fails or cannot be had.
+        OutcomeCache::Entry VerifyCandidate(
+            const MBACandidate &cand, const CandidateOutcome &proposal,
+            const CobraPassOptions &options, CobraStatistics &stats, bool *unknown = nullptr
+        ) {
+            const auto since = [](std::chrono::steady_clock::time_point begin) {
+                return static_cast< uint64_t >(
+                    std::chrono::duration_cast< std::chrono::nanoseconds >(
+                        std::chrono::steady_clock::now() - begin
+                    )
+                        .count()
+                );
+            };
+            const Expr *ast       = cand.expr.get();
+            const auto &positions = proposal.real_var_positions;
+
             // Proved outright where the inputs can be walked, on the bits the
             // rewrite was found for. This runs whether or not a solver is asked
             // for: a rewrite it refutes is wrong either way, and one it proves
@@ -1001,7 +1252,7 @@ namespace cobra {
             bool proved           = false;
             bool accepted_unknown = false;
             if (ast != nullptr) {
-                auto rewritten = CloneExpr(*result.value().expr);
+                auto rewritten = CloneExpr(*proposal.expr);
                 if (!positions.empty()) {
                     RemapVarIndices(*rewritten, positions);
                 }
@@ -1012,10 +1263,12 @@ namespace cobra {
                     rewritten =
                         Expr::BitwiseAnd(std::move(rewritten), Expr::Constant(cand.demanded_mask));
                 }
-                const auto decided = DecideByEnumeration(
+                const auto enumeration_begin = std::chrono::steady_clock::now();
+                const auto decided           = DecideByEnumeration(
                     *original, *rewritten, static_cast< uint32_t >(cand.var_names.size()),
                     cand.bitwidth
                 );
+                stats.enumeration_nanoseconds += since(enumeration_begin);
                 if (decided.has_value()) {
                     CountVerification([&](VerificationCounters &counters) {
                         ++(*decided ? counters.proved_by_enumeration
@@ -1044,7 +1297,7 @@ namespace cobra {
                     return nullptr;
                 }
 
-                auto z3_expr = CloneExpr(*result.value().expr);
+                auto z3_expr = CloneExpr(*proposal.expr);
                 if (!positions.empty()) {
                     RemapVarIndices(*z3_expr, positions);
                 }
@@ -1058,9 +1311,16 @@ namespace cobra {
                     z3_expr =
                         Expr::BitwiseAnd(std::move(z3_expr), Expr::Constant(cand.demanded_mask));
                 }
-                auto z3_result = Z3VerifyExprs(
+                const auto solver_begin = std::chrono::steady_clock::now();
+                auto z3_result          = Z3VerifyExprs(
                     *proved_ast, *z3_expr, cand.var_names, cand.bitwidth, options.z3_settings
                 );
+                const uint64_t solving = since(solver_begin);
+                ++stats.solver_calls;
+                stats.solver_nanoseconds += solving;
+                (z3_result.unknown        ? stats.solver_unknown_nanoseconds
+                 : z3_result.equivalent ? stats.solver_proved_nanoseconds
+                                        : stats.solver_refuted_nanoseconds) += solving;
 
                 // A solver that ran out of time has proved nothing. A host may
                 // still choose to take its silence for a yes, and for a tree of
@@ -1088,6 +1348,9 @@ namespace cobra {
                     }
                 });
                 accepted_unknown = z3_result.unknown && z3_result.equivalent;
+                if (unknown != nullptr) {
+                    *unknown = z3_result.unknown;
+                }
                 if (declined_comparison) {
                     ++NumSkippedUnsupported;
                     LLVM_DEBUG(
@@ -1116,13 +1379,304 @@ namespace cobra {
             }
 #endif
 
-            verdict = SolveVerdict::kSolved;
             return std::make_shared< const CandidateOutcome >(CandidateOutcome{
-                .expr               = std::move(result.value().expr),
-                .real_vars          = std::move(result.value().real_vars),
-                .real_var_positions = std::move(positions),
-                .accepted_unknown   = accepted_unknown });
+                .expr               = CloneExpr(*proposal.expr),
+                .real_vars          = proposal.real_vars,
+                .real_var_positions = proposal.real_var_positions,
+                .accepted_unknown   = accepted_unknown,
+                .verified           = true });
         }
+
+        // `COBRA_VERIFY_BEFORE_BUDGET=1`: prove every rewrite as soon as it is
+        // found, as the pass used to, whether or not it fits the budget.
+        bool VerifyBeforeBudget() {
+            static const bool verify_first = [] {
+                const char *choice = std::getenv("COBRA_VERIFY_BEFORE_BUDGET");
+                return choice != nullptr && *choice != '\0' && *choice != '0';
+            }();
+            return verify_first;
+        }
+
+        // How many instructions `ReconstructIr` emits for `expr` at the least.
+        // It builds one per operator that reads a variable - an operator over
+        // constants alone is folded by the builder - plus the extension of
+        // every comparison and a cast for every use of a leaf held at another
+        // width; freezing leaves can only add to that. So a rewrite whose count
+        // reaches the candidate's budget is one the loop will turn down, and
+        // proving it ahead of the loop would be wasted.
+        uint32_t MinimumInstructions(
+            const Expr &expr, const std::vector< uint32_t > &positions,
+            const std::vector< bool > &leaf_needs_cast, bool &reads_variable
+        ) {
+            if (expr.kind == Expr::Kind::kVariable) {
+                reads_variable      = true;
+                const uint32_t leaf = positions.empty() ? expr.var_index
+                                                        : positions[expr.var_index];
+                return leaf < leaf_needs_cast.size() && leaf_needs_cast[leaf] ? 1 : 0;
+            }
+            reads_variable = false;
+            uint32_t count = 0;
+            for (const auto &child : expr.children) {
+                bool child_reads = false;
+                count += MinimumInstructions(*child, positions, leaf_needs_cast, child_reads);
+                reads_variable = reads_variable || child_reads;
+            }
+            if (expr.children.empty() || !reads_variable) {
+                return count;
+            }
+            const bool comparison = expr.kind == Expr::Kind::kCmpEq
+                || expr.kind == Expr::Kind::kCmpUlt || expr.kind == Expr::Kind::kCmpSlt;
+            return count + (comparison ? 2 : 1);
+        }
+
+        // ---- solving ahead of the loop ------------------------------------
+        //
+        // What a candidate's search and proof produce depends on nothing but
+        // the candidate as it was collected - its tree, signature, width,
+        // demanded bits and variable count, which is what the outcome cache
+        // keys it on - and on the options. Only building a rewrite into the IR
+        // and committing it has to follow the loop's order, because each
+        // rewrite changes what the next one is built into. So candidates are
+        // solved on worker threads as soon as they are queued, in the order the
+        // loop will reach them, and each answer goes into the outcome cache
+        // under the candidate's key: the answer the loop would have computed
+        // itself, so the loop commits the same rewrites it always did.
+        //
+        // A worker proves a rewrite before anyone knows whether it fits the
+        // instruction budget, which the loop only learns by building it. A
+        // rewrite that plainly cannot fit is left unproved, as the loop leaves
+        // it; one that might is proved, and a wasted proof costs a worker's
+        // time instead of the loop's.
+        //
+        // The one answer that depends on more than the candidate is a proof the
+        // solver could not finish within its budget. A worker has the same
+        // budget and a core of its own, so its "unknown" is taken as the loop's
+        // would have been; `COBRA_BACKGROUND_UNKNOWN=retry` leaves such a
+        // rewrite unproved instead, and the loop tries the proof itself.
+        //
+        // `COBRA_THREADS` sets the number of workers; 0 solves everything in
+        // the loop, as the pass used to.
+        class Speculation
+        {
+          public:
+            static Speculation &Instance() {
+                // Never destroyed: see `Drain`.
+                static auto *instance = new Speculation(ThreadCount());
+                return *instance;
+            }
+
+            bool Enabled() const { return !workers_.empty(); }
+
+            // False when `key` is being solved already.
+            bool Submit(
+                const std::string &key, const MBACandidate &cand, const CobraPassOptions &options,
+                uint32_t budget
+            ) {
+                auto task      = std::make_shared< Task >();
+                task->key      = key;
+                task->options  = options;
+                task->budget   = budget;
+                // Only what the search and the proof read: no IR. The evaluator
+                // is copied, which is what makes it safe to run on another
+                // thread (see the contract in Evaluator.h).
+                task->input.root          = nullptr;
+                task->input.var_names     = cand.var_names;
+                task->input.sig           = cand.sig;
+                task->input.bitwidth      = cand.bitwidth;
+                task->input.expr          = cand.expr ? CloneExpr(*cand.expr) : nullptr;
+                task->input.evaluator     = cand.evaluator;
+                task->input.demanded_mask = cand.demanded_mask;
+                task->leaf_needs_cast.reserve(cand.leaf_values.size());
+                for (const auto *leaf : cand.leaf_values) {
+                    task->leaf_needs_cast.push_back(
+                        !leaf->getType()->isIntegerTy(cand.bitwidth)
+                    );
+                }
+                const std::lock_guard< std::mutex > lock(mutex_);
+                if (!by_key_.try_emplace(key, task).second) {
+                    return false;
+                }
+                queue_.push_back(std::move(task));
+                work_.notify_one();
+                return true;
+            }
+
+            // Called by the loop on reaching `key`. A worker still on it is
+            // waited for; a task no worker has started is withdrawn and the
+            // loop solves it itself. True when a worker's answer is in the
+            // outcome cache.
+            bool Settle(const std::string &key, CobraStatistics &stats) {
+                std::unique_lock< std::mutex > lock(mutex_);
+                auto found = by_key_.find(key);
+                if (found == by_key_.end()) {
+                    return false;
+                }
+                auto task = found->second;
+                by_key_.erase(found);
+                if (task->state == Task::kPending) {
+                    task->state = Task::kWithdrawn;
+                    ++stats.background_withdrawn;
+                    return false;
+                }
+                if (task->state == Task::kRunning) {
+                    const auto begin = std::chrono::steady_clock::now();
+                    done_.wait(lock, [&] { return task->state == Task::kDone; });
+                    stats.background_wait_nanoseconds += Since(begin);
+                }
+                ++stats.background_settled;
+                return true;
+            }
+
+            // Withdraws everything not started and waits for what is running,
+            // so that no work outlives the run that queued it and no worker is
+            // ever busy when the process exits.
+            void Drain(CobraStatistics &stats) {
+                std::unique_lock< std::mutex > lock(mutex_);
+                for (auto &task : queue_) {
+                    if (task->state == Task::kPending) {
+                        task->state = Task::kWithdrawn;
+                    }
+                }
+                queue_.clear();
+                by_key_.clear();
+                const auto begin = std::chrono::steady_clock::now();
+                done_.wait(lock, [&] { return running_ == 0; });
+                stats.background_drain_nanoseconds += Since(begin);
+            }
+
+          private:
+            struct Task
+            {
+                enum State : uint8_t { kPending, kRunning, kDone, kWithdrawn };
+
+                std::string key;
+                MBACandidate input{};
+                CobraPassOptions options;
+                uint32_t budget = 0;
+                std::vector< bool > leaf_needs_cast;
+                State state     = kPending;
+            };
+
+            static uint64_t Since(std::chrono::steady_clock::time_point begin) {
+                return static_cast< uint64_t >(
+                    std::chrono::duration_cast< std::chrono::nanoseconds >(
+                        std::chrono::steady_clock::now() - begin
+                    )
+                        .count()
+                );
+            }
+
+            static unsigned ThreadCount() {
+                if (const char *count = std::getenv("COBRA_THREADS")) {
+                    return static_cast< unsigned >(std::strtoul(count, nullptr, 10));
+                }
+                const unsigned hardware = std::thread::hardware_concurrency();
+                return hardware > 2 ? std::min(4U, hardware - 2) : 0U;
+            }
+
+            static bool RetryUnknown() {
+                static const bool retry = [] {
+                    const char *choice = std::getenv("COBRA_BACKGROUND_UNKNOWN");
+                    return choice != nullptr && std::string_view(choice) == "retry";
+                }();
+                return retry;
+            }
+
+            explicit Speculation(unsigned threads) {
+                for (unsigned index = 0; index < threads; ++index) {
+                    // The search and the proof recurse over trees of up to a
+                    // few thousand nodes, as they do on the loop's thread; a
+                    // secondary thread's default stack is a fraction of that.
+                    pthread_attr_t attributes;
+                    pthread_attr_init(&attributes);
+                    pthread_attr_setstacksize(&attributes, kStackBytes);
+                    pthread_t thread;
+                    if (pthread_create(&thread, &attributes, &Speculation::Work, this) == 0) {
+                        pthread_detach(thread);
+                        workers_.push_back(thread);
+                    }
+                    pthread_attr_destroy(&attributes);
+                }
+            }
+
+            static void *Work(void *self) {
+                static_cast< Speculation * >(self)->Loop();
+                return nullptr;
+            }
+
+            void Loop() {
+                for (;;) {
+                    std::shared_ptr< Task > task;
+                    {
+                        std::unique_lock< std::mutex > lock(mutex_);
+                        work_.wait(lock, [&] { return !queue_.empty(); });
+                        task = std::move(queue_.front());
+                        queue_.pop_front();
+                        if (task->state != Task::kPending) {
+                            continue;
+                        }
+                        task->state = Task::kRunning;
+                        ++running_;
+                    }
+                    // A failure is the loop's to meet, where it would have met
+                    // it without the workers: nothing is recorded for the key,
+                    // and the loop solves the candidate itself.
+                    try {
+                        Solve(*task);
+                    } catch (...) {
+                    }
+                    {
+                        const std::lock_guard< std::mutex > lock(mutex_);
+                        task->state = Task::kDone;
+                        --running_;
+                    }
+                    done_.notify_all();
+                }
+            }
+
+            static void Solve(Task &task) {
+                const auto begin = std::chrono::steady_clock::now();
+                CobraStatistics stats;
+                auto verdict  = SolveVerdict::kUnsolved;
+                auto proposal = ProposeRewrite(task.input, task.options, verdict, stats);
+                OutcomeCache::Entry entry = proposal;
+                if (proposal != nullptr) {
+                    bool reads_variable = false;
+                    if (VerifyBeforeBudget()
+                        || MinimumInstructions(
+                               *proposal->expr, proposal->real_var_positions,
+                               task.leaf_needs_cast, reads_variable
+                           ) < task.budget)
+                    {
+                        bool unknown  = false;
+                        auto verified = VerifyCandidate(
+                            task.input, *proposal, task.options, stats, &unknown
+                        );
+                        if (verified != nullptr) {
+                            entry = std::move(verified);
+                        } else if (!(unknown && RetryUnknown())) {
+                            entry = nullptr;
+                        }
+                    } else {
+                        ++stats.background_proofs_skipped;
+                    }
+                }
+                SharedOutcomeCache().Insert(task.key, std::move(entry));
+                ++stats.background_solved;
+                stats.background_nanoseconds += Since(begin);
+                MergeStatistics(stats);
+            }
+
+            static constexpr size_t kStackBytes = size_t{ 64 } << 20;
+
+            std::mutex mutex_;
+            std::condition_variable work_;
+            std::condition_variable done_;
+            std::deque< std::shared_ptr< Task > > queue_;
+            std::unordered_map< std::string, std::shared_ptr< Task > > by_key_;
+            std::vector< pthread_t > workers_;
+            unsigned running_ = 0;
+        };
 
     } // namespace
 
@@ -1148,7 +1702,7 @@ namespace cobra {
 
         const uint64_t options_tag = OptionsTag(options_);
 
-        DemandedBitsOracle demanded_bits(f);
+        DemandedBitsOracle demanded_bits(f, stats);
         const DemandedMaskFn demanded = [&](llvm::Instruction *inst) {
             return demanded_bits.MaskOf(inst);
         };
@@ -1168,6 +1722,25 @@ namespace cobra {
         NumCandidates += candidates.size();
 
         auto &cache = SharedOutcomeCache();
+
+        // Every queued candidate's key, parallel to `candidates`, and the
+        // candidates handed to the workers as they are queued (`Speculation`).
+        auto &speculation = Speculation::Instance();
+        std::vector< std::string > keys;
+        const auto queue_key = [&](const MBACandidate &queued) {
+            keys.push_back(CandidateKey(queued, options_));
+            if (speculation.Enabled() && !cache.Find(keys.back()).has_value()) {
+                const uint32_t budget = options_.cost_model == MbaCostModel::kTreeInstructions
+                    ? queued.tree_size
+                    : queued.dying_count;
+                if (speculation.Submit(keys.back(), queued, options_, budget)) {
+                    ++stats.background_submitted;
+                }
+            }
+        };
+        for (const auto &detected : candidates) {
+            queue_key(detected);
+        }
 
         // Rejected candidates put their inner roots back on the queue, so an
         // expression stays reachable even when the tree enclosing it is not
@@ -1222,10 +1795,14 @@ namespace cobra {
                     cand, options_.min_ast_size, options_.max_vars, options_tag,
                     options_.cost_model, options_.max_tree_nodes, demanded
                 );
+                stats.boundary_nanoseconds += since(retry_begin);
+                const auto recut_begin = std::chrono::steady_clock::now();
                 auto recuts = RecutMbaCandidate(
                     cand, options_.min_ast_size, options_.max_vars, options_.max_recut_nodes,
                     options_.max_recut_vars, options_tag, options_.cost_model, demanded
                 );
+                stats.recut_nanoseconds += since(recut_begin);
+                const auto inner_begin = std::chrono::steady_clock::now();
 
                 // Only a full collection speaks for what the tree holds. A
                 // re-cut is another view of the same root, not a different set
@@ -1245,8 +1822,10 @@ namespace cobra {
                     fresh, options_.min_ast_size, options_.max_vars, options_tag,
                     options_.cost_model, options_.max_tree_nodes, demanded
                 );
+                stats.inner_nanoseconds += since(inner_begin);
                 for (auto &cut : boundary) {
                     if (attempted.insert({ cut.root, cut.node_limit }).second) {
+                        queue_key(cut);
                         candidates.push_back(std::move(cut));
                         origins.push_back(CandidateOrigin::kBoundaryCut);
                         ++stats.requeued;
@@ -1254,6 +1833,7 @@ namespace cobra {
                 }
                 for (auto &recut : recuts) {
                     if (attempted.insert({ recut.root, recut.node_limit }).second) {
+                        queue_key(recut);
                         candidates.push_back(std::move(recut));
                         origins.push_back(CandidateOrigin::kRecut);
                         ++stats.requeued;
@@ -1261,6 +1841,7 @@ namespace cobra {
                 }
                 for (auto &inner : inners) {
                     if (attempted.insert({ inner.root, inner.node_limit }).second) {
+                        queue_key(inner);
                         candidates.push_back(std::move(inner));
                         origins.push_back(CandidateOrigin::kInnerRoot);
                         ++stats.requeued;
@@ -1306,18 +1887,34 @@ namespace cobra {
                 }
             };
 
-            const std::string key = CandidateKey(cand, options_);
+            // A copy: queuing more candidates below can move `keys`.
+            const std::string key = keys[index];
 
             OutcomeCache::Entry outcome;
             bool served_from_cache = false;
             auto verdict           = SolveVerdict::kUnsolved;
             const auto solve_begin = std::chrono::steady_clock::now();
+            if (speculation.Enabled()) {
+                speculation.Settle(key, stats);
+            }
             if (auto cached = cache.Find(key)) {
                 ++NumOutcomeCacheHits;
                 outcome           = std::move(*cached);
                 served_from_cache = true;
             } else {
-                outcome = cache.Insert(key, SolveCandidate(cand, options_, verdict));
+                const bool evicted = cache.WasEvicted(key);
+                auto proposal = ProposeRewrite(cand, options_, verdict, stats);
+                if (VerifyBeforeBudget() && proposal != nullptr) {
+                    proposal = VerifyCandidate(cand, *proposal, options_, stats);
+                    if (proposal == nullptr) {
+                        verdict = SolveVerdict::kUnsolved;
+                    }
+                }
+                outcome = cache.Insert(key, std::move(proposal));
+                if (evicted) {
+                    ++stats.resolved_after_eviction;
+                    stats.resolved_after_eviction_nanoseconds += since(solve_begin);
+                }
             }
             spent = since(solve_begin);
             stats.solve_nanoseconds += spent;
@@ -1437,12 +2034,15 @@ namespace cobra {
             const uint32_t budget = options_.cost_model == MbaCostModel::kTreeInstructions
                 ? cand.tree_size
                 : cand.dying_count;
-            if (emitted.size() >= budget) {
+            const auto discard_rewrite = [&] {
                 for (auto *dead : llvm::reverse(emitted)) {
                     if (dead->use_empty()) {
                         dead->eraseFromParent();
                     }
                 }
+            };
+            if (emitted.size() >= budget) {
+                discard_rewrite();
                 ++NumSkippedCost;
                 LLVM_DEBUG(
                     llvm::dbgs() << "CoBRA: skipping — rewrite emits " << emitted.size()
@@ -1453,14 +2053,59 @@ namespace cobra {
                 stats.rejected_nanoseconds += rebuilding;
                 spent += rebuilding;
                 ++stats.rejected_budget;
+                if (served_from_cache) {
+                    ++stats.cached_over_budget;
+                } else {
+                    ++stats.proved_over_budget;
+                    stats.proved_over_budget_nanoseconds += spent;
+                }
                 account(false);
                 record_rejection();
                 requeue_retries();
                 continue;
             }
 
+            // The rewrite fits, so it is worth proving now - once per key: the
+            // verified rewrite replaces the proposal in the cache, and a failed
+            // proof replaces it with the rejection it would always have been.
+            uint64_t verifying = 0;
+            if (!outcome->verified) {
+                const auto verify_begin  = std::chrono::steady_clock::now();
+                const uint64_t unknown_before = stats.solver_unknown_nanoseconds;
+                auto verified            = VerifyCandidate(cand, *outcome, options_, stats);
+                cache.Insert(key, verified);
+                verifying = since(verify_begin);
+                spent += verifying;
+                stats.solve_nanoseconds += verifying;
+                if (SlowReport().enabled && verifying / 1000000 >= SlowReport().threshold_ms) {
+                    static uint64_t verify_sequence = 0;
+                    const char *verdict = verified != nullptr ? "verified"
+                        : stats.solver_unknown_nanoseconds != unknown_before
+                        ? "verification unknown"
+                        : "verification refuted";
+                    RecordCandidate(
+                        SlowReport().directory + "/verify", verify_sequence, f, cand, outcome.get(),
+                        verifying / 1000000, verdict
+                    );
+                }
+                if (verified == nullptr) {
+                    discard_rewrite();
+                    const uint64_t rebuilding = since(rebuild_begin) - verifying;
+                    stats.rebuild_nanoseconds += rebuilding;
+                    stats.rejected_nanoseconds += rebuilding + verifying;
+                    spent += rebuilding;
+                    ++stats.rejected_unverified;
+                    account(false);
+                    record_rejection();
+                    requeue_retries();
+                    continue;
+                }
+                stats.solved_nanoseconds += verifying;
+                outcome = std::move(verified);
+            }
+
             {
-                const uint64_t rebuilding = since(rebuild_begin);
+                const uint64_t rebuilding = since(rebuild_begin) - verifying;
                 stats.rebuild_nanoseconds += rebuilding;
                 stats.solved_nanoseconds += rebuilding;
                 spent += rebuilding;
@@ -1522,6 +2167,10 @@ namespace cobra {
                     }
                 }
             }
+        }
+
+        if (speculation.Enabled()) {
+            speculation.Drain(stats);
         }
 
         stats.nanoseconds = since(run_begin);
@@ -1641,16 +2290,55 @@ namespace cobra {
         line("candidates solved", stats.solved, stats.solved_nanoseconds);
         line("candidates rejected",
              stats.rejected_unsolved + stats.rejected_cost + stats.rejected_budget
-                 + stats.rejected_cached,
+                 + stats.rejected_unverified + stats.rejected_cached,
              stats.rejected_nanoseconds);
         part("  no simplification found", stats.rejected_unsolved);
         part("  simplification not cheaper", stats.rejected_cost);
         part("  rebuilt IR over budget", stats.rejected_budget);
+        part("  fits the budget, not verified", stats.rejected_unverified);
         part("  rejected by an earlier run", stats.rejected_cached);
         line("served from the outcome cache", stats.cache_hits, stats.cache_nanoseconds);
         cost("finding the candidates", stats.detect_nanoseconds);
         cost("  re-cutting and descending", stats.ladder_nanoseconds);
         cost("rebuilding the IR", stats.rebuild_nanoseconds);
+
+        out << "  where the time goes (solved, not cached):\n";
+        line("  searching for a rewrite", stats.search_found, stats.search_nanoseconds);
+        cost("    of which the searches that found one", stats.search_found_nanoseconds);
+        cost("  proving by running every input", stats.enumeration_nanoseconds);
+        line("  proving with the solver", stats.solver_calls, stats.solver_nanoseconds);
+        cost("    proved", stats.solver_proved_nanoseconds);
+        cost("    refuted", stats.solver_refuted_nanoseconds);
+        cost("    unknown", stats.solver_unknown_nanoseconds);
+        line("  found, then over the IR budget", stats.proved_over_budget,
+             stats.proved_over_budget_nanoseconds);
+        part("  cached rewrite over the IR budget", stats.cached_over_budget);
+        line("  re-solved after a cache eviction", stats.resolved_after_eviction,
+             stats.resolved_after_eviction_nanoseconds);
+        line("  demanded bits (builds, queries)", stats.demanded_builds,
+             stats.demanded_nanoseconds);
+        part("    instructions settled from readers", stats.demanded_local_settled);
+        part("    of which by a fixpoint over a cycle", stats.demanded_local_nodes);
+        part("    cycles settled that way", stats.demanded_local_regions);
+        part("    cycles too large, whole function", stats.demanded_local_declined);
+        if (stats.demanded_check_compared != 0) {
+            part("    checked against the whole function", stats.demanded_check_compared);
+            part("      disagreements", stats.demanded_check_mismatches);
+        }
+        if (stats.background_submitted != 0) {
+            out << "  solved ahead of the loop, on worker threads:\n";
+            part("  candidates handed to the workers", stats.background_submitted);
+            line("  solved by a worker (worker time)", stats.background_solved,
+                 stats.background_nanoseconds);
+            part("    left unproved, plainly over budget", stats.background_proofs_skipped);
+            line("  answers the loop waited for", stats.background_settled,
+                 stats.background_wait_nanoseconds);
+            part("  withdrawn, solved by the loop", stats.background_withdrawn);
+            cost("  waiting for workers at run end", stats.background_drain_nanoseconds);
+        }
+        cost("  ladder: boundary cuts", stats.boundary_nanoseconds);
+        cost("  ladder: re-cuts", stats.recut_nanoseconds);
+        cost("  ladder: inner roots", stats.inner_nanoseconds);
 
         table("by where the candidate came from", "origin", stats.by_origin,
               static_cast< unsigned >(CandidateOrigin::kCount), [](unsigned index) {
