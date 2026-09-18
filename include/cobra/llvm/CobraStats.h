@@ -126,4 +126,38 @@ namespace cobra {
     // The report, as a table. Prints nothing when the pass never ran.
     void PrintStatistics(llvm::raw_ostream &out);
 
+    // What stood behind the rewrites the pass made, kept whether or not the
+    // report above is on: these are a handful of increments, and the one that
+    // matters is not a cost but a liability. A solver that runs out of time
+    // answers "unknown", and a host can ask for that to be taken as a yes
+    // (`Z3UnknownResultMode::kTreatAsEquivalent`). Every rewrite accepted that
+    // way is a rewrite nothing proved, and a run has to be able to say how many
+    // of those it is standing on.
+    //
+    // All but the last count solves, so a candidate served again from the
+    // outcome cache is not counted again. `rewrites_on_unknown` counts what
+    // reached the IR: each rewrite emitted whose only justification was an
+    // unknown answer, cache hits included.
+    struct VerificationCounters
+    {
+        // Settled by running both sides over every input: a proof, or a
+        // counterexample, with no solver involved.
+        uint64_t proved_by_enumeration  = 0;
+        uint64_t refuted_by_enumeration = 0;
+        uint64_t proved_by_solver       = 0;
+        uint64_t refuted_by_solver      = 0;
+        // The solver answered unknown and the mode took that for equivalence;
+        // `unknown_accepted_timeouts` is how many of them were its time limit.
+        uint64_t unknown_accepted          = 0;
+        uint64_t unknown_accepted_timeouts = 0;
+        // The solver answered unknown and the candidate was declined: the mode
+        // said so, or the tree holds a comparison, where no probe vouches for
+        // the rewrite and the mode is therefore not asked.
+        uint64_t unknown_declined    = 0;
+        uint64_t rewrites_on_unknown = 0;
+    };
+
+    VerificationCounters Verification();
+    void ResetVerification();
+
 } // namespace cobra
