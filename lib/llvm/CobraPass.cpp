@@ -1,6 +1,7 @@
 #include "cobra/llvm/CobraPass.h"
 #include "IRReconstructor.h"
 #include "MBADetector.h"
+#include "cobra/llvm/CobraStats.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/ExprCost.h"
 #include "cobra/core/ExprUtils.h"
@@ -24,8 +25,11 @@
 #include "llvm/Support/Debug.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <chrono>
@@ -229,6 +233,162 @@ namespace cobra {
             return out;
         }
 
+        // ---- what the time was spent on -----------------------------------
+        //
+        // The pass is handed every MBA root a function holds, and it cannot see
+        // from a root whether simplifying it is worth anything: the tree that
+        // decides an address and the tree that feeds a dead flag word look the
+        // same from below. Classifying each candidate by what reads it, and
+        // adding the time up per class, is what turns "CoBRA is the slowest
+        // pass" into a statement about which of its work pays.
+
+        constexpr uint32_t ConsumerBit(CandidateConsumer consumer) {
+            return 1U << static_cast< unsigned >(consumer);
+        }
+
+        // How many readers the classification may look at. It has to cost a
+        // fraction of a solve, not be exact about a value a hundred
+        // instructions read; the class of a value is decided by the first
+        // reader that says what it is for, and that is almost always close.
+        constexpr unsigned kMaxConsumerVisits = 96;
+
+        // The classes the value under `root` reaches, as a bitmask.
+        uint32_t ConsumerMask(const llvm::Instruction *root) {
+            if (root->use_empty()) {
+                return ConsumerBit(CandidateConsumer::kUnused);
+            }
+
+            uint32_t mask = 0;
+            unsigned visits = 0;
+            llvm::DenseSet< const llvm::Value * > seen;
+            llvm::SmallVector< const llvm::Value *, 16 > work{ root };
+            while (!work.empty() && visits < kMaxConsumerVisits) {
+                const llvm::Value *value = work.pop_back_val();
+                for (const llvm::User *user : value->users()) {
+                    if (++visits >= kMaxConsumerVisits) {
+                        break;
+                    }
+                    if (const auto *store = llvm::dyn_cast< llvm::StoreInst >(user)) {
+                        mask |= ConsumerBit(
+                            store->getValueOperand() == value ? CandidateConsumer::kStoredValue
+                                                              : CandidateConsumer::kPointerOffset
+                        );
+                        continue;
+                    }
+                    // A load reads it as an address; a GEP and an `inttoptr`
+                    // build one out of it, which is the `base + index * scale +
+                    // displacement` an address simplification is meant to own.
+                    if (llvm::isa< llvm::LoadInst >(user)
+                        || llvm::isa< llvm::GetElementPtrInst >(user)
+                        || llvm::isa< llvm::IntToPtrInst >(user))
+                    {
+                        mask |= ConsumerBit(CandidateConsumer::kPointerOffset);
+                        continue;
+                    }
+                    if (llvm::isa< llvm::ICmpInst >(user)) {
+                        mask |= ConsumerBit(CandidateConsumer::kCompared);
+                        continue;
+                    }
+                    if (llvm::isa< llvm::ReturnInst >(user)) {
+                        mask |= ConsumerBit(CandidateConsumer::kReturned);
+                        continue;
+                    }
+                    if (llvm::isa< llvm::CallBase >(user)) {
+                        mask |= ConsumerBit(CandidateConsumer::kCallArgument);
+                        continue;
+                    }
+                    if (llvm::isa< llvm::CastInst >(user) || llvm::isa< llvm::PHINode >(user)
+                        || llvm::isa< llvm::BinaryOperator >(user)
+                        || llvm::isa< llvm::SelectInst >(user)
+                        || llvm::isa< llvm::FreezeInst >(user))
+                    {
+                        if (seen.insert(user).second) {
+                            work.push_back(user);
+                        }
+                        continue;
+                    }
+                    mask |= ConsumerBit(CandidateConsumer::kOther);
+                }
+            }
+            return mask != 0 ? mask : ConsumerBit(CandidateConsumer::kOther);
+        }
+
+        // The class a candidate is counted under when it reaches several, most
+        // valuable first.
+        CandidateConsumer PrimaryConsumer(uint32_t mask) {
+            for (const auto consumer :
+                 { CandidateConsumer::kPointerOffset, CandidateConsumer::kCompared,
+                   CandidateConsumer::kStoredValue, CandidateConsumer::kCallArgument,
+                   CandidateConsumer::kReturned, CandidateConsumer::kOther,
+                   CandidateConsumer::kUnused })
+            {
+                if ((mask & ConsumerBit(consumer)) != 0) {
+                    return consumer;
+                }
+            }
+            return CandidateConsumer::kOther;
+        }
+
+        struct StatisticsState
+        {
+            std::mutex mutex;
+            bool enabled = false;
+            CobraStatistics totals;
+        };
+
+        StatisticsState &Stats() {
+            static StatisticsState state;
+            return state;
+        }
+
+        void Merge(CandidateClass &into, const CandidateClass &from) {
+            into.candidates += from.candidates;
+            into.solved += from.solved;
+            into.nanoseconds += from.nanoseconds;
+        }
+
+        // A run accumulates into its own copy and merges once, so nothing on
+        // the hot path touches shared state.
+        void MergeStatistics(const CobraStatistics &run) {
+            auto &state = Stats();
+            const std::lock_guard< std::mutex > lock(state.mutex);
+            auto &into = state.totals;
+            into.runs += run.runs;
+            into.nanoseconds += run.nanoseconds;
+            into.detect_nanoseconds += run.detect_nanoseconds;
+            into.ladder_nanoseconds += run.ladder_nanoseconds;
+            into.solve_nanoseconds += run.solve_nanoseconds;
+            into.rebuild_nanoseconds += run.rebuild_nanoseconds;
+            into.detected += run.detected;
+            into.requeued += run.requeued;
+            into.dead_roots += run.dead_roots;
+            into.cache_hits += run.cache_hits;
+            into.solved += run.solved;
+            into.rejected_unsolved += run.rejected_unsolved;
+            into.rejected_cost += run.rejected_cost;
+            into.rejected_budget += run.rejected_budget;
+            into.rejected_cached += run.rejected_cached;
+            into.solved_nanoseconds += run.solved_nanoseconds;
+            into.rejected_nanoseconds += run.rejected_nanoseconds;
+            into.cache_nanoseconds += run.cache_nanoseconds;
+            into.reaching_pointer_offset += run.reaching_pointer_offset;
+            into.solved_reaching_pointer_offset += run.solved_reaching_pointer_offset;
+            into.pointer_offset_nanoseconds += run.pointer_offset_nanoseconds;
+            for (unsigned index = 0;
+                 index < static_cast< unsigned >(CandidateConsumer::kCount); ++index)
+            {
+                Merge(into.by_consumer[index], run.by_consumer[index]);
+            }
+            for (unsigned index = 0; index < static_cast< unsigned >(CandidateOrigin::kCount);
+                 ++index)
+            {
+                Merge(into.by_origin[index], run.by_origin[index]);
+            }
+            for (unsigned index = 0; index <= CobraStatistics::kMaxVariableRow; ++index) {
+                Merge(into.by_variables[index], run.by_variables[index]);
+            }
+        }
+
         // ---- where the time goes ------------------------------------------
         //
         // A single `CobraPass::run` on an obfuscated partial CFG has been
@@ -250,11 +410,28 @@ namespace cobra {
             // Record a candidate holding at least this many variables whatever
             // it cost. Zero leaves the cost as the only trigger.
             uint32_t variable_floor = 0;
+
+            // With `COBRA_ADDRESS_REPORT` set to a directory, every rewrite of
+            // an expression that reaches an address is written there too.
+            // Counting them says how much of the pass's time goes into
+            // addresses; it does not say what they look like, and that is what
+            // a cheaper pass dedicated to addresses has to be built against.
+            std::string addresses;
+            uint64_t address_cap = 200;
         };
 
         const SlowCandidateReport &SlowReport() {
             static const SlowCandidateReport report = [] {
                 SlowCandidateReport out;
+                if (const char *where = std::getenv("COBRA_ADDRESS_REPORT")) {
+                    if (*where != '\0') {
+                        out.addresses = where;
+                        llvm::sys::fs::create_directories(out.addresses, true);
+                        if (const char *cap = std::getenv("COBRA_ADDRESS_CAP")) {
+                            out.address_cap = std::strtoull(cap, nullptr, 10);
+                        }
+                    }
+                }
                 const char *directory = std::getenv("COBRA_SLOW_REPORT");
                 if (directory == nullptr || *directory == '\0') {
                     return out;
@@ -414,29 +591,28 @@ namespace cobra {
             return path;
         }
 
-        void RecordSlowCandidate(
-            const llvm::Function &f, const MBACandidate &cand, const CandidateOutcome *outcome,
-            uint64_t milliseconds, const char *verdict
+        void RecordCandidate(
+            const std::string &directory, uint64_t &sequence, const llvm::Function &f,
+            const MBACandidate &cand, const CandidateOutcome *outcome, uint64_t milliseconds,
+            const char *verdict
         ) {
-            const auto &report = SlowReport();
             const std::lock_guard< std::mutex > lock(SlowReportMutex());
-            static uint64_t sequence = 0;
-            const uint64_t index     = ++sequence;
+            const uint64_t index = ++sequence;
 
             std::string note;
             const std::string module_path = WriteCandidateModule(
-                cand, report.directory + "/cobra-slow-" + std::to_string(index) + ".ll", note
+                cand, directory + "/cobra-slow-" + std::to_string(index) + ".ll", note
             );
 
             std::error_code code;
             llvm::raw_fd_ostream log(
-                report.directory + "/cobra-slow.log", code, llvm::sys::fs::CD_OpenAlways,
+                directory + "/cobra-slow.log", code, llvm::sys::fs::CD_OpenAlways,
                 llvm::sys::fs::FA_Write, llvm::sys::fs::OF_Append | llvm::sys::fs::OF_Text
             );
             if (code) {
                 return;
             }
-            log << "## slow candidate " << index << "\n";
+            log << "## candidate " << index << "\n";
             log << "milliseconds   " << milliseconds << "\n";
             log << "verdict        " << verdict << "\n";
             log << "function       " << f.getName() << "\n";
@@ -598,10 +774,18 @@ namespace cobra {
             return tag;
         }
 
+        // Why a solve ended the way it did. The two rejections are worth
+        // telling apart in the report: one says the search found nothing, the
+        // other says it found something and the answer was no smaller, and
+        // only the first is a missing capability.
+        enum class SolveVerdict : uint8_t { kSolved, kUnsolved, kNotCheaper };
+
         // Run the full solve-and-verify pipeline for one candidate. Returns
         // null when any gate rejects it.
-        OutcomeCache::Entry
-        SolveCandidate(const MBACandidate &cand, const CobraPassOptions &options) {
+        OutcomeCache::Entry SolveCandidate(
+            const MBACandidate &cand, const CobraPassOptions &options, SolveVerdict &verdict
+        ) {
+            verdict = SolveVerdict::kUnsolved;
             Options opts{ .bitwidth         = cand.bitwidth,
                           .max_vars         = options.max_vars,
                           .spot_check       = true,
@@ -661,6 +845,7 @@ namespace cobra {
                 auto original_cost   = ComputeCost(*cand.expr);
                 auto simplified_cost = ComputeCost(*result.value().expr);
                 if (!IsBetter(simplified_cost.cost, original_cost.cost)) {
+                    verdict = SolveVerdict::kNotCheaper;
                     ++NumSkippedCost;
                     LLVM_DEBUG(
                         llvm::dbgs() << "CoBRA: skipping — simplified form is not smaller\n"
@@ -733,6 +918,7 @@ namespace cobra {
             }
 #endif
 
+            verdict = SolveVerdict::kSolved;
             return std::make_shared< const CandidateOutcome >(CandidateOutcome{
                 .expr               = std::move(result.value().expr),
                 .real_vars          = std::move(result.value().real_vars),
@@ -745,6 +931,22 @@ namespace cobra {
     CobraPass::run(llvm::Function &f, llvm::FunctionAnalysisManager & /*AM*/) {
         bool changed = false;
 
+        // What this run contributes to the report. It is accumulated locally
+        // and merged once at the end, so nothing in the loop below touches
+        // shared state.
+        CobraStatistics stats;
+        stats.runs           = 1;
+        const bool classify  = StatisticsEnabled();
+        const auto run_begin = std::chrono::steady_clock::now();
+        const auto since     = [](std::chrono::steady_clock::time_point begin) {
+            return static_cast< uint64_t >(
+                std::chrono::duration_cast< std::chrono::nanoseconds >(
+                    std::chrono::steady_clock::now() - begin
+                )
+                    .count()
+            );
+        };
+
         const uint64_t options_tag = OptionsTag(options_);
 
         DemandedBitsOracle demanded_bits(f);
@@ -752,10 +954,17 @@ namespace cobra {
             return demanded_bits.MaskOf(inst);
         };
 
+        const auto detect_begin = std::chrono::steady_clock::now();
         auto candidates = DetectMbaCandidates(
             f, options_.min_ast_size, options_.max_vars, options_tag, options_.cost_model,
             options_.max_tree_nodes, demanded
         );
+        stats.detect_nanoseconds += since(detect_begin);
+        stats.detected = candidates.size();
+
+        // What each queued candidate is, parallel to `candidates`: only these
+        // first ones are expressions the function holds.
+        std::vector< CandidateOrigin > origins(candidates.size(), CandidateOrigin::kDetected);
 
         NumCandidates += candidates.size();
 
@@ -787,6 +996,7 @@ namespace cobra {
             // re-cuts and inner roots were queued before that happened, and
             // solving them now buys nothing.
             if (cand.root->use_empty()) {
+                ++stats.dead_roots;
                 continue;
             }
 
@@ -806,6 +1016,7 @@ namespace cobra {
             // Both lists are built before either is queued: pushing can
             // reallocate `candidates`, and `cand` is a reference into it.
             const auto requeue_retries = [&] {
+                const auto retry_begin = std::chrono::steady_clock::now();
                 // The boundary cut first: it is the one reading of the root
                 // the ladder below cannot reach, and it costs a single solve.
                 auto boundary = BoundaryCutMbaCandidate(
@@ -838,17 +1049,61 @@ namespace cobra {
                 for (auto &cut : boundary) {
                     if (attempted.insert({ cut.root, cut.node_limit }).second) {
                         candidates.push_back(std::move(cut));
+                        origins.push_back(CandidateOrigin::kBoundaryCut);
+                        ++stats.requeued;
                     }
                 }
                 for (auto &recut : recuts) {
                     if (attempted.insert({ recut.root, recut.node_limit }).second) {
                         candidates.push_back(std::move(recut));
+                        origins.push_back(CandidateOrigin::kRecut);
+                        ++stats.requeued;
                     }
                 }
                 for (auto &inner : inners) {
                     if (attempted.insert({ inner.root, inner.node_limit }).second) {
                         candidates.push_back(std::move(inner));
+                        origins.push_back(CandidateOrigin::kInnerRoot);
+                        ++stats.requeued;
                     }
+                }
+                stats.ladder_nanoseconds += since(retry_begin);
+            };
+
+            // Everything the report wants to know about this candidate is read
+            // before the solve: afterwards the root may have been replaced, and
+            // what used to read it reads the rewrite instead.
+            const unsigned variables = static_cast< unsigned >(
+                std::min< size_t >(cand.var_names.size(), CobraStatistics::kMaxVariableRow)
+            );
+            const uint32_t consumers = classify ? ConsumerMask(cand.root) : 0U;
+            const auto consumer      = PrimaryConsumer(consumers);
+            const bool addresses =
+                (consumers & ConsumerBit(CandidateConsumer::kPointerOffset)) != 0;
+
+            // What this candidate cost, filled in once the solve is done, and
+            // added to every row it belongs to when its fate is known.
+            uint64_t spent = 0;
+            const auto account = [&](bool solved) {
+                auto &by_variables = stats.by_variables[variables];
+                ++by_variables.candidates;
+                by_variables.solved += solved ? 1 : 0;
+                by_variables.nanoseconds += spent;
+                auto &by_origin = stats.by_origin[static_cast< unsigned >(origins[index])];
+                ++by_origin.candidates;
+                by_origin.solved += solved ? 1 : 0;
+                by_origin.nanoseconds += spent;
+                if (!classify) {
+                    return;
+                }
+                auto &by_consumer = stats.by_consumer[static_cast< unsigned >(consumer)];
+                ++by_consumer.candidates;
+                by_consumer.solved += solved ? 1 : 0;
+                by_consumer.nanoseconds += spent;
+                if (addresses) {
+                    ++stats.reaching_pointer_offset;
+                    stats.solved_reaching_pointer_offset += solved ? 1 : 0;
+                    stats.pointer_offset_nanoseconds += spent;
                 }
             };
 
@@ -856,34 +1111,60 @@ namespace cobra {
 
             OutcomeCache::Entry outcome;
             bool served_from_cache = false;
+            auto verdict           = SolveVerdict::kUnsolved;
             const auto solve_begin = std::chrono::steady_clock::now();
             if (auto cached = cache.Find(key)) {
                 ++NumOutcomeCacheHits;
                 outcome           = std::move(*cached);
                 served_from_cache = true;
             } else {
-                outcome = cache.Insert(key, SolveCandidate(cand, options_));
+                outcome = cache.Insert(key, SolveCandidate(cand, options_, verdict));
             }
-            const auto solve_ms = static_cast< uint64_t >(
-                std::chrono::duration_cast< std::chrono::milliseconds >(
-                    std::chrono::steady_clock::now() - solve_begin
-                )
-                    .count()
-            );
+            spent = since(solve_begin);
+            stats.solve_nanoseconds += spent;
+            if (served_from_cache) {
+                ++stats.cache_hits;
+                stats.cache_nanoseconds += spent;
+                if (outcome == nullptr) {
+                    ++stats.rejected_cached;
+                }
+            } else if (outcome == nullptr) {
+                stats.rejected_nanoseconds += spent;
+                ++(verdict == SolveVerdict::kNotCheaper ? stats.rejected_cost
+                                                        : stats.rejected_unsolved);
+            } else {
+                stats.solved_nanoseconds += spent;
+            }
+            const uint64_t solve_ms = spent / 1000000;
             const bool wide = SlowReport().variable_floor != 0
                 && cand.var_names.size() >= SlowReport().variable_floor;
             if (SlowReport().enabled && !served_from_cache
                 && (solve_ms >= SlowReport().threshold_ms || wide))
             {
-                RecordSlowCandidate(
-                    f, cand, outcome.get(), solve_ms, outcome == nullptr ? "rejected" : "solved"
+                static uint64_t slow_sequence = 0;
+                RecordCandidate(
+                    SlowReport().directory, slow_sequence, f, cand, outcome.get(), solve_ms,
+                    outcome == nullptr ? "rejected" : "solved"
                 );
+            }
+            // An address expression CoBRA rewrote is one a pass dedicated to
+            // addresses could have folded more cheaply, so its shape is written
+            // out for that pass to be built against.
+            if (addresses && outcome != nullptr && !SlowReport().addresses.empty()) {
+                static uint64_t address_sequence = 0;
+                if (address_sequence < SlowReport().address_cap) {
+                    RecordCandidate(
+                        SlowReport().addresses, address_sequence, f, cand, outcome.get(),
+                        solve_ms, "reaches an address"
+                    );
+                }
             }
             if (outcome == nullptr) {
                 // Nothing to rewrite here. Leaving the tree unmarked would have
                 // the next run rediscover and re-solve it from scratch, which
                 // is the dominant cost when a function is re-optimized, so the
                 // shape that led nowhere is recorded on the root.
+                account(false);
                 record_rejection();
                 requeue_retries();
                 continue;
@@ -903,6 +1184,8 @@ namespace cobra {
             if (!real_vars.empty() && !identity) {
                 var_map = positions;
             }
+
+            const auto rebuild_begin = std::chrono::steady_clock::now();
 
             // Everything the builder emits lands between `mark` and the root, so
             // the replacement can be priced in the only currency that matters —
@@ -966,9 +1249,24 @@ namespace cobra {
                     llvm::dbgs() << "CoBRA: skipping — rewrite emits " << emitted.size()
                                  << " instructions against a budget of " << budget << "\n"
                 );
+                const uint64_t rebuilding = since(rebuild_begin);
+                stats.rebuild_nanoseconds += rebuilding;
+                stats.rejected_nanoseconds += rebuilding;
+                spent += rebuilding;
+                ++stats.rejected_budget;
+                account(false);
                 record_rejection();
                 requeue_retries();
                 continue;
+            }
+
+            {
+                const uint64_t rebuilding = since(rebuild_begin);
+                stats.rebuild_nanoseconds += rebuilding;
+                stats.solved_nanoseconds += rebuilding;
+                spent += rebuilding;
+                ++stats.solved;
+                account(true);
             }
 
             cand.root->replaceAllUsesWith(new_val);
@@ -1022,7 +1320,153 @@ namespace cobra {
             }
         }
 
+        stats.nanoseconds = since(run_begin);
+        MergeStatistics(stats);
+
         return changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all();
     }
 
+    const char *NameOf(CandidateConsumer consumer) {
+        switch (consumer) {
+            case CandidateConsumer::kPointerOffset: return "pointer offset";
+            case CandidateConsumer::kStoredValue:   return "stored value";
+            case CandidateConsumer::kCompared:      return "compared";
+            case CandidateConsumer::kCallArgument:  return "call argument";
+            case CandidateConsumer::kReturned:      return "returned";
+            case CandidateConsumer::kOther:         return "other";
+            case CandidateConsumer::kUnused:        return "unused";
+            case CandidateConsumer::kCount:         break;
+        }
+        return "?";
+    }
+
+    const char *NameOf(CandidateOrigin origin) {
+        switch (origin) {
+            case CandidateOrigin::kDetected:    return "detected in the function";
+            case CandidateOrigin::kBoundaryCut: return "re-read at a bitwise boundary";
+            case CandidateOrigin::kRecut:       return "the same root, cut shorter";
+            case CandidateOrigin::kInnerRoot:   return "a root the tree buried";
+            case CandidateOrigin::kCount:       break;
+        }
+        return "?";
+    }
+
+    void EnableStatistics(bool enabled) {
+        auto &state = Stats();
+        const std::lock_guard< std::mutex > lock(state.mutex);
+        state.enabled = enabled;
+    }
+
+    bool StatisticsEnabled() {
+        auto &state = Stats();
+        const std::lock_guard< std::mutex > lock(state.mutex);
+        return state.enabled;
+    }
+
+    CobraStatistics Statistics() {
+        auto &state = Stats();
+        const std::lock_guard< std::mutex > lock(state.mutex);
+        return state.totals;
+    }
+
+    void ResetStatistics() {
+        auto &state = Stats();
+        const std::lock_guard< std::mutex > lock(state.mutex);
+        state.totals = CobraStatistics{};
+    }
+
+    void PrintStatistics(llvm::raw_ostream &out) {
+        const auto stats = Statistics();
+        if (stats.runs == 0) {
+            return;
+        }
+
+        const auto seconds = [](uint64_t nanoseconds) {
+            return static_cast< double >(nanoseconds) / 1e9;
+        };
+        // A count with no time of its own: it is part of the line above it.
+        const auto part = [&](const char *what, uint64_t count) {
+            out << "  " << llvm::left_justify(what, 36) << llvm::format("%10llu\n", count);
+        };
+        const auto line = [&](const char *what, uint64_t count, uint64_t nanoseconds) {
+            out << "  " << llvm::left_justify(what, 36) << llvm::format("%10llu", count)
+                << llvm::format("%12.2f s\n", seconds(nanoseconds));
+        };
+        const auto cost = [&](const char *what, uint64_t nanoseconds) {
+            out << "  " << llvm::left_justify(what, 36) << llvm::right_justify("", 10)
+                << llvm::format("%12.2f s\n", seconds(nanoseconds));
+        };
+        const auto table = [&](const char *heading, const char *first,
+                               const CandidateClass *rows, unsigned count,
+                               const char *(*name)(unsigned)) {
+            out << "  " << heading << ":\n";
+            out << "    " << llvm::left_justify(first, 30)
+                << llvm::right_justify("candidates", 12) << llvm::right_justify("solved", 9)
+                << llvm::right_justify("time", 12) << '\n';
+            for (unsigned index = 0; index < count; ++index) {
+                if (rows[index].candidates == 0) {
+                    continue;
+                }
+                out << "    " << llvm::left_justify(name(index), 30)
+                    << llvm::format("%12llu", rows[index].candidates)
+                    << llvm::format("%9llu", rows[index].solved)
+                    << llvm::format("%10.2f s\n", seconds(rows[index].nanoseconds));
+            }
+        };
+
+        const uint64_t looked_at = stats.detected + stats.requeued;
+        out << "CoBRA statistics (cumulative):\n";
+        line("runs", stats.runs, stats.nanoseconds);
+        line("candidates looked at", looked_at,
+             stats.solve_nanoseconds + stats.rebuild_nanoseconds);
+        part("  detected in the function", stats.detected);
+        part("  re-cut and descended into", stats.requeued);
+        part("  roots already rewritten", stats.dead_roots);
+        line("candidates solved", stats.solved, stats.solved_nanoseconds);
+        line("candidates rejected",
+             stats.rejected_unsolved + stats.rejected_cost + stats.rejected_budget
+                 + stats.rejected_cached,
+             stats.rejected_nanoseconds);
+        part("  no simplification found", stats.rejected_unsolved);
+        part("  simplification not cheaper", stats.rejected_cost);
+        part("  rebuilt IR over budget", stats.rejected_budget);
+        part("  rejected by an earlier run", stats.rejected_cached);
+        line("served from the outcome cache", stats.cache_hits, stats.cache_nanoseconds);
+        cost("finding the candidates", stats.detect_nanoseconds);
+        cost("  re-cutting and descending", stats.ladder_nanoseconds);
+        cost("rebuilding the IR", stats.rebuild_nanoseconds);
+
+        table("by where the candidate came from", "origin", stats.by_origin,
+              static_cast< unsigned >(CandidateOrigin::kCount), [](unsigned index) {
+                  return NameOf(static_cast< CandidateOrigin >(index));
+              });
+
+        uint64_t classified = 0;
+        for (const auto &row : stats.by_consumer) {
+            classified += row.candidates;
+        }
+        if (classified != 0) {
+            table("by what reads the candidate", "consumer", stats.by_consumer,
+                  static_cast< unsigned >(CandidateConsumer::kCount), [](unsigned index) {
+                      return NameOf(static_cast< CandidateConsumer >(index));
+                  });
+            out << "    " << llvm::left_justify("reaching an address at all", 30)
+                << llvm::format("%12llu", stats.reaching_pointer_offset)
+                << llvm::format("%9llu", stats.solved_reaching_pointer_offset)
+                << llvm::format("%10.2f s\n", seconds(stats.pointer_offset_nanoseconds));
+        }
+
+        out << "  by independent leaves:\n";
+        for (unsigned index = 0; index <= CobraStatistics::kMaxVariableRow; ++index) {
+            const auto &row = stats.by_variables[index];
+            if (row.candidates == 0) {
+                continue;
+            }
+            out << "    " << llvm::left_justify(std::to_string(index), 30)
+                << llvm::format("%12llu", row.candidates) << llvm::format("%9llu", row.solved)
+                << llvm::format("%10.2f s\n", seconds(row.nanoseconds));
+        }
+    }
+
 } // namespace cobra
+
