@@ -310,6 +310,96 @@ namespace cobra {
             return ty->isIntegerTy() && ty->getIntegerBitWidth() == bw;
         }
 
+        // A value wider than the tree normally has no reading at the tree's
+        // width and stays a leaf. A logical shift by a constant is the one
+        // exception worth making.
+        //
+        // When every reader of the shift truncates its result, the shift is
+        // only ever read for the bits it brought down; and when the highest of
+        // those started below the tree's width, they all came from the low `bw`
+        // bits of the value being shifted - which is exactly what the tree
+        // holds for a wider value. Shifting those gives the same bits, and the
+        // truncation above discards the positions the narrow shift filled with
+        // zeros instead of the bits it could not reach.
+        //
+        // This is what lets a word taken apart into slices and put back
+        // together be read as one expression over one variable. Without it each
+        // slice is an opaque leaf of its own, so the halves of a value look
+        // independent and no identity spanning them can be found - which is how
+        // `(sext x ^ C)` split into two halves, each xored with a constant and
+        // recombined, stays thirteen instructions when it is `x + 1`.
+        bool WideSliceFitsTreeWidth(const llvm::Instruction *inst, uint32_t bw) {
+            if (inst->getOpcode() != llvm::Instruction::LShr || inst->use_empty()) {
+                return false;
+            }
+            const auto *amount = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
+            if (amount == nullptr || amount->getValue().uge(bw)) {
+                return false;
+            }
+            const uint32_t shift = static_cast< uint32_t >(amount->getZExtValue());
+            for (const llvm::User *user : inst->users()) {
+                const auto *trunc = llvm::dyn_cast< llvm::TruncInst >(user);
+                if (trunc == nullptr || shift + trunc->getType()->getIntegerBitWidth() > bw) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Whether a node wider than the tree has an exact reading at the tree's
+        // width `bw`, which is its low `bw` bits.
+        //
+        // The descent only ever arrives at such a node from a reader that looks
+        // at nothing else: a truncation to `bw` bits or fewer, the slice above,
+        // or - by induction - another node admitted here. So the question is
+        // whether the node's own low `bw` bits are a function of its operands'
+        // low `bw` bits, and for the ring operations they are: reduction modulo
+        // `2^bw` is a homomorphism, which is the same fact that lets a narrower
+        // node be held zero-extended and masked. The bitwise operators work bit
+        // by bit; a left shift by a constant is a multiplication; extending a
+        // value leaves its low bits where they were, as long as a sign extension
+        // starts at or above `bw` - from below it the copied sign bit lands
+        // inside the tree, and the model has no reading for that. A right shift
+        // moves bits down from above, so it is exact only as the slice; division
+        // and comparison read the whole word and stay leaves.
+        //
+        // Without this the tree stops at the first wide value it meets, and what
+        // it rewrites is phrased over `trunc` of that value. A protector widens
+        // `x` before taking it apart - `sext x ^ C` - and parks the wide value in
+        // a slot as well, so nothing downstream can sink the truncation through
+        // a `xor` with other readers, and `x + 1` is left as
+        // `(trunc (sext x ^ C) ^ K) + 1`.
+        bool WideNodeFitsTreeWidth(const llvm::Instruction *inst, uint32_t bw) {
+            if (WideSliceFitsTreeWidth(inst, bw)) {
+                return true;
+            }
+            // Constants are read through `getZExtValue`.
+            if (inst->getType()->getIntegerBitWidth() > 64) {
+                return false;
+            }
+            switch (inst->getOpcode()) {
+                case llvm::Instruction::Add:
+                case llvm::Instruction::Sub:
+                case llvm::Instruction::Mul:
+                case llvm::Instruction::And:
+                case llvm::Instruction::Or:
+                case llvm::Instruction::Xor:
+                    return true;
+                case llvm::Instruction::Shl: {
+                    const auto *amount = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
+                    return amount != nullptr && amount->getValue().ult(bw);
+                }
+                case llvm::Instruction::ZExt:
+                    return inst->getOperand(0)->getType()->isIntegerTy();
+                case llvm::Instruction::SExt: {
+                    const auto *src = inst->getOperand(0)->getType();
+                    return src->isIntegerTy() && src->getIntegerBitWidth() >= bw;
+                }
+                default:
+                    return false;
+            }
+        }
+
         // Every slot in a tree is evaluated under one mask, so a node whose
         // operands are narrower than the root could be handed values it cannot
         // hold in the IR. `select` and `icmp` therefore only join the tree when
@@ -345,11 +435,15 @@ namespace cobra {
             // above it, which is exact: reducing a ring computation modulo 2^n
             // commutes with computing it, the logical shift and the bitwise
             // operators keep an in-range value in range, and a constant is
-            // already the value its own width gives it. A wider node has no
-            // reading at the root's width, so it stays a leaf.
+            // already the value its own width gives it. A wider node is read
+            // at the root's width where `WideNodeFitsTreeWidth` says that is
+            // exact, and stays a leaf otherwise.
             const auto *ty = inst->getType();
-            if (!ty->isIntegerTy() || ty->getIntegerBitWidth() > bw) {
+            if (!ty->isIntegerTy()) {
                 return false;
+            }
+            if (ty->getIntegerBitWidth() > bw) {
+                return WideNodeFitsTreeWidth(inst, bw);
             }
 
             // A zero extension is the identity on a value held zero-extended.
@@ -363,11 +457,11 @@ namespace cobra {
                 return inst->getOperand(0)->getType()->isIntegerTy(1);
             }
 
-            // A truncation is a mask, provided the value it narrows has a
-            // reading at the root's width at all.
+            // A truncation is a mask. The value it narrows may be wider than
+            // the tree: the tree then holds that value's low `bw` bits, and a
+            // mask that keeps a subset of them is exact whatever sits above.
             if (inst->getOpcode() == llvm::Instruction::Trunc) {
-                const auto *src = inst->getOperand(0)->getType();
-                return src->isIntegerTy() && src->getIntegerBitWidth() <= bw;
+                return inst->getOperand(0)->getType()->isIntegerTy();
             }
 
             return true;

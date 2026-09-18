@@ -3,6 +3,7 @@
 #include "MBADetector.h"
 #include "cobra/llvm/CobraStats.h"
 #include "cobra/core/BitWidth.h"
+#include "cobra/core/CompiledExpr.h"
 #include "cobra/core/ExprCost.h"
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/SignatureChecker.h"
@@ -32,6 +33,8 @@
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -71,6 +74,11 @@ namespace cobra {
             // there hands it the wrong leaves, with nothing on a cache hit to
             // catch it.
             std::vector< uint32_t > real_var_positions;
+            // The solver could not decide this rewrite and the host's mode took
+            // that for equivalence. Carried on the outcome because the outcome
+            // is what the cache hands back: every rewrite it serves later stands
+            // on the same unknown answer, and is counted as such.
+            bool accepted_unknown = false;
         };
 
         // Which bits of a value its readers look at, from LLVM's demanded-bits
@@ -339,6 +347,25 @@ namespace cobra {
         StatisticsState &Stats() {
             static StatisticsState state;
             return state;
+        }
+
+        // The verification ledger of `CobraStats.h`. Separate from the report's
+        // state because it is kept when the report is off.
+        struct VerificationState
+        {
+            std::mutex mutex;
+            VerificationCounters counters;
+        };
+
+        VerificationState &VerificationLedger() {
+            static VerificationState state;
+            return state;
+        }
+
+        template< typename Update > void CountVerification(Update &&update) {
+            auto &state = VerificationLedger();
+            const std::lock_guard< std::mutex > lock(state.mutex);
+            update(state.counters);
         }
 
         void Merge(CandidateClass &into, const CandidateClass &from) {
@@ -780,6 +807,103 @@ namespace cobra {
         // only the first is a missing capability.
         enum class SolveVerdict : uint8_t { kSolved, kUnsolved, kNotCheaper };
 
+        // How many bits of each variable `expr` can see, read off the tree. A
+        // leaf narrower than the tree enters it as `var & (2^w - 1)` - that is
+        // how the detector models the extension that carries it up - so a
+        // variable met only under such a mask has `w` bits that matter and no
+        // others. Met anywhere else it is read in full. The answer depends on
+        // the tree alone, which keeps it inside what the outcome cache keys on.
+        void ReadWidths(const Expr &expr, uint32_t bitwidth, std::vector< uint32_t > &widths) {
+            const auto note = [&](uint32_t variable, uint32_t width) {
+                if (variable >= widths.size()) {
+                    widths.resize(variable + 1, 0);
+                }
+                widths[variable] = std::max(widths[variable], width);
+            };
+            const auto narrow_mask = [&](const Expr &node) -> uint32_t {
+                const uint64_t mask = node.constant_val;
+                if (node.kind != Expr::Kind::kConstant || mask == 0 || (mask & (mask + 1)) != 0) {
+                    return 0;
+                }
+                return std::min(static_cast< uint32_t >(std::popcount(mask)), bitwidth);
+            };
+
+            std::vector< const Expr * > pending{ &expr };
+            while (!pending.empty()) {
+                const Expr *node = pending.back();
+                pending.pop_back();
+                if (node->kind == Expr::Kind::kVariable) {
+                    note(node->var_index, bitwidth);
+                    continue;
+                }
+                if (node->kind == Expr::Kind::kAnd && node->children.size() == 2) {
+                    const Expr &lhs = *node->children[0];
+                    const Expr &rhs = *node->children[1];
+                    if (lhs.kind == Expr::Kind::kVariable && narrow_mask(rhs) != 0) {
+                        note(lhs.var_index, narrow_mask(rhs));
+                        continue;
+                    }
+                    if (rhs.kind == Expr::Kind::kVariable && narrow_mask(lhs) != 0) {
+                        note(rhs.var_index, narrow_mask(lhs));
+                        continue;
+                    }
+                }
+                for (const auto &child : node->children) {
+                    pending.push_back(child.get());
+                }
+            }
+        }
+
+        // Settles `lhs == rhs` by running both over every input, when there are
+        // few enough of them to do that. Probes cannot stand in for this: a
+        // product masked down to one bit is an equality test in disguise -
+        // `((v ^ K) * (2^34 - 4)) & 2^33` is `v != K` - which differs from a
+        // constant at one input in 2^16, and neither the Boolean cube nor a
+        // random point ever lands on it. Nor can a solver be relied on to: it
+        // ran out of its budget on exactly that tree, a host that takes an
+        // unknown answer for a yes then accepted the constant, and `K` was one
+        // of the only two values the variable ever held - the flag a VM's
+        // conditional jump tests. Sixty-five thousand evaluations cost less
+        // than the solver's start-up and leave nothing to believe.
+        //
+        // Empty when the inputs are too many to walk.
+        std::optional< bool > DecideByEnumeration(
+            const Expr &lhs, const Expr &rhs, uint32_t num_vars, uint32_t bitwidth
+        ) {
+            constexpr uint32_t kMaxInputBits = 20;
+
+            std::vector< uint32_t > widths(num_vars, 0);
+            ReadWidths(lhs, bitwidth, widths);
+            ReadWidths(rhs, bitwidth, widths);
+            uint32_t input_bits = 0;
+            for (const uint32_t width : widths) {
+                input_bits += width;
+                if (input_bits > kMaxInputBits) {
+                    return std::nullopt;
+                }
+            }
+
+            const auto compiled_lhs = CompileExpr(lhs, bitwidth);
+            const auto compiled_rhs = CompileExpr(rhs, bitwidth);
+            std::vector< uint64_t > values(widths.size(), 0);
+            std::vector< uint64_t > stack_lhs;
+            std::vector< uint64_t > stack_rhs;
+            const uint64_t inputs = uint64_t{ 1 } << input_bits;
+            for (uint64_t input = 0; input < inputs; ++input) {
+                uint64_t rest = input;
+                for (size_t variable = 0; variable < widths.size(); ++variable) {
+                    values[variable] = rest & Bitmask(widths[variable]);
+                    rest >>= widths[variable];
+                }
+                if (EvalCompiledExpr(compiled_lhs, values, stack_lhs)
+                    != EvalCompiledExpr(compiled_rhs, values, stack_rhs))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         // Run the full solve-and-verify pipeline for one candidate. Returns
         // null when any gate rejects it.
         OutcomeCache::Entry SolveCandidate(
@@ -870,8 +994,47 @@ namespace cobra {
                 positions = std::move(*support);
             }
 
+            // Proved outright where the inputs can be walked, on the bits the
+            // rewrite was found for. This runs whether or not a solver is asked
+            // for: a rewrite it refutes is wrong either way, and one it proves
+            // has nothing left for the solver to say.
+            bool proved           = false;
+            bool accepted_unknown = false;
+            if (ast != nullptr) {
+                auto rewritten = CloneExpr(*result.value().expr);
+                if (!positions.empty()) {
+                    RemapVarIndices(*rewritten, positions);
+                }
+                auto original = CloneExpr(*ast);
+                if (cand.demanded_mask != Bitmask(cand.bitwidth)) {
+                    original =
+                        Expr::BitwiseAnd(std::move(original), Expr::Constant(cand.demanded_mask));
+                    rewritten =
+                        Expr::BitwiseAnd(std::move(rewritten), Expr::Constant(cand.demanded_mask));
+                }
+                const auto decided = DecideByEnumeration(
+                    *original, *rewritten, static_cast< uint32_t >(cand.var_names.size()),
+                    cand.bitwidth
+                );
+                if (decided.has_value()) {
+                    CountVerification([&](VerificationCounters &counters) {
+                        ++(*decided ? counters.proved_by_enumeration
+                                    : counters.refuted_by_enumeration);
+                    });
+                }
+                if (decided.has_value() && !*decided) {
+                    ++NumSkippedUnsupported;
+                    LLVM_DEBUG(
+                        llvm::dbgs() << "CoBRA: skipping — the rewrite differs from the tree on "
+                                        "an input\n"
+                    );
+                    return nullptr;
+                }
+                proved = decided.has_value();
+            }
+
 #ifdef COBRA_HAS_Z3
-            if (options.z3_verify) {
+            if (options.z3_verify && !proved) {
                 if (ast == nullptr) {
                     ++NumSkippedUnsupported;
                     LLVM_DEBUG(
@@ -898,6 +1061,41 @@ namespace cobra {
                 auto z3_result = Z3VerifyExprs(
                     *proved_ast, *z3_expr, cand.var_names, cand.bitwidth, options.z3_settings
                 );
+
+                // A solver that ran out of time has proved nothing. A host may
+                // still choose to take its silence for a yes, and for a tree of
+                // ring operations that is a bet with the probes behind it: the
+                // rewrite already agrees with the tree on the Boolean cube and
+                // at random points, which two different polynomials almost
+                // never do. Over a comparison the probes are no evidence at all
+                // (see above) - they sit on one side of it, and a rewrite that
+                // replaced the comparison by the side they saw passes every one
+                // of them. There the proof is the only check there is, so an
+                // unknown answer declines the candidate whatever the mode: taken
+                // as a yes, it folded the `icmp ult` behind a VM's conditional
+                // jump to true and the jump's displacement to a constant.
+                const bool declined_comparison =
+                    z3_result.equivalent && z3_result.unknown && ContainsComparison(*ast);
+                CountVerification([&](VerificationCounters &counters) {
+                    if (!z3_result.unknown) {
+                        ++(z3_result.equivalent ? counters.proved_by_solver
+                                                : counters.refuted_by_solver);
+                    } else if (z3_result.equivalent && !declined_comparison) {
+                        ++counters.unknown_accepted;
+                        counters.unknown_accepted_timeouts += z3_result.timed_out ? 1 : 0;
+                    } else {
+                        ++counters.unknown_declined;
+                    }
+                });
+                accepted_unknown = z3_result.unknown && z3_result.equivalent;
+                if (declined_comparison) {
+                    ++NumSkippedUnsupported;
+                    LLVM_DEBUG(
+                        llvm::dbgs() << "CoBRA: skipping — a comparison needs a proof and Z3 "
+                                        "returned unknown\n"
+                    );
+                    return nullptr;
+                }
                 if (!z3_result.equivalent) {
                     ++NumSkippedUnsupported;
                     LLVM_DEBUG(
@@ -908,7 +1106,7 @@ namespace cobra {
                 }
             }
 #else
-            if (options.z3_verify) {
+            if (options.z3_verify && !proved) {
                 ++NumSkippedUnsupported;
                 LLVM_DEBUG(
                     llvm::dbgs() << "CoBRA: skipping — built without Z3 support but Z3 "
@@ -922,7 +1120,8 @@ namespace cobra {
             return std::make_shared< const CandidateOutcome >(CandidateOutcome{
                 .expr               = std::move(result.value().expr),
                 .real_vars          = std::move(result.value().real_vars),
-                .real_var_positions = std::move(positions) });
+                .real_var_positions = std::move(positions),
+                .accepted_unknown   = accepted_unknown });
         }
 
     } // namespace
@@ -1271,6 +1470,11 @@ namespace cobra {
 
             cand.root->replaceAllUsesWith(new_val);
             ++NumSimplified;
+            if (outcome->accepted_unknown) {
+                CountVerification([](VerificationCounters &counters) {
+                    ++counters.rewrites_on_unknown;
+                });
+            }
             changed = true;
             demanded_bits.Invalidate();
 
@@ -1373,6 +1577,18 @@ namespace cobra {
         auto &state = Stats();
         const std::lock_guard< std::mutex > lock(state.mutex);
         state.totals = CobraStatistics{};
+    }
+
+    VerificationCounters Verification() {
+        auto &state = VerificationLedger();
+        const std::lock_guard< std::mutex > lock(state.mutex);
+        return state.counters;
+    }
+
+    void ResetVerification() {
+        auto &state = VerificationLedger();
+        const std::lock_guard< std::mutex > lock(state.mutex);
+        state.counters = VerificationCounters{};
     }
 
     void PrintStatistics(llvm::raw_ostream &out) {
