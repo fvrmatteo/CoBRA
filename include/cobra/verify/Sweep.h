@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace cobra {
@@ -54,6 +56,34 @@ namespace cobra {
     std::vector< bitwuzla::Term > SweepFormula(
         bitwuzla::TermManager &terms, const std::vector< bitwuzla::Term > &assertions,
         const SweepSettings &settings, SweepCounters *counters = nullptr
+    );
+
+    // The values `term` takes on the inputs the sweep simulates a formula on,
+    // one per input, in the order they are drawn: every free constant at zero,
+    // at all ones, at one and at the signed extremes, then small and random
+    // values drawn for each constant on its own (Booleans are 0 or 1). Nothing
+    // when the term is wider than 64 bits or holds an operator the sweep does
+    // not evaluate; the semantics are the solver's, so a division by zero or an
+    // over-wide shift evaluates to what Bitwuzla says it does.
+    //
+    // Each value is one the term takes under some assignment of its free
+    // constants. Two different values therefore prove the term is not a
+    // constant - as long as nothing else constrains those constants, which only
+    // the caller can know.
+    std::optional< std::vector< uint64_t > >
+    SimulateTerm(bitwuzla::TermManager &terms, const bitwuzla::Term &term);
+
+    // The values `term` takes under each of `inputs`, an assignment of values
+    // to its free constants keyed by the constant's id (Booleans are 0 or 1),
+    // with the semantics of `SimulateTerm`. Nothing when the term cannot be
+    // evaluated, or when an input leaves one of its free constants unassigned.
+    //
+    // What this is for is a model and its neighbours: a solver's model with one
+    // constant changed is still a model of every assertion that does not
+    // mention the constant, so the term's value there is one it can take.
+    std::optional< std::vector< uint64_t > > EvaluateTerm(
+        bitwuzla::TermManager &terms, const bitwuzla::Term &term,
+        const std::vector< std::unordered_map< uint64_t, uint64_t > > &inputs
     );
 
 } // namespace cobra
