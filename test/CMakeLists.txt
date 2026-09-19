@@ -96,6 +96,13 @@ if(COBRA_VERIFY_BACKEND)
     target_link_libraries(test_z3_verifier PRIVATE cobra-verify GTest::gtest_main)
     gtest_discover_tests(test_z3_verifier)
 
+    # Word-level sweeping works on Bitwuzla terms.
+    if(COBRA_VERIFY_BACKEND STREQUAL "Bitwuzla")
+        add_executable(test_sweep verify/test_sweep.cpp)
+        target_link_libraries(test_sweep PRIVATE cobra-verify GTest::gtest_main)
+        gtest_discover_tests(test_sweep)
+    endif()
+
 endif()
 
 # Dataset benchmark tests: MSiMBA/MBASimplifier datasets

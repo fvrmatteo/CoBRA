@@ -113,6 +113,9 @@ namespace cobra {
         uint64_t search_nanoseconds         = 0;
         uint64_t search_found               = 0; // the search proposed a rewrite
         uint64_t search_found_nanoseconds   = 0;
+        // Trees found by random inputs to compute one of their own inputs
+        // (offered only under `sweep`, see ProposeRewrite).
+        uint64_t leaf_identities = 0;
         uint64_t enumeration_nanoseconds    = 0;
         uint64_t solver_calls               = 0;
         uint64_t solver_nanoseconds         = 0;

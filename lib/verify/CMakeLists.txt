@@ -1,7 +1,7 @@
 # Exactly one backend is compiled: both sources implement the same
 # Z3Verify/Z3VerifyExprs entry points from cobra/verify/Z3Verifier.h.
 if(COBRA_VERIFY_BACKEND STREQUAL "Bitwuzla")
-    add_library(cobra-verify STATIC BitwuzlaVerify.cpp)
+    add_library(cobra-verify STATIC BitwuzlaVerify.cpp Sweep.cpp)
     set(_cobra_verify_solver PkgConfig::BITWUZLA)
 else()
     add_library(cobra-verify STATIC Z3Verifier.cpp)
