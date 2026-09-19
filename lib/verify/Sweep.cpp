@@ -151,6 +151,52 @@ namespace cobra {
                 return result;
             }
 
+            // `SimulateTerm`: the simulation alone, with nothing asked.
+            std::optional< std::vector< uint64_t > > Values(const Term &term) {
+                Collect(term);
+                Simulate();
+                const uint32_t i = index_.at(term.id());
+                if (!nodes_[i].simulated) {
+                    return std::nullopt;
+                }
+                return std::vector< uint64_t >(values_[i].begin(), values_[i].begin() + kRandomSamples);
+            }
+
+            // `EvaluateTerm`: the node table filled from given inputs rather
+            // than drawn ones. Every node under the root is needed - nothing is
+            // evaluated lazily - so one the sweep cannot evaluate settles it.
+            std::optional< std::vector< uint64_t > >
+            Values(const Term &term, const std::vector< std::unordered_map< uint64_t, uint64_t > > &inputs) {
+                Collect(term);
+                values_.assign(nodes_.size(), std::vector< uint64_t >(inputs.size(), 0));
+                for (uint32_t i = 0; i < nodes_.size(); ++i) {
+                    Node &node     = nodes_[i];
+                    node.simulated = Simulable(node);
+                    for (uint32_t child : node.children) {
+                        node.simulated = node.simulated && nodes_[child].simulated;
+                    }
+                    if (!node.simulated) {
+                        return std::nullopt;
+                    }
+                    if (node.term.is_value()) {
+                        std::fill(values_[i].begin(), values_[i].end(), ValueOf(node.term, node.width));
+                        continue;
+                    }
+                    for (size_t slot = 0; slot < inputs.size(); ++slot) {
+                        if (!node.variable) {
+                            values_[i][slot] = Evaluate(i, static_cast< unsigned >(slot));
+                            continue;
+                        }
+                        const auto found = inputs[slot].find(node.term.id());
+                        if (found == inputs[slot].end()) {
+                            return std::nullopt;
+                        }
+                        values_[i][slot] = found->second & (node.width == 0 ? 1 : Mask(node.width));
+                    }
+                }
+                return values_[index_.at(term.id())];
+            }
+
           private:
             bool Stopped() const {
                 return (settings_.stop != nullptr && settings_.stop->load(std::memory_order_relaxed))
@@ -412,17 +458,17 @@ namespace cobra {
                 }
             }
 
+            // Called once per node and input, so the operand lists are reused
+            // rather than allocated each time.
             uint64_t Evaluate(uint32_t i, unsigned slot) const {
                 const Node &node = nodes_[i];
-                std::vector< uint64_t > operands;
-                std::vector< unsigned > widths;
-                operands.reserve(node.children.size());
-                widths.reserve(node.children.size());
+                operands_.clear();
+                widths_.clear();
                 for (uint32_t child : node.children) {
-                    operands.push_back(values_[child][slot]);
-                    widths.push_back(nodes_[child].width);
+                    operands_.push_back(values_[child][slot]);
+                    widths_.push_back(nodes_[child].width);
                 }
-                return Apply(node.term, node.width, operands, widths);
+                return Apply(node.term, node.width, operands_, widths_);
             }
 
             static uint64_t ValueOf(const Term &value, unsigned width) {
@@ -1125,6 +1171,8 @@ namespace cobra {
             std::unique_ptr< bitwuzla::Bitwuzla > solver_;
             std::mt19937_64 random_{ 0x5eedC0B7A };
             unsigned counterexamples_ = 0;
+            mutable std::vector< uint64_t > operands_; // `Evaluate`'s
+            mutable std::vector< unsigned > widths_;
         };
 
     } // namespace
@@ -1136,6 +1184,24 @@ namespace cobra {
         SweepCounters local;
         Sweeper sweeper(terms, settings, counters != nullptr ? *counters : local);
         return sweeper.Run(assertions);
+    }
+
+    std::optional< std::vector< uint64_t > >
+    SimulateTerm(bitwuzla::TermManager &terms, const bitwuzla::Term &term) {
+        const SweepSettings settings;
+        SweepCounters counters;
+        Sweeper sweeper(terms, settings, counters);
+        return sweeper.Values(term);
+    }
+
+    std::optional< std::vector< uint64_t > > EvaluateTerm(
+        bitwuzla::TermManager &terms, const bitwuzla::Term &term,
+        const std::vector< std::unordered_map< uint64_t, uint64_t > > &inputs
+    ) {
+        const SweepSettings settings;
+        SweepCounters counters;
+        Sweeper sweeper(terms, settings, counters);
+        return sweeper.Values(term, inputs);
     }
 
 } // namespace cobra

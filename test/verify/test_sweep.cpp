@@ -160,3 +160,84 @@ TEST(Sweep, SynthesizesLinearCombinationsOverAtoms) {
     EXPECT_GT(counters.synthesized, 0u);
     EXPECT_EQ(Solve(t, swept, 2000), bitwuzla::Result::UNSAT);
 }
+
+// A displacement hidden behind the carry identity simulates to one value, a
+// genuine function of its input to many, and an operator the sweep does not
+// evaluate to nothing at all.
+TEST(Sweep, SimulatesTermsWithTheSolversSemantics) {
+    bitwuzla::TermManager t;
+    const auto sort = t.mk_bv_sort(64);
+    const Term sp   = t.mk_const(sort, "sp");
+    const Term a    = t.mk_const(sort, "a");
+
+    // sp + (a & ~sp) - (a & ~sp) - 0x40, with the `and not` written the
+    // protector's way on one side only: always -0x40 away from sp.
+    const Term hidden = HiddenAndNot(t, sp, a);
+    const Term plain  = t.mk_term(Kind::BV_AND, { a, t.mk_term(Kind::BV_NOT, { sp }) });
+    const Term offset = t.mk_bv_value_uint64(sort, 0x40);
+    const Term address = t.mk_term(
+        Kind::BV_SUB, { t.mk_term(Kind::BV_ADD, { sp, t.mk_term(Kind::BV_SUB, { hidden, plain }) }), offset }
+    );
+    const auto displacement = SimulateTerm(t, t.mk_term(Kind::BV_SUB, { address, sp }));
+    ASSERT_TRUE(displacement.has_value());
+    for (const uint64_t value : *displacement) {
+        EXPECT_EQ(value, uint64_t{ 0 } - 0x40);
+    }
+
+    const auto moving = SimulateTerm(t, t.mk_term(Kind::BV_SUB, { t.mk_term(Kind::BV_ADD, { sp, a }), sp }));
+    ASSERT_TRUE(moving.has_value());
+    EXPECT_NE(moving->front(), moving->back());
+
+    // Division by zero is all ones, as the solver has it: the first input
+    // puts every constant at zero.
+    const auto quotient = SimulateTerm(t, t.mk_term(Kind::BV_UDIV, { a, sp }));
+    ASSERT_TRUE(quotient.has_value());
+    EXPECT_EQ(quotient->front(), ~uint64_t{ 0 });
+
+    EXPECT_FALSE(SimulateTerm(t, t.mk_term(Kind::BV_SDIV, { a, sp })).has_value());
+    const Term wide = t.mk_const(t.mk_bv_sort(128), "wide");
+    EXPECT_FALSE(SimulateTerm(t, t.mk_term(Kind::BV_ADD, { wide, wide })).has_value());
+}
+
+// A model the solver found evaluates to the value the solver reports, and the
+// same model with a constant no assertion mentions changed is a model too: its
+// value is another the term can take, found without asking again.
+TEST(Sweep, EvaluatesTermsAtAModelAndItsNeighbours) {
+    bitwuzla::TermManager t;
+    const auto sort = t.mk_bv_sort(64);
+    const Term sp   = t.mk_const(sort, "sp");
+    const Term x    = t.mk_const(sort, "x");
+    const Term pick = t.mk_const(t.mk_bool_sort(), "pick");
+
+    // pick ? x : x + 8, minus sp; the assertion constrains `pick` and `x` only.
+    const Term eight   = t.mk_bv_value_uint64(sort, 8);
+    const Term chosen  = t.mk_term(Kind::ITE, { pick, x, t.mk_term(Kind::BV_ADD, { x, eight }) });
+    const Term value   = t.mk_term(Kind::BV_SUB, { chosen, sp });
+    const Term guarded = t.mk_term(
+        Kind::IMPLIES, { pick, t.mk_term(Kind::BV_ULT, { x, t.mk_bv_value_uint64(sort, 100) }) }
+    );
+
+    bitwuzla::Options options;
+    options.set(bitwuzla::Option::PRODUCE_MODELS, true);
+    bitwuzla::Bitwuzla solver(t, options);
+    solver.assert_formula(guarded);
+    ASSERT_EQ(solver.check_sat(), bitwuzla::Result::SAT);
+    const auto number = [&](const Term &term) {
+        const Term v = solver.get_value(term);
+        return v.sort().is_bool() ? uint64_t{ v.is_true() } : std::stoull(v.value< std::string >(2), nullptr, 2);
+    };
+    const uint64_t expected = number(value);
+
+    std::unordered_map< uint64_t, uint64_t > model{
+        { sp.id(), number(sp) }, { x.id(), number(x) }, { pick.id(), number(pick) }
+    };
+    auto moved       = model;
+    moved[sp.id()] += 0x100;
+    const auto values = EvaluateTerm(t, value, { model, moved });
+    ASSERT_TRUE(values.has_value());
+    EXPECT_EQ((*values)[0], expected);
+    EXPECT_EQ((*values)[1], expected - 0x100);
+
+    // An input that leaves a constant out is not an input.
+    EXPECT_FALSE(EvaluateTerm(t, value, { { { sp.id(), 0 } } }).has_value());
+}
