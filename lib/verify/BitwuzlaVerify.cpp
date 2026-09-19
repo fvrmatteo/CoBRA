@@ -8,7 +8,11 @@
 #include "cobra/core/Expr.h"
 #include "cobra/verify/Z3Verifier.h"
 #include <bitwuzla/cpp/bitwuzla.h>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <cstddef>
 #include <cstdint>
 #include <sstream>
@@ -133,6 +137,49 @@ namespace cobra {
             return result;
         }
 
+        // With `SMT_QUERY_DUMP` set to a directory, every query is written to
+        // `<dir>/cobra/<n>.smt2` with a header naming the answer and the time it
+        // took - the same corpus format the host writes for its own solvers, so
+        // strategies can be compared offline on the queries a run really poses.
+        const std::string &DumpDirectory() {
+            static const std::string directory = [] {
+                const char *where = std::getenv("SMT_QUERY_DUMP");
+                if (where == nullptr || *where == '\0') {
+                    return std::string{};
+                }
+                std::filesystem::create_directories(std::string(where) + "/cobra");
+                return std::string(where) + "/cobra";
+            }();
+            return directory;
+        }
+
+        bool DumpEnabled() { return !DumpDirectory().empty(); }
+
+        std::string PrintFormula(const bitwuzla::Bitwuzla &solver) {
+            std::ostringstream out;
+            solver.print_formula(out, "smt2");
+            return out.str();
+        }
+
+        void DumpQuery(
+            const std::string &formula, const Z3VerificationSettings &settings,
+            bitwuzla::Result status, std::chrono::steady_clock::duration elapsed
+        ) {
+            const std::string &directory = DumpDirectory();
+            if (directory.empty()) {
+                return;
+            }
+            static std::atomic< uint64_t > sequence{ 0 };
+            std::ofstream out(directory + "/" + std::to_string(++sequence) + ".smt2");
+            const char *answer = status == bitwuzla::Result::SAT     ? "sat"
+                               : status == bitwuzla::Result::UNSAT ? "unsat"
+                                                                   : "unknown";
+            out << "; site cobra\n; method equivalence\n; budget-ms " << settings.timeout_ms
+                << "\n; answer " << answer << "\n; microseconds "
+                << std::chrono::duration_cast< std::chrono::microseconds >(elapsed).count() << "\n";
+            out << formula;
+        }
+
         bitwuzla::Options BuildOptions(const Z3VerificationSettings &settings) {
             bitwuzla::Options options;
             // Models are only read on the SAT path, where they carry the
@@ -144,6 +191,7 @@ namespace cobra {
             if (settings.timeout_ms > 0) {
                 options.set(bitwuzla::Option::TIME_LIMIT_PER, settings.timeout_ms);
             }
+            options.set(bitwuzla::Option::REWRITE_LEVEL, static_cast< uint64_t >(settings.rewrite_level));
             return options;
         }
 
@@ -157,12 +205,15 @@ namespace cobra {
             bitwuzla::Bitwuzla solver(tm, BuildOptions(settings));
             solver.assert_formula(tm.mk_term(bitwuzla::Kind::DISTINCT, { lhs, rhs }));
 
+            // Printed before solving: afterwards Bitwuzla prints the formula its
+            // preprocessing left, which is not the question that was asked.
+            const std::string kFormula = DumpEnabled() ? PrintFormula(solver) : std::string{};
             const auto kStart     = std::chrono::steady_clock::now();
             const auto kStatus    = solver.check_sat();
-            const auto kElapsedMs = std::chrono::duration_cast< std::chrono::milliseconds >(
-                                        std::chrono::steady_clock::now() - kStart
-            )
-                                        .count();
+            const auto kElapsed   = std::chrono::steady_clock::now() - kStart;
+            const auto kElapsedMs =
+                std::chrono::duration_cast< std::chrono::milliseconds >(kElapsed).count();
+            DumpQuery(kFormula, settings, kStatus, kElapsed);
 
             Z3VerifyResult result;
 

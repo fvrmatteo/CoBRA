@@ -51,6 +51,8 @@ namespace cobra::verify_detail {
         out += std::to_string(settings.timeout_ms);
         out += ':';
         out += std::to_string(static_cast< int >(settings.unknown_result_mode));
+        out += ':';
+        out += std::to_string(settings.rewrite_level);
         // The names never reach the solver, but they are read back into the
         // counterexample a hit would replay.
         for (const auto &name : var_names) {

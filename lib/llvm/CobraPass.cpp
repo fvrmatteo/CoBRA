@@ -1,6 +1,7 @@
 #include "cobra/llvm/CobraPass.h"
 #include "IRReconstructor.h"
 #include "LocalDemandedBits.h"
+#include "SmtStrategy.h"
 #include "MBADetector.h"
 #include "cobra/llvm/CobraStats.h"
 #include "cobra/core/BitWidth.h"
@@ -78,8 +79,8 @@ namespace cobra {
             // same key, and the key describes variables by position only, so a
             // position is the one thing about them that holds for all of those
             // candidates. Their names do not: the same name can stand at another
-            // position in another tree - a VM's handlers read the same register
-            // and frame slots in different roles - and binding a rewrite by name
+            // position in another tree - an interpreter's handlers read the same
+            // register and frame slots in different roles - and binding a rewrite by name
             // there hands it the wrong leaves, with nothing on a cache hit to
             // catch it.
             std::vector< uint32_t > real_var_positions;
@@ -535,6 +536,7 @@ namespace cobra {
             into.search_nanoseconds += run.search_nanoseconds;
             into.search_found += run.search_found;
             into.search_found_nanoseconds += run.search_found_nanoseconds;
+            into.leaf_identities += run.leaf_identities;
             into.enumeration_nanoseconds += run.enumeration_nanoseconds;
             into.solver_calls += run.solver_calls;
             into.solver_nanoseconds += run.solver_nanoseconds;
@@ -641,6 +643,37 @@ namespace cobra {
                 return out;
             }();
             return report;
+        }
+
+        // `COBRA_REWRITE_LOG=<file>`: every rewrite the pass applies, one line
+        // each - the root it replaces, the expression in and out, what the
+        // rewrite emitted against its budget, and whether it was proved - so two
+        // runs can be compared rewrite by rewrite.
+        void LogRewrite(
+            const MBACandidate &cand, const CandidateOutcome &outcome, size_t emitted, uint32_t budget
+        ) {
+            static const std::string path = [] {
+                const char *where = std::getenv("COBRA_REWRITE_LOG");
+                return where == nullptr ? std::string{} : std::string(where);
+            }();
+            if (path.empty()) {
+                return;
+            }
+            static std::mutex mutex;
+            const std::lock_guard< std::mutex > lock(mutex);
+            std::error_code code;
+            llvm::raw_fd_ostream log(
+                path, code, llvm::sys::fs::CD_OpenAlways, llvm::sys::fs::FA_Write,
+                llvm::sys::fs::OF_Append | llvm::sys::fs::OF_Text
+            );
+            if (code) {
+                return;
+            }
+            const auto &names = outcome.real_vars.empty() ? cand.var_names : outcome.real_vars;
+            log << cand.root->getFunction()->getName() << " | emitted " << emitted << " of " << budget
+                << (outcome.accepted_unknown ? " | unknown accepted" : "") << " | in "
+                << (cand.expr ? RenderSSA(*cand.expr, cand.var_names) : std::string("?")) << " | out "
+                << (outcome.expr ? RenderSSA(*outcome.expr, names) : std::string("?")) << "\n";
         }
 
         std::mutex &SlowReportMutex() {
@@ -881,6 +914,10 @@ namespace cobra {
             key += options.z3_verify ? "|z" : "|-";
             key += std::to_string(options.z3_settings.timeout_ms);
             key += std::to_string(static_cast< int >(options.z3_settings.unknown_result_mode));
+            key += ':';
+            key += std::to_string(options.z3_settings.rewrite_level);
+            key += std::to_string(static_cast< int >(options.z3_settings.strategy));
+            key += options.z3_settings.sweep ? "s" : "";
             key += '|';
             key += std::to_string(cand.var_names.size());
             key += '|';
@@ -953,7 +990,7 @@ namespace cobra {
             // least one whole generation after it was written. Clearing
             // everything at once, as the cache used to, dropped the entries
             // the pass was about to ask for together with the stale ones - over
-            // a VM exploration a third of every solve was a candidate solved
+            // one long exploration a third of every solve was a candidate solved
             // before and forgotten. An entry is a key of a few hundred bytes
             // and a small expression, so this is tens of megabytes at most.
             static constexpr size_t kGeneration = 32768;
@@ -1000,6 +1037,9 @@ namespace cobra {
             tag          = mix(tag, options.z3_verify ? 1 : 0);
             tag          = mix(tag, options.z3_settings.timeout_ms);
             tag = mix(tag, static_cast< uint64_t >(options.z3_settings.unknown_result_mode));
+            tag = mix(tag, options.z3_settings.rewrite_level);
+            tag = mix(tag, static_cast< uint64_t >(options.z3_settings.strategy));
+            tag = mix(tag, options.z3_settings.sweep ? 1 : 0);
             tag = mix(tag, static_cast< uint64_t >(options.enabled_families));
             tag = mix(tag, static_cast< uint64_t >(options.cost_model));
             return tag;
@@ -1066,8 +1106,8 @@ namespace cobra {
         // random point ever lands on it. Nor can a solver be relied on to: it
         // ran out of its budget on exactly that tree, a host that takes an
         // unknown answer for a yes then accepted the constant, and `K` was one
-        // of the only two values the variable ever held - the flag a VM's
-        // conditional jump tests. Sixty-five thousand evaluations cost less
+        // of the only two values the variable ever held - the flag an
+        // interpreter's conditional jump tests. Sixty-five thousand evaluations cost less
         // than the solver's start-up and leave nothing to believe.
         //
         // Empty when the inputs are too many to walk.
@@ -1154,10 +1194,36 @@ namespace cobra {
             const auto search_begin = std::chrono::steady_clock::now();
             auto result             = Simplify(cand.sig, cand.var_names, ast, opts);
             const uint64_t searching = since(search_begin);
+
+
             stats.search_nanoseconds += searching;
             if (result.has_value() && result.value().kind == SimplifyOutcome::Kind::kSimplified) {
                 ++stats.search_found;
                 stats.search_found_nanoseconds += searching;
+            }
+
+            // A tree that computes one of its own inputs. Obfuscated identity
+            // updates - `x` rewritten through a borrow, a shift and an add chain
+            // that cancel - are such trees, and once a comparison stands in for
+            // the borrow no technique of the search above reads them. Random
+            // full-width inputs say which input it is; the proof decides, so this
+            // is only offered when the sweep makes such proofs affordable.
+            const bool searched = result.has_value() && result.value().kind == SimplifyOutcome::Kind::kSimplified;
+            if (!searched && options.z3_verify && options.z3_settings.sweep && ast != nullptr) {
+                const auto count = static_cast< uint32_t >(cand.var_names.size());
+                for (uint32_t index = 0; index < count; ++index) {
+                    auto leaf = Expr::Variable(index);
+                    if (FullWidthCheckEval(cand.evaluator, count, *leaf, cand.bitwidth, 32).passed) {
+                        ++stats.leaf_identities;
+                        verdict = SolveVerdict::kSolved;
+                        return std::make_shared< const CandidateOutcome >(CandidateOutcome{
+                            .expr               = std::move(leaf),
+                            .real_vars          = {},
+                            .real_var_positions = {},
+                            .accepted_unknown   = false,
+                            .verified           = false });
+                    }
+                }
             }
             if (!result.has_value()) {
                 ++NumSkippedUnsupported;
@@ -1312,7 +1378,7 @@ namespace cobra {
                         Expr::BitwiseAnd(std::move(z3_expr), Expr::Constant(cand.demanded_mask));
                 }
                 const auto solver_begin = std::chrono::steady_clock::now();
-                auto z3_result          = Z3VerifyExprs(
+                auto z3_result          = VerifyExprsWithStrategy(
                     *proved_ast, *z3_expr, cand.var_names, cand.bitwidth, options.z3_settings
                 );
                 const uint64_t solving = since(solver_begin);
@@ -1332,8 +1398,8 @@ namespace cobra {
                 // replaced the comparison by the side they saw passes every one
                 // of them. There the proof is the only check there is, so an
                 // unknown answer declines the candidate whatever the mode: taken
-                // as a yes, it folded the `icmp ult` behind a VM's conditional
-                // jump to true and the jump's displacement to a constant.
+                // as a yes, it folded the `icmp ult` behind an interpreter's
+                // conditional jump to true and the jump's displacement to a constant.
                 const bool declined_comparison =
                     z3_result.equivalent && z3_result.unknown && ContainsComparison(*ast);
                 CountVerification([&](VerificationCounters &counters) {
@@ -2113,6 +2179,7 @@ namespace cobra {
                 account(true);
             }
 
+            LogRewrite(cand, *outcome, emitted.size(), budget);
             cand.root->replaceAllUsesWith(new_val);
             ++NumSimplified;
             if (outcome->accepted_unknown) {
@@ -2245,6 +2312,7 @@ namespace cobra {
         if (stats.runs == 0) {
             return;
         }
+        const auto smt = SmtStrategyStatistics();
 
         const auto seconds = [](uint64_t nanoseconds) {
             return static_cast< double >(nanoseconds) / 1e9;
@@ -2305,6 +2373,9 @@ namespace cobra {
         out << "  where the time goes (solved, not cached):\n";
         line("  searching for a rewrite", stats.search_found, stats.search_nanoseconds);
         cost("    of which the searches that found one", stats.search_found_nanoseconds);
+        if (stats.leaf_identities != 0) {
+            part("    a tree equal to one of its inputs (sweep)", stats.leaf_identities);
+        }
         cost("  proving by running every input", stats.enumeration_nanoseconds);
         line("  proving with the solver", stats.solver_calls, stats.solver_nanoseconds);
         cost("    proved", stats.solver_proved_nanoseconds);
@@ -2335,6 +2406,22 @@ namespace cobra {
                  stats.background_wait_nanoseconds);
             part("  withdrawn, solved by the loop", stats.background_withdrawn);
             cost("  waiting for workers at run end", stats.background_drain_nanoseconds);
+        }
+        if (smt.compiled + smt.folded + smt.fallbacks != 0) {
+            out << "  proofs compiled through LLVM (smt-strategy):\n";
+            part("  answered by the optimizer alone", smt.folded);
+            part("  optimized, then solved", smt.compiled);
+            part("  not translatable, asked as built", smt.fallbacks);
+            part("  race won by the compiled question", smt.race_compiled_won);
+            part("  race won by the question as built", smt.race_direct_won);
+            part("  race, neither answered", smt.race_both_unknown);
+            if (smt.swept != 0) {
+                part("  swept after the head start (smt-sweep)", smt.swept);
+                part("    lemmas asked", smt.sweep_lemmas);
+                part("    lemmas proved", smt.sweep_proved);
+                part("      of which with shared subterms cut", smt.sweep_generalized);
+                part("    candidates synthesized", smt.sweep_synthesized);
+            }
         }
         cost("  ladder: boundary cuts", stats.boundary_nanoseconds);
         cost("  ladder: re-cuts", stats.recut_nanoseconds);

@@ -13,10 +13,26 @@ namespace cobra {
         kTreatAsEquivalent,
     };
 
+    // How an equivalence query reaches the solver (see `VerifyExprsWithStrategy`
+    // in the LLVM library): as built, compiled through LLVM's optimizer first,
+    // or both at once on two threads, taking the first definite answer.
+    enum class SmtStrategy : uint8_t { kDirect, kLLVM, kRace };
+
     struct Z3VerificationSettings
     {
         uint32_t timeout_ms                     = 500;
         Z3UnknownResultMode unknown_result_mode = Z3UnknownResultMode::kFail;
+        // Bitwuzla's term rewriting level, 0 to 2 (its own default is 2).
+        uint32_t rewrite_level = 2;
+        SmtStrategy strategy   = SmtStrategy::kDirect;
+        // The optimization pipeline of kLLVM and kRace, in `opt -passes=` syntax.
+        std::string llvm_passes =
+            "instcombine<no-verify-fixpoint>,aggressive-instcombine,reassociate,sccp,dce,adce,"
+            "instsimplify,gvn";
+        // Whether kLLVM and kRace sweep a question (`SweepFormula`,
+        // cobra/verify/Sweep.h) that is not answered within a millisecond - under
+        // kRace both the compiled one and the one as built.
+        bool sweep = false;
     };
 
     struct Z3VerifyResult

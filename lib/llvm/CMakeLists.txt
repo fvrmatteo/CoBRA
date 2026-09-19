@@ -7,6 +7,7 @@ set(cobra_llvm_sources
     MBADetector.cpp
     IRReconstructor.cpp
     LocalDemandedBits.cpp
+    SmtStrategy.cpp
 )
 
 set(cobra_llvm_compile_definitions)
@@ -35,6 +36,12 @@ endif()
 
 if(COBRA_VERIFY_BACKEND)
     target_compile_definitions(cobra-llvm-obj PRIVATE COBRA_HAS_Z3=1)
+endif()
+
+# SmtStrategy.cpp hands compiled questions to Bitwuzla directly.
+if(COBRA_VERIFY_BACKEND STREQUAL "Bitwuzla")
+    target_include_directories(cobra-llvm-obj PRIVATE $<TARGET_PROPERTY:PkgConfig::BITWUZLA,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(cobra-llvm-obj PRIVATE COBRA_HAS_BITWUZLA=1)
 endif()
 
 if(cobra_llvm_compile_options)
