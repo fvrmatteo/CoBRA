@@ -44,6 +44,7 @@ namespace cobra {
     enum class CandidateOrigin : uint8_t {
         kDetected,    // a root the detector handed back
         kBoundaryCut, // the same root, read with arithmetic under a bitwise reader kept whole
+        kSharedCut,   // the same root, read with the values it reads more than once kept whole
         kRecut,       // the same root, collected to a shorter tree
         kInnerRoot,   // a root the rejected tree buried
         kCount
@@ -90,6 +91,14 @@ namespace cobra {
         uint64_t rejected_unsolved = 0; // no simplification was found
         uint64_t rejected_cost     = 0; // one was, and it was not cheaper
         uint64_t rejected_budget   = 0; // the rebuilt IR was not cheaper
+
+        // Rewrites that read instructions the function already held in place of
+        // building them again, how many instructions that was, and how many of
+        // those rewrites would have been over the budget had they built
+        // everything themselves.
+        uint64_t rewrites_reusing       = 0;
+        uint64_t reused_instructions    = 0;
+        uint64_t rewrites_fit_by_reuse  = 0;
         uint64_t rejected_cached   = 0; // an earlier run had already rejected it
         // A rewrite that fits the budget and then failed verification. The
         // proof runs after the budget check, so these are the only refutations.
@@ -167,6 +176,7 @@ namespace cobra {
 
         // The ladder, by the kind of second look.
         uint64_t boundary_nanoseconds = 0;
+        uint64_t shared_nanoseconds   = 0;
         uint64_t recut_nanoseconds    = 0;
         uint64_t inner_nanoseconds    = 0;
 

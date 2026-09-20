@@ -70,6 +70,20 @@ namespace cobra {
         // up "simplified" into a wider polynomial. This is the count to beat.
         uint32_t dying_count = 0;
 
+        // The instructions of the collected tree, and the ones among them that
+        // `dying_count` counts. A rewrite that reads one of these in place of
+        // building it again keeps it in the function, which is what it is
+        // priced on (see `IrReuse`).
+        std::vector< llvm::Instruction * > tree;
+        std::vector< llvm::Instruction * > dying;
+
+        // Whether poison in any instruction of the tree is poison in the root:
+        // true unless the tree holds something that can stop it - a `select`,
+        // whose other arm is not read, a `freeze`, or a phi the collection
+        // looked through, which hands on one arm only when control came that
+        // way.
+        bool poison_reaches_root = false;
+
         // How many instructions the tree was allowed to hold, or zero when it
         // was collected to exhaustion. Only a re-cut carries a limit, and it is
         // what tells the two apart: a limited tree is a deliberately partial
@@ -102,6 +116,17 @@ namespace cobra {
     // The `node_limit` a boundary cut carries: past any re-cut ladder, so the
     // driver treats it as the partial view it is and never cuts it again.
     constexpr uint32_t kBoundaryCutLimit = UINT32_MAX;
+
+    // The `node_limit`s the shared-value cuts carry (see
+    // `SharedCutMbaCandidate`): the first rung holds `kSharedCutLimit` and each
+    // later one the value below, so every rung is a partial view of its own and
+    // all of them sit past any re-cut ladder, as the boundary cut does.
+    constexpr uint32_t kSharedCutLimit = UINT32_MAX - 1;
+    constexpr uint32_t kSharedCutRungs = 1U << 16;
+
+    constexpr bool IsSharedCutLimit(uint32_t node_limit) {
+        return node_limit <= kSharedCutLimit && node_limit > kSharedCutLimit - kSharedCutRungs;
+    }
 
     // Find MBA candidates across a function.  Blocks are scanned in
     // post-order (uses before defs) with reverse instruction iteration
@@ -197,6 +222,44 @@ namespace cobra {
     std::vector< MBACandidate > BoundaryCutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
+        uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
+    );
+
+    // The same root as `cand`, re-collected with the values its tree reads more
+    // than once kept as leaves.
+    //
+    // An identity reads its operands several times - that is what makes it an
+    // identity and not a computation - so an operand that is an expression in
+    // its own right is a value the tree holds once and reads from several
+    // places. `((A & B) ^ B) + (A & B)` is `B` whatever `B` is computed from,
+    // and with `B` a variable the solver sees that at once and the rewrite is
+    // the value the function already holds: nothing is rebuilt, and nothing
+    // that computes `B` is priced, because none of it is in the tree. Expand
+    // `B` and the identity is gone: a product under the bitwise operators is no
+    // sum of atoms over its own operands, and an answer in those operands
+    // would have to compute `B` a second time beside the first.
+    //
+    // Neither of the other cuts finds that reading. A breadth-first prefix
+    // expands the nodes nearest the root, and a shared value read from near
+    // the root is expanded long before the operators that read it from
+    // further down; the boundary cut keeps a value opaque only where a bitwise
+    // operator reads it, so the same value is expanded through the `add` that
+    // reads it beside them.
+    //
+    // Which shared values are the identity's operands and which are only its
+    // intermediate results - `A & B` above is read twice as well - is not
+    // something the tree says, so the cuts form a ladder of their own. The
+    // first keeps every shared value opaque, and each rejection expands one
+    // more, nearest the root first: an intermediate result is read by the root
+    // end of the identity and its operands by the far end. One rung at a time,
+    // for the reason `RecutMbaCandidate` gives, and at most `max_shared_cuts`.
+    //
+    // Returns nothing for a re-cut or a boundary cut, for a tree that reads
+    // nothing twice, and once the rungs have caught up with the full tree.
+    std::vector< MBACandidate > SharedCutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint32_t max_shared_cuts, uint64_t options_tag,
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
         uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
     );
 

@@ -13,14 +13,27 @@ endif()
 
 message(STATUS "LLVM pass tests: opt=${OPT_BIN} FileCheck=${FILECHECK_BIN}")
 
+# A test named `test_*_verified.ll` holds a comparison, which the pass only
+# rewrites under a proof: it runs with `cobra-simplify<verified>` and needs the
+# solver backend. One named `test_*_dying_cost.ll` is about what a rewrite
+# removes, and runs with `cobra-simplify<dying-cost>`.
 function(cobra_add_ll_test TEST_FILE)
     get_filename_component(TEST_NAME "${TEST_FILE}" NAME_WE)
     set(FULL_NAME "LLVMPass.${TEST_NAME}")
     set(FULL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/${TEST_FILE}")
+    set(PIPELINE "cobra-simplify")
+    if(TEST_NAME MATCHES "_verified$")
+        if(NOT COBRA_VERIFY_BACKEND)
+            return()
+        endif()
+        set(PIPELINE "cobra-simplify<verified>")
+    elseif(TEST_NAME MATCHES "_dying_cost$")
+        set(PIPELINE "cobra-simplify<dying-cost>")
+    endif()
 
     add_test(
         NAME "${FULL_NAME}"
-        COMMAND sh -c "${OPT_BIN} -load-pass-plugin=$<TARGET_FILE:CobraPass> -passes=cobra-simplify -S '${FULL_PATH}' | ${FILECHECK_BIN} '${FULL_PATH}'"
+        COMMAND sh -c "${OPT_BIN} -load-pass-plugin=$<TARGET_FILE:CobraPass> -passes='${PIPELINE}' -S '${FULL_PATH}' | ${FILECHECK_BIN} '${FULL_PATH}'"
     )
     set_tests_properties("${FULL_NAME}" PROPERTIES LABELS "llvm")
 endfunction()

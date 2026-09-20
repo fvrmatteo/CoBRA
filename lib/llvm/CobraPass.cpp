@@ -525,6 +525,9 @@ namespace cobra {
             into.rejected_unsolved += run.rejected_unsolved;
             into.rejected_cost += run.rejected_cost;
             into.rejected_budget += run.rejected_budget;
+            into.rewrites_reusing += run.rewrites_reusing;
+            into.reused_instructions += run.reused_instructions;
+            into.rewrites_fit_by_reuse += run.rewrites_fit_by_reuse;
             into.rejected_cached += run.rejected_cached;
             into.rejected_unverified += run.rejected_unverified;
             into.solved_nanoseconds += run.solved_nanoseconds;
@@ -557,6 +560,7 @@ namespace cobra {
             into.demanded_check_compared += run.demanded_check_compared;
             into.demanded_check_mismatches += run.demanded_check_mismatches;
             into.boundary_nanoseconds += run.boundary_nanoseconds;
+            into.shared_nanoseconds += run.shared_nanoseconds;
             into.recut_nanoseconds += run.recut_nanoseconds;
             into.inner_nanoseconds += run.inner_nanoseconds;
             into.background_submitted += run.background_submitted;
@@ -632,6 +636,7 @@ namespace cobra {
                 out.enabled   = true;
                 out.directory = directory;
                 llvm::sys::fs::create_directories(out.directory + "/verify", true);
+                llvm::sys::fs::create_directories(out.directory + "/budget", true);
                 if (const char *threshold = std::getenv("COBRA_SLOW_MS")) {
                     out.threshold_ms = std::strtoull(threshold, nullptr, 10);
                 }
@@ -844,7 +849,12 @@ namespace cobra {
             log << "bitwidth       " << cand.bitwidth << "\n";
             log << "tree-size      " << cand.tree_size << "\n";
             log << "dying-count    " << cand.dying_count << "\n";
-            log << "node-limit     " << cand.node_limit << "\n";
+            if (IsSharedCutLimit(cand.node_limit)) {
+                log << "node-limit     shared values, rung " << kSharedCutLimit - cand.node_limit
+                    << "\n";
+            } else {
+                log << "node-limit     " << cand.node_limit << "\n";
+            }
             log << "variables      " << cand.var_names.size() << "\n";
             log << "root           " << PrintedValue(cand.root) << "\n";
             if (cand.expr) {
@@ -1033,6 +1043,7 @@ namespace cobra {
             tag          = mix(tag, options.min_ast_size);
             tag          = mix(tag, options.max_recut_nodes);
             tag          = mix(tag, options.max_recut_vars);
+            tag          = mix(tag, options.max_shared_cuts);
             tag          = mix(tag, options.max_tree_nodes);
             tag          = mix(tag, options.z3_verify ? 1 : 0);
             tag          = mix(tag, options.z3_settings.timeout_ms);
@@ -1453,6 +1464,29 @@ namespace cobra {
                 .verified           = true });
         }
 
+        // `COBRA_REUSE=0`: build every rewrite from its leaves, as the pass used
+        // to, reading nothing the function already holds (see `IrReuse`).
+        bool ReuseInstructions() {
+            static const bool reuse = [] {
+                const char *choice = std::getenv("COBRA_REUSE");
+                return choice == nullptr || *choice == '\0' || *choice != '0';
+            }();
+            return reuse;
+        }
+
+        // `COBRA_SHARED_CUTS=<n>`: how many rungs the shared-value ladder may
+        // climb, in place of `CobraPassOptions::max_shared_cuts`; zero turns the
+        // ladder off.
+        uint32_t SharedCuts(const CobraPassOptions &options) {
+            static const int64_t chosen = [] {
+                const char *choice = std::getenv("COBRA_SHARED_CUTS");
+                return choice == nullptr || *choice == '\0'
+                    ? int64_t{ -1 }
+                    : static_cast< int64_t >(std::strtoul(choice, nullptr, 10));
+            }();
+            return chosen < 0 ? options.max_shared_cuts : static_cast< uint32_t >(chosen);
+        }
+
         // `COBRA_VERIFY_BEFORE_BUDGET=1`: prove every rewrite as soon as it is
         // found, as the pass used to, whether or not it fits the budget.
         bool VerifyBeforeBudget() {
@@ -1827,6 +1861,14 @@ namespace cobra {
             attempted.insert({ cand.root, cand.node_limit });
         }
 
+        // For reading what the function already holds in place of building it
+        // (`IrReuse`): the dominator tree, built when the first rewrite needs
+        // it - the pass never touches the control flow - and the instructions
+        // earlier rewrites of this run left without readers, which stay in the
+        // function until the run ends.
+        std::optional< llvm::DominatorTree > dominators;
+        llvm::DenseSet< const llvm::Instruction * > retired;
+
         for (size_t index = 0; index < candidates.size(); ++index) {
             auto &cand = candidates[index];
 
@@ -1851,7 +1893,7 @@ namespace cobra {
             // operands this one did, so they are worth trying while the IR still
             // looks the way they were collected from.
             //
-            // Both lists are built before either is queued: pushing can
+            // Every list is built before any is queued: pushing can
             // reallocate `candidates`, and `cand` is a reference into it.
             const auto requeue_retries = [&] {
                 const auto retry_begin = std::chrono::steady_clock::now();
@@ -1862,6 +1904,15 @@ namespace cobra {
                     options_.cost_model, options_.max_tree_nodes, demanded
                 );
                 stats.boundary_nanoseconds += since(retry_begin);
+                // Then the reading that keeps what the tree reads more than
+                // once whole: the one that can answer with a value the
+                // function already holds.
+                const auto shared_begin = std::chrono::steady_clock::now();
+                auto shared = SharedCutMbaCandidate(
+                    cand, options_.min_ast_size, options_.max_vars, SharedCuts(options_),
+                    options_tag, options_.cost_model, options_.max_tree_nodes, demanded
+                );
+                stats.shared_nanoseconds += since(shared_begin);
                 const auto recut_begin = std::chrono::steady_clock::now();
                 auto recuts = RecutMbaCandidate(
                     cand, options_.min_ast_size, options_.max_vars, options_.max_recut_nodes,
@@ -1894,6 +1945,14 @@ namespace cobra {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
                         origins.push_back(CandidateOrigin::kBoundaryCut);
+                        ++stats.requeued;
+                    }
+                }
+                for (auto &cut : shared) {
+                    if (attempted.insert({ cut.root, cut.node_limit }).second) {
+                        queue_key(cut);
+                        candidates.push_back(std::move(cut));
+                        origins.push_back(CandidateOrigin::kSharedCut);
                         ++stats.requeued;
                     }
                 }
@@ -2081,8 +2140,29 @@ namespace cobra {
                 }
             }
 
-            auto *new_val =
-                ReconstructIr(*outcome->expr, cand, builder, var_map, frozen_leaves);
+            // What the function already computes is read, not built again. A
+            // flagged instruction of the tree can be read where the root was
+            // poison whenever it was; the frozen leaves of a tree that spans a
+            // `freeze` are new values nothing reads yet, so there the question
+            // does not come up.
+            IrReuse reuse;
+            llvm::SmallPtrSet< const llvm::Instruction *, 32 > poisons_root;
+            if (ReuseInstructions()) {
+                if (!dominators.has_value()) {
+                    dominators.emplace(f);
+                }
+                reuse.before     = cand.root;
+                reuse.dominators = &*dominators;
+                if (cand.poison_reaches_root) {
+                    poisons_root.insert(cand.tree.begin(), cand.tree.end());
+                    reuse.poisons_root = &poisons_root;
+                }
+            }
+
+            auto *new_val = ReconstructIr(
+                *outcome->expr, cand, builder, var_map, frozen_leaves,
+                ReuseInstructions() ? &reuse : nullptr
+            );
 
             llvm::SmallVector< llvm::Instruction *, 16 > emitted;
             for (auto it = kAtFront ? block->begin() : std::next(kMark); &*it != cand.root;
@@ -2107,18 +2187,56 @@ namespace cobra {
                     }
                 }
             };
-            if (emitted.size() >= budget) {
+
+            // An instruction the rewrite reads is priced like one it builds
+            // wherever the cost model would have counted it gone. Measured on
+            // the whole expression that is every one of them: the expression
+            // after the rewrite is what it built and what it read, whoever
+            // computed the latter first. Measured on what the rewrite removes,
+            // it is the ones that were going to disappear - with this root, or
+            // with one an earlier rewrite replaced - and now stay; one the rest
+            // of the function keeps alive regardless costs nothing to read.
+            size_t charged = 0;
+            if (options_.cost_model == MbaCostModel::kTreeInstructions) {
+                charged = reuse.reused.size();
+            } else if (!reuse.reused.empty()) {
+                const llvm::SmallPtrSet< const llvm::Instruction *, 32 > dying(
+                    cand.dying.begin(), cand.dying.end()
+                );
+                charged = static_cast< size_t >(
+                    llvm::count_if(reuse.reused, [&](const llvm::Instruction *read) {
+                        return dying.contains(read) || retired.contains(read);
+                    })
+                );
+            }
+            const size_t cost = emitted.size() + charged;
+
+            if (cost >= budget) {
                 discard_rewrite();
                 ++NumSkippedCost;
                 LLVM_DEBUG(
                     llvm::dbgs() << "CoBRA: skipping — rewrite emits " << emitted.size()
-                                 << " instructions against a budget of " << budget << "\n"
+                                 << " instructions and keeps " << charged
+                                 << " against a budget of " << budget << "\n"
                 );
                 const uint64_t rebuilding = since(rebuild_begin);
                 stats.rebuild_nanoseconds += rebuilding;
                 stats.rejected_nanoseconds += rebuilding;
                 spent += rebuilding;
                 ++stats.rejected_budget;
+                // The rewrites that are found and then turned down are the ones
+                // a better reconstruction could still win, so with the report
+                // on each is written out with what it came to.
+                if (SlowReport().enabled) {
+                    static uint64_t budget_sequence = 0;
+                    const std::string verdict = "over budget: built " + std::to_string(emitted.size())
+                        + ", read " + std::to_string(reuse.reused.size()) + " (" + std::to_string(charged)
+                        + " priced), against " + std::to_string(budget);
+                    RecordCandidate(
+                        SlowReport().directory + "/budget", budget_sequence, f, cand, outcome.get(),
+                        since(rebuild_begin) / 1000000, verdict.c_str()
+                    );
+                }
                 if (served_from_cache) {
                     ++stats.cached_over_budget;
                 } else {
@@ -2179,8 +2297,41 @@ namespace cobra {
                 account(true);
             }
 
+            if (!reuse.reused.empty()) {
+                ++stats.rewrites_reusing;
+                stats.reused_instructions += reuse.reused.size();
+                // What the rewrite would have emitted building everything
+                // itself: every lookup that found something, again.
+                if (emitted.size() + reuse.found >= budget) {
+                    ++stats.rewrites_fit_by_reuse;
+                }
+            }
+
             LogRewrite(cand, *outcome, emitted.size(), budget);
             cand.root->replaceAllUsesWith(new_val);
+
+            // What this rewrite takes out of the function, for the rewrites
+            // after it: an instruction of the tree goes once everything that
+            // reads it has gone, starting with the root.
+            if (options_.cost_model == MbaCostModel::kDyingInstructions) {
+                retired.insert(cand.root);
+                for (bool growing = true; growing;) {
+                    growing = false;
+                    for (const auto *ti : cand.tree) {
+                        if (retired.contains(ti)) {
+                            continue;
+                        }
+                        const bool unread = llvm::all_of(ti->users(), [&](const llvm::User *u) {
+                            const auto *ui = llvm::dyn_cast< llvm::Instruction >(u);
+                            return ui != nullptr && retired.contains(ui);
+                        });
+                        if (unread) {
+                            retired.insert(ti);
+                            growing = true;
+                        }
+                    }
+                }
+            }
             ++NumSimplified;
             if (outcome->accepted_unknown) {
                 CountVerification([](VerificationCounters &counters) {
@@ -2195,7 +2346,11 @@ namespace cobra {
             // own output cannot shrink further. Fingerprinting it now turns
             // that into a lookup; if a later pass reshapes it the recorded
             // shape stops matching and it is examined again.
-            if (auto *new_inst = llvm::dyn_cast< llvm::Instruction >(new_val)) {
+            //
+            // A replacement that is an instruction the function already held is
+            // not CoBRA's output, and nothing has been learnt about it here.
+            auto *new_inst = llvm::dyn_cast< llvm::Instruction >(new_val);
+            if (new_inst != nullptr && !reuse.seen.contains(new_inst)) {
                 if (auto new_fp = ComputeMbaFingerprint(new_inst, options_.max_tree_nodes)) {
                     // The replacement has the root's readers, so its demand is
                     // the root's.
@@ -2264,6 +2419,7 @@ namespace cobra {
         switch (origin) {
             case CandidateOrigin::kDetected:    return "detected in the function";
             case CandidateOrigin::kBoundaryCut: return "re-read at a bitwise boundary";
+            case CandidateOrigin::kSharedCut:   return "re-read over its shared values";
             case CandidateOrigin::kRecut:       return "the same root, cut shorter";
             case CandidateOrigin::kInnerRoot:   return "a root the tree buried";
             case CandidateOrigin::kCount:       break;
@@ -2356,6 +2512,9 @@ namespace cobra {
         part("  re-cut and descended into", stats.requeued);
         part("  roots already rewritten", stats.dead_roots);
         line("candidates solved", stats.solved, stats.solved_nanoseconds);
+        part("  reading what the function held", stats.rewrites_reusing);
+        part("    instructions read, not rebuilt", stats.reused_instructions);
+        part("    over the budget had they been built", stats.rewrites_fit_by_reuse);
         line("candidates rejected",
              stats.rejected_unsolved + stats.rejected_cost + stats.rejected_budget
                  + stats.rejected_unverified + stats.rejected_cached,
@@ -2424,6 +2583,7 @@ namespace cobra {
             }
         }
         cost("  ladder: boundary cuts", stats.boundary_nanoseconds);
+        cost("  ladder: shared-value cuts", stats.shared_nanoseconds);
         cost("  ladder: re-cuts", stats.recut_nanoseconds);
         cost("  ladder: inner roots", stats.inner_nanoseconds);
 

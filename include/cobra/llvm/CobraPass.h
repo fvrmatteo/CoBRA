@@ -47,6 +47,14 @@ namespace cobra {
         // twenty-eight.
         uint32_t max_recut_vars = 6;
 
+        // How many rungs the shared-value ladder of a rejected root may climb:
+        // the root re-collected with the values its tree reads more than once
+        // kept as variables, one more of them expanded per rejection. The
+        // first rungs are the ones that read an identity in the operands it was
+        // written in; each further one is closer to the full collection that
+        // was already rejected. Zero turns the ladder off.
+        uint32_t max_shared_cuts = 4;
+
         // How many instructions a collection may hold before the walk stops
         // expanding and keeps what remains as leaves. Values narrower than the
         // root join a tree through their casts, so a tree is no longer bounded
