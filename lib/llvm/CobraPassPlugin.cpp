@@ -24,6 +24,15 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
                              fpm.addPass(cobra::CobraPass());
                              return true;
                          }
+                         // Every rewrite proved by the solver, which is what
+                         // a tree that holds a comparison needs before it is
+                         // looked at at all.
+                         if (name == "cobra-simplify<verified>") {
+                             cobra::CobraPassOptions options;
+                             options.z3_verify = true;
+                             fpm.addPass(cobra::CobraPass(options));
+                             return true;
+                         }
                          if (name == "cobra-simplify<dying-cost>") {
                              cobra::CobraPassOptions options;
                              options.cost_model = cobra::MbaCostModel::kDyingInstructions;

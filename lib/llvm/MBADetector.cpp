@@ -400,16 +400,21 @@ namespace cobra {
             }
         }
 
-        // Every slot in a tree is evaluated under one mask, so a node whose
-        // operands are narrower than the root could be handed values it cannot
-        // hold in the IR. `select` and `icmp` therefore only join the tree when
-        // they work entirely at the tree width; otherwise they stay leaves, the
-        // behaviour that predates their support.
+        // Every slot in a tree is evaluated under one mask, so a comparison of
+        // operands narrower than the root would order them by a sign bit they
+        // do not have. An `icmp` therefore only joins the tree when it compares
+        // at the tree width; otherwise it stays a leaf, the behaviour that
+        // predates its support.
         //
-        // A `select` additionally needs its condition to come from an `icmp` of
-        // the same width or an i1 constant. Any other condition would enter the
-        // tree as an i1 leaf, and leaves are probed across the full width, so it
-        // would be fed values a one-bit value can never take.
+        // A `select` needs its condition to come from such an `icmp` or an i1
+        // constant. Any other condition would enter the tree as an i1 leaf, and
+        // leaves are probed across the full width, so it would be fed values a
+        // one-bit value can never take. Its arms may be narrower than the tree:
+        // it hands one of them on untouched, and a narrow value is held in range
+        // like any other (see below), so the value chosen is in range as well -
+        // a carry picked by a comparison of the whole word and merged into a
+        // half of it is the shape this is for. One wider than the tree is left
+        // to `WideNodeFitsTreeWidth`, which does not take it.
         bool FitsTreeWidth(const llvm::Instruction *inst, uint32_t bw) {
             if (const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
                 return IsTreeWidthInt(cmp->getOperand(0), bw)
@@ -417,7 +422,7 @@ namespace cobra {
             }
 
             if (inst->getOpcode() == llvm::Instruction::Select) {
-                if (!IsTreeWidthInt(inst, bw)) {
+                if (!inst->getType()->isIntegerTy() || inst->getType()->getIntegerBitWidth() > bw) {
                     return false;
                 }
                 const auto *cond = inst->getOperand(0);
@@ -527,13 +532,17 @@ namespace cobra {
         // of its variables, so `(a + b) ^ c` has one only with `a + b` as the
         // variable, and an expansion past it dissolves the identity it takes
         // part in rather than exposing another.
+        //
+        // `opaque`, when given, names values to keep as leaves wherever the
+        // walk meets them (see `SharedCutMbaCandidate`). The root is never one.
         void CollectTree(
             llvm::Instruction *root, uint32_t bw,
             llvm::SmallVector< llvm::Instruction *, 16 > &tree_insts,
             std::vector< llvm::Value * > &leaves,
             llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
             bool try_phi_transparency = true, uint32_t max_nodes = 0,
-            bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0
+            bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
+            const llvm::DenseSet< const llvm::Value * > *opaque = nullptr
         ) {
             // A re-cut's budget and the cap on any collection are both
             // budgets on the same walk; the tighter one applies.
@@ -563,6 +572,13 @@ namespace cobra {
                 if (budget != 0 && tree_insts.size() >= budget
                     && !llvm::isa< llvm::Constant >(v))
                 {
+                    if (std::find(leaves.begin(), leaves.end(), v) == leaves.end()) {
+                        leaves.push_back(v);
+                    }
+                    continue;
+                }
+
+                if (opaque != nullptr && v != root && opaque->contains(v)) {
                     if (std::find(leaves.begin(), leaves.end(), v) == leaves.end()) {
                         leaves.push_back(v);
                     }
@@ -1571,13 +1587,23 @@ namespace cobra {
         // A root whose tree swallows a later root wins: the inner one is only
         // reconsidered if the outer candidate goes on to fail, which the caller
         // arranges by feeding `MBACandidate::inner_roots` back in.
+        //
+        // `shared_cut`, when given, is one rung of `SharedCutMbaCandidate`: the
+        // values to keep as leaves and the `node_limit` that names the rung.
+        struct SharedCut
+        {
+            llvm::DenseSet< const llvm::Value * > opaque;
+            uint32_t node_limit = kSharedCutLimit;
+        };
+
         void BuildCandidates(
             llvm::ArrayRef< llvm::Instruction * > roots, uint32_t min_ast_size,
             uint32_t max_vars, MbaCostModel cost_model, uint64_t options_tag,
             std::vector< MBACandidate > &candidates, uint32_t max_nodes = 0,
             bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
-            const DemandedMaskFn &demanded = {}
+            const DemandedMaskFn &demanded = {}, const SharedCut *shared_cut = nullptr
         ) {
+            const auto *opaque = shared_cut != nullptr ? &shared_cut->opaque : nullptr;
             llvm::DenseSet< llvm::Instruction * > already_in_tree;
 
             for (auto *root : roots) {
@@ -1602,7 +1628,7 @@ namespace cobra {
                 CollectTree(
                     &inst, bw, tree_insts, leaves, phi_redirects,
                     /*try_phi_transparency=*/true, max_nodes, cut_arith_under_bitwise,
-                    max_tree_nodes
+                    max_tree_nodes, opaque
                 );
 
                 if (tree_insts.size() < min_ast_size) {
@@ -1645,7 +1671,7 @@ namespace cobra {
                 const MbaFingerprint fingerprint = WithDemandedMask(
                     FingerprintTree(&inst, leaves, tree_set, phi_redirects), demanded_mask, bw
                 );
-                if (max_nodes == 0 && !cut_arith_under_bitwise
+                if (max_nodes == 0 && !cut_arith_under_bitwise && shared_cut == nullptr
                     && FingerprintUnchanged(inst, fingerprint, options_tag))
                 {
                     ++NumFingerprintSkips;
@@ -1664,7 +1690,7 @@ namespace cobra {
                     CollectTree(
                         &inst, bw, tree_insts, leaves, phi_redirects,
                         /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
-                        max_tree_nodes
+                        max_tree_nodes, opaque
                     );
 
                     if (tree_insts.size() < min_ast_size) {
@@ -1788,6 +1814,10 @@ namespace cobra {
                     llvm::any_of(tree_insts, [](const llvm::Instruction *ti) {
                         return IsTransparentFreeze(ti);
                     });
+                const bool poison_reaches_root = phi_redirects.empty() && !spans_freeze
+                    && llvm::none_of(tree_insts, [](const llvm::Instruction *ti) {
+                           return llvm::isa< llvm::SelectInst >(ti);
+                       });
 
                 candidates.push_back(
                     MBACandidate{ .root        = &inst,
@@ -1800,8 +1830,12 @@ namespace cobra {
                                   .fingerprint = fingerprint,
                                   .inner_roots = std::move(inner_roots),
                                   .dying_count = static_cast< uint32_t >(dying.size()),
-                                  .node_limit = cut_arith_under_bitwise ? kBoundaryCutLimit
-                                                                        : max_nodes,
+                                  .tree        = { tree_insts.begin(), tree_insts.end() },
+                                  .dying       = { dying.begin(), dying.end() },
+                                  .poison_reaches_root = poison_reaches_root,
+                                  .node_limit = shared_cut != nullptr ? shared_cut->node_limit
+                                      : cut_arith_under_bitwise      ? kBoundaryCutLimit
+                                                                     : max_nodes,
                                   .tree_size    = static_cast< uint32_t >(tree_insts.size()),
                                   .boundary_cut  = cut_arith_under_bitwise,
                                   .demanded_mask = demanded_mask,
@@ -1910,6 +1944,83 @@ namespace cobra {
         // A cut that took nothing out is the full collection again.
         if (!candidates.empty() && candidates.front().tree_size >= cand.tree_size) {
             candidates.clear();
+        }
+        return candidates;
+    }
+
+    std::vector< MBACandidate > SharedCutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint32_t max_shared_cuts, uint64_t options_tag, MbaCostModel cost_model,
+        uint32_t max_tree_nodes, const DemandedMaskFn &demanded
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr) {
+            return candidates;
+        }
+
+        // The ladder starts at a rejected full collection and is only ever
+        // advanced by one of its own rungs.
+        uint32_t rung = 0;
+        if (cand.node_limit != 0) {
+            if (!IsSharedCutLimit(cand.node_limit)) {
+                return candidates;
+            }
+            rung = kSharedCutLimit - cand.node_limit + 1;
+        }
+
+        // The full collection again: what it reads more than once is a fact
+        // about the whole tree, not about the rung that sent us here. The walk
+        // is breadth-first, so `tree_insts` lists the shared values nearest the
+        // root first, which is the order the rungs expand them in.
+        const uint32_t bw = cand.bitwidth;
+        llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
+        std::vector< llvm::Value * > leaves;
+        llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
+        CollectTree(
+            cand.root, bw, tree_insts, leaves, phi_redirects, /*try_phi_transparency=*/true, 0,
+            false, max_tree_nodes
+        );
+        const llvm::DenseSet< const llvm::Value * > tree_set(
+            tree_insts.begin(), tree_insts.end()
+        );
+        llvm::SmallVector< llvm::Instruction *, 8 > shared;
+        for (auto *ti : tree_insts) {
+            if (ti == cand.root) {
+                continue;
+            }
+            const auto reads = llvm::count_if(ti->uses(), [&](const llvm::Use &use) {
+                return tree_set.contains(use.getUser());
+            });
+            if (reads > 1) {
+                shared.push_back(ti);
+            }
+        }
+
+        const auto rungs =
+            std::min< size_t >({ shared.size(), max_shared_cuts, kSharedCutRungs });
+        for (; rung < rungs; ++rung) {
+            SharedCut cut;
+            cut.opaque.insert(shared.begin() + rung, shared.end());
+            cut.node_limit = kSharedCutLimit - rung;
+            BuildCandidates(
+                { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0,
+                false, max_tree_nodes, demanded, &cut
+            );
+            if (candidates.empty()) {
+                continue;
+            }
+            // The rungs only ever grow the tree, so one no larger than the
+            // rung that was just rejected is that rung again: the value it
+            // expanded is read only from under one that is still opaque.
+            if (cand.node_limit != 0 && candidates.front().tree_size <= cand.tree_size) {
+                candidates.clear();
+                continue;
+            }
+            // And one that kept nothing out is the full collection.
+            if (candidates.front().tree_size >= tree_insts.size()) {
+                candidates.clear();
+            }
+            return candidates;
         }
         return candidates;
     }
