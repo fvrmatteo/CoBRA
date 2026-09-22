@@ -328,6 +328,42 @@ namespace cobra {
                 return { .constant = (coeff * kVal) & ctx.mask, .terms = {} };
             }
 
+            // Lower (a * 2^k) & c  =  (a & (c >> k)) * 2^k.
+            //
+            // A mask over a value shifted up keeps only bits the shift brought
+            // there, so it is the shift of the value masked by the same bits
+            // moved down: a semilinear term with coefficient 2^k, where the
+            // shape as written is a shift of a non-bitwise operand and was
+            // turned down. It is the shape a compiler writes a masked shift
+            // in - the mask is moved outward past the shift - so a term as
+            // plain as `8 * (t & 0xFFFFFFFF)` arrives this way round. Modular:
+            // bits the shift pushes past the width are gone on both sides.
+            if (expr.kind == Expr::Kind::kAnd) {
+                for (size_t side = 0; side < 2; ++side) {
+                    const auto &product = *expr.children[side];
+                    const auto &mask    = *expr.children[1 - side];
+                    if (product.kind != Expr::Kind::kMul || HasVariable(mask)) { continue; }
+                    const Expr *scaled = nullptr;
+                    uint64_t factor    = 0;
+                    for (size_t which = 0; which < 2 && scaled == nullptr; ++which) {
+                        const auto &candidate_factor = *product.children[which];
+                        const auto &candidate_value  = *product.children[1 - which];
+                        if (HasVariable(candidate_factor) || !HasVariable(candidate_value)) { continue; }
+                        const uint64_t f = EvalConstantArith(candidate_factor, ctx.mask, ctx.bitwidth);
+                        if (f != 0 && (f & (f - 1)) == 0) {
+                            scaled = &candidate_value;
+                            factor = f;
+                        }
+                    }
+                    if (scaled == nullptr) { continue; }
+                    unsigned shift = 0;
+                    while ((factor >> shift) != 1) { ++shift; }
+                    const uint64_t kC = EvalConstantBitwise(mask, ctx.mask);
+                    auto masked = Expr::BitwiseAnd(CloneExpr(*scaled), Expr::Constant((kC >> shift) & ctx.mask));
+                    return CollectTerms(ctx, *masked, (coeff * factor) & ctx.mask);
+                }
+            }
+
             switch (expr.kind) {
                 case Expr::Kind::kAdd: {
                     auto left         = CollectTerms(ctx, *expr.children[0], coeff);
