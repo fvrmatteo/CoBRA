@@ -26,9 +26,11 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <cstdlib>
 #include <queue>
 #include <random>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -37,6 +39,42 @@
 STATISTIC(NumFingerprintSkips, "Number of MBA trees skipped (unchanged since last examined)");
 
 namespace cobra {
+
+    // `ptradd`: a byte `getelementptr` with one index.
+    //
+    // Its value is the pointer it walks from plus that index, so over the
+    // indices alone it is an addition - and that is how the detector reads
+    // it. The base is left out of the expression entirely, which keeps the
+    // whole tree in integers and makes the rewrite a `getelementptr` again
+    // rather than a cast: the value of `gep(base, simplified)` is `base +
+    // simplified`, and `simplified` is what was proved equal to the sum of
+    // the indices.
+    //
+    // Without this a chain cuts the sum it spells in half - `gep(gep(p, a),
+    // b)` hides `a + b` - and any identity the obfuscator wrote across it is
+    // invisible: no candidate is ever built for the sum, and the IR
+    // afterwards cannot be told from one that was examined and left alone.
+    const llvm::GetElementPtrInst *ByteGepOf(const llvm::Value *v) {
+        const auto *gep = llvm::dyn_cast_or_null< llvm::GetElementPtrInst >(v);
+        if (gep == nullptr || gep->getNumIndices() != 1
+            || !gep->getSourceElementType()->isIntegerTy(8)
+            || !gep->getOperand(1)->getType()->isIntegerTy(64))
+        {
+            return nullptr;
+        }
+        return gep;
+    }
+
+    // The pointer a chain of `ptradd`s walks from: what the rewrite adds the
+    // simplified sum of the indices back to.
+    llvm::Value *ByteGepBase(const llvm::GetElementPtrInst *gep) {
+        const llvm::Value *base = gep->getPointerOperand();
+        while (const auto *inner = ByteGepOf(base)) {
+            base = inner->getPointerOperand();
+        }
+        return const_cast< llvm::Value * >(base);
+    }
+
 
     namespace {
 
@@ -231,7 +269,7 @@ namespace cobra {
 
         bool IsMbaInstruction(const llvm::Instruction *inst) {
             return IsMbaOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
-                || IsTransparentFreeze(inst);
+                || IsTransparentFreeze(inst) || ByteGepOf(inst) != nullptr;
         }
 
         // `icmp` produces i1, which is useless as a candidate root: it is only
@@ -244,8 +282,27 @@ namespace cobra {
                 && IsMbaOpcode(opcode);
         }
 
+        // A `ptradd` is a root only when it is a chain whose two halves are both
+        // dynamic. One step is no sum at all - rooting there says nothing that
+        // rooting at its index does not - and a shared base plus a constant
+        // displacement is how a canonicalization spells one location: rewriting
+        // that into a single step would collapse the one-pointer-per-location
+        // form the alias analysis and the store coalescing are built on, for an
+        // identity that is not there. A protector's split is two computed
+        // halves, and that is the shape worth rooting at.
+        bool IsPtrAddChain(const llvm::Instruction *inst) {
+            const auto *gep = ByteGepOf(inst);
+            if (gep == nullptr) {
+                return false;
+            }
+            const auto *inner = ByteGepOf(gep->getPointerOperand());
+            return inner != nullptr && !llvm::isa< llvm::ConstantInt >(gep->getOperand(1))
+                && !llvm::isa< llvm::ConstantInt >(inner->getOperand(1));
+        }
+
         bool IsMbaRoot(const llvm::Instruction *inst) {
-            return IsMbaRootOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr;
+            return IsMbaRootOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
+                || IsPtrAddChain(inst);
         }
 
         // The operators that read their operands bit by bit, and the ones that
@@ -416,6 +473,9 @@ namespace cobra {
         // half of it is the shape this is for. One wider than the tree is left
         // to `WideNodeFitsTreeWidth`, which does not take it.
         bool FitsTreeWidth(const llvm::Instruction *inst, uint32_t bw) {
+            if (ByteGepOf(inst) != nullptr) {
+                return bw == 64; // the index width, which is the pointer width
+            }
             if (const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
                 return IsTreeWidthInt(cmp->getOperand(0), bw)
                     && IsSupportedPredicate(cmp->getPredicate());
@@ -606,6 +666,26 @@ namespace cobra {
                         continue;
                     }
 
+                    // A chain of `ptradd`s is taken whole or not at all: the
+                    // node's value is the sum of the indices, so an inner step
+                    // left outside the tree would stand for the pointer it
+                    // computes and the two readings would disagree.
+                    if (ByteGepOf(inst) != nullptr) {
+                        const llvm::Value *step = inst;
+                        while (const auto *ptradd = ByteGepOf(step)) {
+                            auto *node = const_cast< llvm::GetElementPtrInst * >(ptradd);
+                            if (node != inst) {
+                                if (!visited.insert(node).second) {
+                                    break;
+                                }
+                                tree_insts.push_back(node);
+                            }
+                            work.push({ node->getOperand(1), from_bitwise });
+                            step = node->getPointerOperand();
+                        }
+                        tree_insts.push_back(inst);
+                        continue;
+                    }
                     tree_insts.push_back(inst);
                     if (const auto *fsh = FunnelShiftOf(inst)) {
                         // The callee and the amount are not values to follow.
@@ -991,6 +1071,17 @@ namespace cobra {
                     return Emit(Op::kOr, high, low);
                 }
 
+                // A `ptradd` is the addition it spells, over the indices only:
+                // the pointer it walks from is not part of the value the tree
+                // describes, and the rewrite puts it back.
+                if (ByteGepOf(inst) != nullptr) {
+                    const uint32_t index = lower(inst->getOperand(1));
+                    if (ByteGepOf(inst->getOperand(0)) == nullptr) {
+                        return Emit(Op::kMask, index, 0);
+                    }
+                    return Emit(Op::kAdd, lower(inst->getOperand(0)), index);
+                }
+
                 const uint32_t lhs = lower(inst->getOperand(0));
                 const uint32_t rhs = lower(inst->getOperand(1));
 
@@ -1043,6 +1134,24 @@ namespace cobra {
             uint64_t mask_ = UINT64_MAX;
             uint32_t bits_ = 64;
         };
+
+        // `COBRA_DETECT_DEBUG=1`: why a root was not offered as a candidate.
+        //
+        // A root that is never built into a candidate is invisible afterwards:
+        // it carries no fingerprint, so it cannot be told from one that was
+        // examined and left alone, and it never reaches the re-cut ladder
+        // either, because that is driven from a rejection. Naming the gate is
+        // what turns "CoBRA did not simplify this" into something to act on.
+        void DeclinedRoot(
+            const llvm::Instruction &root, llvm::StringRef gate, size_t tree, size_t leaves
+        ) {
+            static const bool enabled = std::getenv("COBRA_DETECT_DEBUG") != nullptr;
+            if (!enabled) {
+                return;
+            }
+            llvm::errs() << "cobra: declined root" << root << ": " << gate << " (tree " << tree
+                         << ", leaves " << leaves << ")\n";
+        }
 
         bool HasPolynomialMul(
             llvm::Instruction *root, const llvm::DenseSet< llvm::Value * > &visited_tree
@@ -1385,6 +1494,28 @@ namespace cobra {
                 return Expr::BitwiseOr(std::move(high), std::move(low));
             }
 
+            // A `ptradd`, read as the addition of its indices (see `ByteGepOf`).
+            if (ByteGepOf(inst) != nullptr) {
+                auto index = BuildExprFromIRImpl(
+                    inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress,
+                    budget
+                );
+                if (index == nullptr) {
+                    return nullptr;
+                }
+                if (ByteGepOf(inst->getOperand(0)) == nullptr) {
+                    return mask_to_width(std::move(index));
+                }
+                auto below = BuildExprFromIRImpl(
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
+                    budget
+                );
+                if (below == nullptr) {
+                    return nullptr;
+                }
+                return mask_to_width(Expr::Add(std::move(below), std::move(index)));
+            }
+
             // Binary operations
             auto lhs = BuildExprFromIRImpl(
                 inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
@@ -1609,18 +1740,24 @@ namespace cobra {
             for (auto *root : roots) {
                 auto &inst = *root;
                 if (already_in_tree.contains(&inst) != 0u) {
+                    DeclinedRoot(inst, "claimed by an enclosing root's tree", 0, 0);
                     continue;
                 }
 
-                if (!inst.getType()->isIntegerTy()) {
+                const bool ptradd = ByteGepOf(&inst) != nullptr;
+                if (!ptradd && !inst.getType()->isIntegerTy()) {
+                    DeclinedRoot(inst, "not an integer", 0, 0);
                     continue;
                 }
-                const uint32_t bw = inst.getType()->getIntegerBitWidth();
+                const uint32_t bw = ptradd ? 64u : inst.getType()->getIntegerBitWidth();
                 if (bw > 64) {
                     continue;
                 }
-                const uint64_t demanded_mask =
-                    demanded ? (demanded(&inst) & Bitmask(bw)) : Bitmask(bw);
+                // A `ptradd`'s readers are pointers: every bit of the index is
+                // live, so there is no narrower mask to read it under.
+                const uint64_t demanded_mask = (!ptradd && demanded)
+                    ? (demanded(&inst) & Bitmask(bw))
+                    : Bitmask(bw);
 
                 llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
                 std::vector< llvm::Value * > leaves;
@@ -1632,6 +1769,7 @@ namespace cobra {
                 );
 
                 if (tree_insts.size() < min_ast_size) {
+                    DeclinedRoot(inst, "smaller than min_ast_size", tree_insts.size(), leaves.size());
                     continue;
                 }
 
@@ -1645,6 +1783,7 @@ namespace cobra {
                 // stays as a guard against a caller asking for 2^40 entries.
                 constexpr uint32_t kPreElimCap = 20;
                 if (leaves.size() > std::min(max_vars, kPreElimCap)) {
+                    DeclinedRoot(inst, "more leaves than max_vars", tree_insts.size(), leaves.size());
                     continue;
                 }
 
@@ -1652,6 +1791,7 @@ namespace cobra {
                     tree_insts.begin(), tree_insts.end()
                 );
                 if (HasPolynomialMul(&inst, tree_set)) {
+                    DeclinedRoot(inst, "a polynomial multiplication", tree_insts.size(), leaves.size());
                     continue;
                 }
 
@@ -1671,8 +1811,17 @@ namespace cobra {
                 const MbaFingerprint fingerprint = WithDemandedMask(
                     FingerprintTree(&inst, leaves, tree_set, phi_redirects), demanded_mask, bw
                 );
-                if (max_nodes == 0 && !cut_arith_under_bitwise && shared_cut == nullptr
-                    && FingerprintUnchanged(inst, fingerprint, options_tag))
+                // `COBRA_FINGERPRINT=off` examines every tree again, however
+                // it was left. The record says "this exact tree was examined
+                // under these options", not "and there is nothing to find", so
+                // when a verdict turns out to have depended on something other
+                // than the tree the record is what makes it permanent.
+                static const bool skip_unchanged = [] {
+                    const char *choice = std::getenv("COBRA_FINGERPRINT");
+                    return choice == nullptr || std::string_view(choice) != "off";
+                }();
+                if (skip_unchanged && max_nodes == 0 && !cut_arith_under_bitwise
+                    && shared_cut == nullptr && FingerprintUnchanged(inst, fingerprint, options_tag))
                 {
                     ++NumFingerprintSkips;
                     for (auto *ti : tree_insts) {
@@ -1863,6 +2012,40 @@ namespace cobra {
         }
 
         std::vector< MBACandidate > candidates;
+        {
+            static const bool trace = std::getenv("COBRA_DETECT_DEBUG") != nullptr;
+            if (trace) {
+                // How much of the function is addressed through a chain of byte
+                // geps rather than through one sum: a chain is an addition the
+                // detector cannot see, because `getelementptr` is not an MBA
+                // opcode, so every identity the protector wrote across it is
+                // cut in half before a candidate is even built.
+                size_t chained = 0;
+                for (const auto &block : f) {
+                    for (const auto &inst : block) {
+                        const auto *gep = llvm::dyn_cast< llvm::GetElementPtrInst >(&inst);
+                        if (gep != nullptr
+                            && llvm::isa< llvm::GetElementPtrInst >(gep->getPointerOperand()))
+                        {
+                            ++chained;
+                        }
+                    }
+                }
+                llvm::errs() << "cobra: detect over " << f.getName() << ": " << roots.size()
+                             << " root(s) of " << f.getInstructionCount() << " instruction(s), "
+                             << chained << " chained byte gep(s)\n";
+                if (const char *where = std::getenv("COBRA_DETECT_DUMP")) {
+                    static unsigned sequence = 0;
+                    std::error_code code;
+                    llvm::raw_fd_ostream out(
+                        std::string(where) + "/detect-" + std::to_string(++sequence) + ".ll", code
+                    );
+                    if (!code) {
+                        out << f;
+                    }
+                }
+            }
+        }
         BuildCandidates(
             roots, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
             max_tree_nodes, demanded

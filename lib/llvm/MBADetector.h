@@ -12,6 +12,7 @@
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Value.h"
 
 namespace cobra {
@@ -44,6 +45,14 @@ namespace cobra {
     // `fp` for a root read under `mask`. A full mask leaves it as it is, so a
     // record written for a root that is read whole keeps matching.
     MbaFingerprint WithDemandedMask(MbaFingerprint fp, uint64_t mask, uint32_t bitwidth);
+
+    // `ptradd`: a byte `getelementptr` with one index, or nothing. Its value is
+    // the pointer it walks from plus that index, so the detector reads a chain
+    // of them as the addition of the indices and leaves the base out; the
+    // rewrite puts the base back with `ByteGepBase`, so what replaces the root
+    // is a `getelementptr` again rather than a cast.
+    const llvm::GetElementPtrInst *ByteGepOf(const llvm::Value *v);
+    llvm::Value *ByteGepBase(const llvm::GetElementPtrInst *gep);
 
     struct MBACandidate
     {

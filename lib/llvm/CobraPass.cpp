@@ -593,6 +593,15 @@ namespace cobra {
         // only say that much: it cannot name the expression the time went into,
         // and without the expression there is nothing to fix.
         //
+        // Why the last candidate this thread proposed was turned down, for the
+        // slow report. A rejection is otherwise one word, and the word does
+        // not say whether the search found nothing, found something the cost
+        // gate refused, or was never run.
+        std::string &RejectReason() {
+            static thread_local std::string reason;
+            return reason;
+        }
+
         // With `COBRA_SLOW_REPORT` set to a directory, every candidate whose
         // solve costs at least `COBRA_SLOW_MS` milliseconds (default 100) is
         // recorded there - what went in, what came out, what it cost, and the
@@ -845,6 +854,14 @@ namespace cobra {
             log << "## candidate " << index << "\n";
             log << "milliseconds   " << milliseconds << "\n";
             log << "verdict        " << verdict << "\n";
+            if (!RejectReason().empty()) {
+                log << "reason         " << RejectReason() << "\n";
+            }
+            log << "signature      [";
+            for (size_t i = 0; i < cand.sig.size(); ++i) {
+                log << (i ? ", " : "") << cand.sig[i];
+            }
+            log << "]\n";
             log << "function       " << f.getName() << "\n";
             log << "bitwidth       " << cand.bitwidth << "\n";
             log << "tree-size      " << cand.tree_size << "\n";
@@ -969,7 +986,33 @@ namespace cobra {
             }
 
             Entry Insert(const std::string &key, Entry entry) {
+                // `COBRA_CACHE_DEBUG=1`: what is being remembered, and why.
+                // A candidate the loop reports as `rejected (cached)` was
+                // turned down somewhere the per-candidate report does not
+                // reach, and without this there is no way to see where.
+                static const bool trace = std::getenv("COBRA_CACHE_DEBUG") != nullptr;
+                if (trace) {
+                    llvm::errs() << "cobra: cache insert " << (entry == nullptr ? "rejected" : "solved")
+                                 << (RejectReason().empty() ? "" : " (" + RejectReason() + ")") << " key "
+                                 << key << "\n";
+                }
                 const std::lock_guard< std::mutex > lock(mutex_);
+                // A solved entry is a rewrite something proved; a null entry is
+                // only "nothing was found this time". The two are not
+                // interchangeable, and the same key receives both - the loop
+                // and a worker can each reach the same expression, and the
+                // search is not a function of the key alone once a proof can
+                // time out. Letting the second overwrite the first threw away
+                // a proved rewrite and replaced it with a refusal that every
+                // later encounter was then served.
+                if (entry == nullptr) {
+                    if (auto it = young_.find(key); it != young_.end() && it->second != nullptr) {
+                        return it->second;
+                    }
+                    if (auto it = old_.find(key); it != old_.end() && it->second != nullptr) {
+                        return it->second;
+                    }
+                }
                 if (young_.size() >= Generation()) {
                     // `COBRA_OUTCOME_CACHE=legacy`: one generation of 8192,
                     // cleared when it fills, as the cache used to be.
@@ -1061,6 +1104,7 @@ namespace cobra {
         // other says it found something and the answer was no smaller, and
         // only the first is a missing capability.
         enum class SolveVerdict : uint8_t { kSolved, kUnsolved, kNotCheaper };
+
 
         // How many bits of each variable `expr` can see, read off the tree. A
         // leaf narrower than the tree enters it as `var & (2^w - 1)` - that is
@@ -1175,6 +1219,7 @@ namespace cobra {
                 );
             };
             verdict = SolveVerdict::kUnsolved;
+            RejectReason().clear();
             Options opts{ .bitwidth         = cand.bitwidth,
                           .max_vars         = options.max_vars,
                           .spot_check       = true,
@@ -1196,6 +1241,7 @@ namespace cobra {
             // candidate is declined.
             if (!options.z3_verify && ast != nullptr && ContainsComparison(*ast)) {
                 ++NumSkippedUnsupported;
+                RejectReason() = "a comparison needs solver verification";
                 LLVM_DEBUG(
                     llvm::dbgs() << "CoBRA: skipping — a comparison needs solver verification\n"
                 );
@@ -1238,6 +1284,7 @@ namespace cobra {
             }
             if (!result.has_value()) {
                 ++NumSkippedUnsupported;
+                RejectReason() = "error: " + result.error().message;
                 LLVM_DEBUG(
                     llvm::dbgs() << "CoBRA: skipping candidate: " << result.error().message
                                  << "\n"
@@ -1247,6 +1294,7 @@ namespace cobra {
 
             if (result.value().kind != SimplifyOutcome::Kind::kSimplified) {
                 ++NumSkippedUnsupported;
+                RejectReason() = "not simplified: " + result.value().diag.reason;
                 LLVM_DEBUG(
                     llvm::dbgs() << "CoBRA: not simplified: " << result.value().diag.reason
                                  << "\n"
@@ -1269,6 +1317,7 @@ namespace cobra {
                 if (!IsBetter(simplified_cost.cost, original_cost.cost)) {
                     verdict = SolveVerdict::kNotCheaper;
                     ++NumSkippedCost;
+                    RejectReason() = "not cheaper: " + RenderSSA(*result.value().expr, cand.var_names);
                     LLVM_DEBUG(
                         llvm::dbgs() << "CoBRA: skipping — simplified form is not smaller\n"
                     );
@@ -1283,6 +1332,13 @@ namespace cobra {
                 auto support = TryBuildVarSupport(cand.var_names, result.value().real_vars);
                 if (!support.has_value()) {
                     ++NumSkippedUnsupported;
+                    {
+                        std::string names;
+                        for (const auto &n : result.value().real_vars) { names += n + " "; }
+                        std::string have;
+                        for (const auto &n : cand.var_names) { have += n + " "; }
+                        RejectReason() = "real_vars {" + names + "} not within {" + have + "}";
+                    }
                     LLVM_DEBUG(
                         llvm::dbgs() << "CoBRA: skipping — real_vars not contained in "
                                         "candidate variable set\n"
@@ -1388,9 +1444,36 @@ namespace cobra {
                     z3_expr =
                         Expr::BitwiseAnd(std::move(z3_expr), Expr::Constant(cand.demanded_mask));
                 }
+                // The budget is the size of the obligation, not a constant.
+                //
+                // A proof over a thirty-node tree of xors, shifts and a
+                // comparison is not the same question as one over a three-node
+                // ring identity, and giving both the same milliseconds means
+                // the big trees are the ones that time out - the very ones a
+                // rewrite is worth most on. Worse, the outcome is then decided
+                // by how fast the machine happened to be: on the ActionRPG VM
+                // an obfuscated store address was proved equal to `rdx + 8` by
+                // the search and then dropped because the proof wanted 255 ms
+                // against a flat 250, and the store went on may-aliasing the
+                // frame and stopping the exploration.
+                //
+                // Scaling is close to free. The candidates are overwhelmingly
+                // small, and a small tree keeps exactly the budget it had; only
+                // a tree past `kNodesPerBudget` asks for more, and the cap
+                // keeps the worst case bounded. Nothing here accepts an
+                // unproved rewrite: a timeout is still a timeout, this only
+                // decides how long the solver is given before it is called one.
+                constexpr uint32_t kNodesPerBudget = 8;
+                constexpr uint32_t kMaxBudgetScale = 8;
+                auto settings = options.z3_settings;
+                const auto scale = std::min(
+                    kMaxBudgetScale,
+                    std::max(1U, static_cast< uint32_t >(cand.tree_size) / kNodesPerBudget)
+                );
+                settings.timeout_ms *= scale;
                 const auto solver_begin = std::chrono::steady_clock::now();
                 auto z3_result          = VerifyExprsWithStrategy(
-                    *proved_ast, *z3_expr, cand.var_names, cand.bitwidth, options.z3_settings
+                    *proved_ast, *z3_expr, cand.var_names, cand.bitwidth, settings
                 );
                 const uint64_t solving = since(solver_begin);
                 ++stats.solver_calls;
@@ -1674,10 +1757,31 @@ namespace cobra {
                 return hardware > 2 ? std::min(4U, hardware - 2) : 0U;
             }
 
+            // Whether a proof the solver could not finish leaves the rewrite
+            // unproved for the loop to take up, rather than standing as a
+            // refutation of it.
+            //
+            // It has to, and it is the default. A worker's "unknown" says the
+            // solver ran out of budget on this thread at this moment; reading
+            // it as "there is no rewrite" is reading UNKNOWN as UNSAT, and
+            // because the answer is cached under the candidate's key it is
+            // read that way for the rest of the process - every later
+            // encounter of the same expression is served the refusal without
+            // anyone solving it again. That made simplification depend on
+            // thread timing: with workers off the loop proved this expression
+            // and rewrote it, and with workers on the same expression was
+            // abandoned, on the ActionRPG VM leaving an obfuscated store
+            // address unsimplified and the exploration stuck on the store.
+            //
+            // Leaving it unproved costs nothing that was not going to be paid:
+            // the entry carries the proposal the search found, and the loop
+            // proves it when it comes to build the rewrite, which is where a
+            // run without workers proves it too. `COBRA_BACKGROUND_UNKNOWN=refute`
+            // restores the old reading.
             static bool RetryUnknown() {
                 static const bool retry = [] {
                     const char *choice = std::getenv("COBRA_BACKGROUND_UNKNOWN");
-                    return choice != nullptr && std::string_view(choice) == "retry";
+                    return choice == nullptr || std::string_view(choice) != "refute";
                 }();
                 return retry;
             }
@@ -2056,6 +2160,22 @@ namespace cobra {
             } else {
                 stats.solved_nanoseconds += spent;
             }
+            // `COBRA_DETECT_DEBUG=1`: every candidate and what became of it.
+            //
+            // The statistics say how many were rejected but not which, and a
+            // candidate that is solved on a worker thread arrives at the loop as
+            // a cache hit, so neither the counters nor the slow-candidate report
+            // can name the expression that did not fold. This line can.
+            {
+                static const bool trace = std::getenv("COBRA_DETECT_DEBUG") != nullptr;
+                if (trace) {
+                    llvm::errs() << "cobra: candidate" << *cand.root << "  [cut " << cand.node_limit
+                                 << ", tree " << cand.tree.size() << ", vars "
+                                 << cand.var_names.size() << "] -> "
+                                 << (outcome == nullptr ? "rejected" : "solved")
+                                 << (served_from_cache ? " (cached)" : "") << "\n";
+                }
+            }
             const uint64_t solve_ms = spent / 1000000;
             const bool wide = SlowReport().variable_floor != 0
                 && cand.var_names.size() >= SlowReport().variable_floor;
@@ -2257,7 +2377,20 @@ namespace cobra {
                 const auto verify_begin  = std::chrono::steady_clock::now();
                 const uint64_t unknown_before = stats.solver_unknown_nanoseconds;
                 auto verified            = VerifyCandidate(cand, *outcome, options_, stats);
-                cache.Insert(key, verified);
+                // A proof that did not finish says nothing about the rewrite,
+                // so it leaves no trace: neither a null in the cache nor a
+                // fingerprint on the root. Both would turn "the solver ran out
+                // of time on this thread at this moment" into "this tree has
+                // nothing to find", and the second is written into the IR and
+                // travels with it - one timeout and the tree is never examined
+                // again, however much budget a later run would have given it.
+                // A refutation is different and is recorded: the solver found
+                // a counterexample, and it will find it again.
+                const bool proof_unknown =
+                    verified == nullptr && stats.solver_unknown_nanoseconds != unknown_before;
+                if (!proof_unknown) {
+                    cache.Insert(key, verified);
+                }
                 verifying = since(verify_begin);
                 spent += verifying;
                 stats.solve_nanoseconds += verifying;
@@ -2280,7 +2413,9 @@ namespace cobra {
                     spent += rebuilding;
                     ++stats.rejected_unverified;
                     account(false);
-                    record_rejection();
+                    if (!proof_unknown) {
+                        record_rejection();
+                    }
                     requeue_retries();
                     continue;
                 }
@@ -2308,6 +2443,26 @@ namespace cobra {
             }
 
             LogRewrite(cand, *outcome, emitted.size(), budget);
+            // A `ptradd` root was read as the addition of its indices, so what
+            // was proved is the sum the chain walks by. The pointer it walks
+            // from goes back on here, which makes the replacement a
+            // `getelementptr` of the same type as the root rather than a cast.
+            if (const auto *ptradd = ByteGepOf(cand.root)) {
+                llvm::IRBuilder<> rebuild(cand.root);
+                new_val = rebuild.CreateGEP(
+                    ptradd->getSourceElementType(),
+                    ByteGepBase(ptradd), { new_val }
+                );
+                // The builder folds a constant base walked by a constant
+                // index into a constant expression, which carries no
+                // metadata; what it says about the root is then already said
+                // by the constant itself.
+                if (auto *type = cand.root->getMetadata("pointer-type")) {
+                    if (auto *rebuilt = llvm::dyn_cast< llvm::Instruction >(new_val)) {
+                        rebuilt->setMetadata("pointer-type", type);
+                    }
+                }
+            }
             cand.root->replaceAllUsesWith(new_val);
 
             // What this rewrite takes out of the function, for the rewrites
