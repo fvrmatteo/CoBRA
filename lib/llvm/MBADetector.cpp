@@ -241,6 +241,72 @@ namespace cobra {
             return intrinsic;
         }
 
+        // A byte swap: a fixed permutation of the value's bytes, which is a
+        // bitwise operation like any other once the width is known -
+        // `bswap(x) = OR_i (((x >> 8i) & 0xFF) << 8(n-1-i))`. Left as a leaf it
+        // does what a funnel shift left as a leaf does: everything above it
+        // reads an opaque variable in place of the value below, so an identity
+        // an obfuscator wrote across it cannot be seen, and the value below
+        // becomes a second variable standing for something the one above is a
+        // function of.
+        //
+        // `bitreverse` is the same kind of permutation and is deliberately not
+        // followed: it needs one term per *bit* rather than per byte, so the
+        // tree it expands to is larger than anything the search could use.
+        const llvm::IntrinsicInst *ByteSwapOf(const llvm::Value *v) {
+            const auto *intrinsic = llvm::dyn_cast< llvm::IntrinsicInst >(v);
+            if (intrinsic == nullptr || intrinsic->getIntrinsicID() != llvm::Intrinsic::bswap
+                || !intrinsic->getType()->isIntegerTy())
+            {
+                return nullptr;
+            }
+            // The intrinsic is defined for a whole number of bytes, and two is
+            // the smallest width that permutes anything.
+            const auto width = intrinsic->getType()->getIntegerBitWidth();
+            return width >= 16 && width % 8 == 0 ? intrinsic : nullptr;
+        }
+
+        // How many bytes a byte swap permutes.
+        uint64_t ByteSwapBytes(const llvm::IntrinsicInst &bswap) {
+            return bswap.getType()->getIntegerBitWidth() / 8;
+        }
+
+        // A two-operand minimum or maximum, which is the `select` over a
+        // comparison it stands for. The model already writes a `select` in
+        // existing operators (`B ^ ((A ^ B) & -c)`), so following one of these
+        // costs nothing new; left as a leaf it cuts the two values it chooses
+        // between off from everything read through it.
+        const llvm::IntrinsicInst *MinMaxOf(const llvm::Value *v) {
+            const auto *intrinsic = llvm::dyn_cast< llvm::IntrinsicInst >(v);
+            if (intrinsic == nullptr || !intrinsic->getType()->isIntegerTy()) {
+                return nullptr;
+            }
+            switch (intrinsic->getIntrinsicID()) { // NOLINT(hicpp-multiway-paths-covered)
+                case llvm::Intrinsic::smax:
+                case llvm::Intrinsic::smin:
+                case llvm::Intrinsic::umax:
+                case llvm::Intrinsic::umin:
+                    return intrinsic;
+                default:
+                    return nullptr;
+            }
+        }
+
+        // The comparison a minimum or maximum picks on: true when the *first*
+        // operand is the one it returns.
+        llvm::CmpInst::Predicate MinMaxPredicate(const llvm::IntrinsicInst &minmax) {
+            switch (minmax.getIntrinsicID()) { // NOLINT(hicpp-multiway-paths-covered)
+                case llvm::Intrinsic::smax:
+                    return llvm::CmpInst::ICMP_SGT;
+                case llvm::Intrinsic::smin:
+                    return llvm::CmpInst::ICMP_SLT;
+                case llvm::Intrinsic::umax:
+                    return llvm::CmpInst::ICMP_UGT;
+                default:
+                    return llvm::CmpInst::ICMP_ULT;
+            }
+        }
+
         // The rotate amount reduced to the type's width, and the width itself.
         std::pair< uint64_t, uint64_t > FunnelShiftAmount(const llvm::IntrinsicInst &fsh) {
             const uint64_t width = fsh.getType()->getIntegerBitWidth();
@@ -269,6 +335,7 @@ namespace cobra {
 
         bool IsMbaInstruction(const llvm::Instruction *inst) {
             return IsMbaOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
+                || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr
                 || IsTransparentFreeze(inst) || ByteGepOf(inst) != nullptr;
         }
 
@@ -302,6 +369,7 @@ namespace cobra {
 
         bool IsMbaRoot(const llvm::Instruction *inst) {
             return IsMbaRootOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
+                || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr
                 || IsPtrAddChain(inst);
         }
 
@@ -479,6 +547,20 @@ namespace cobra {
             if (const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
                 return IsTreeWidthInt(cmp->getOperand(0), bw)
                     && IsSupportedPredicate(cmp->getPredicate());
+            }
+
+            // A byte swap is exact at the value's own width, which the lowering
+            // masks its operand to; wider than the tree it stays a leaf.
+            if (const auto *bswap = ByteSwapOf(inst)) {
+                return bswap->getType()->getIntegerBitWidth() <= bw;
+            }
+
+            // A minimum or maximum compares whole words, so it is only exact at
+            // the width the tree is evaluated at: a narrower value is held
+            // zero-extended inside the tree, and a signed comparison of the
+            // extended words is not the one the program made.
+            if (const auto *minmax = MinMaxOf(inst)) {
+                return minmax->getType()->getIntegerBitWidth() == bw;
             }
 
             if (inst->getOpcode() == llvm::Instruction::Select) {
@@ -691,6 +773,20 @@ namespace cobra {
                         // The callee and the amount are not values to follow.
                         work.push({ fsh->getArgOperand(0), true });
                         work.push({ fsh->getArgOperand(1), true });
+                        continue;
+                    }
+                    // A byte swap reads its operand bit by bit, like the shifts
+                    // and masks it expands to.
+                    if (const auto *bswap = ByteSwapOf(inst)) {
+                        work.push({ bswap->getArgOperand(0), true });
+                        continue;
+                    }
+                    // A minimum or maximum picks between two whole words, which
+                    // is what a comparison feeding a `select` does, so its
+                    // operands are followed the way a `select`'s arms are.
+                    if (const auto *minmax = MinMaxOf(inst)) {
+                        work.push({ minmax->getArgOperand(0), from_bitwise });
+                        work.push({ minmax->getArgOperand(1), from_bitwise });
                         continue;
                     }
                     // A freeze is not an operator, so it neither starts nor
@@ -1069,6 +1165,48 @@ namespace cobra {
                     const uint32_t high  = MaskToWidth(v, Emit(Op::kShl, a, ConstSlot(left)));
                     const uint32_t low   = Emit(Op::kLShr, b, ConstSlot(right));
                     return Emit(Op::kOr, high, low);
+                }
+
+                // A byte swap, byte by byte: the operand held at its own width,
+                // each byte selected where it is and or'd in where it goes.
+                if (const auto *bswap = ByteSwapOf(inst)) {
+                    const uint64_t bytes  = ByteSwapBytes(*bswap);
+                    const uint32_t source = MaskToWidth(v, lower(bswap->getArgOperand(0)));
+                    uint32_t result       = kZeroSlot;
+                    for (uint64_t index = 0; index < bytes; ++index) {
+                        const uint64_t from = index * 8;
+                        const uint64_t to   = (bytes - 1 - index) * 8;
+                        uint32_t byte = from == 0 ? source : Emit(Op::kLShr, source, ConstSlot(from));
+                        byte          = Emit(Op::kAnd, byte, ConstSlot(0xFFULL));
+                        if (to != 0) {
+                            byte = Emit(Op::kShl, byte, ConstSlot(to));
+                        }
+                        result = index == 0 ? byte : Emit(Op::kOr, result, byte);
+                    }
+                    return result;
+                }
+
+                // A minimum or maximum as the choice it is: the comparison of
+                // the two whole words, and the `select` over it.
+                if (const auto *minmax = MinMaxOf(inst)) {
+                    const uint32_t a = Emit(Op::kMask, lower(minmax->getArgOperand(0)), 0);
+                    const uint32_t b = Emit(Op::kMask, lower(minmax->getArgOperand(1)), 0);
+                    uint32_t cond    = kZeroSlot;
+                    switch (MinMaxPredicate(*minmax)) { // NOLINT(hicpp-multiway-paths-covered)
+                        case llvm::CmpInst::ICMP_SGT:
+                            cond = Emit(Op::kCmpSlt, b, a);
+                            break;
+                        case llvm::CmpInst::ICMP_SLT:
+                            cond = Emit(Op::kCmpSlt, a, b);
+                            break;
+                        case llvm::CmpInst::ICMP_UGT:
+                            cond = Emit(Op::kCmpUlt, b, a);
+                            break;
+                        default:
+                            cond = Emit(Op::kCmpUlt, a, b);
+                            break;
+                    }
+                    return Emit(Op::kMask, Emit3(Op::kSelect, cond, a, b), 0);
                 }
 
                 // A `ptradd` is the addition it spells, over the indices only:
@@ -1492,6 +1630,68 @@ namespace cobra {
                 auto high = mask_to_width(Expr::Mul(std::move(a), Expr::Constant(1ULL << left)));
                 auto low  = Expr::LogicalShr(std::move(b), right);
                 return Expr::BitwiseOr(std::move(high), std::move(low));
+            }
+
+            // A byte swap, byte by byte. The operand appears once per byte, so a
+            // wide swap over a large subtree is what the node budget is for: at
+            // eight bytes this is eight copies of whatever it permutes, and past
+            // the budget the value stays a leaf rather than a tree nothing can
+            // use.
+            if (const auto *bswap = ByteSwapOf(inst)) {
+                const uint64_t bytes = ByteSwapBytes(*bswap);
+                auto source          = BuildExprFromIRImpl(
+                    bswap->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
+                    budget
+                );
+                if (source == nullptr) {
+                    return nullptr;
+                }
+                std::unique_ptr< Expr > result;
+                for (uint64_t index = 0; index < bytes; ++index) {
+                    if (budget == 0) {
+                        return nullptr;
+                    }
+                    --budget;
+                    const uint64_t from = index * 8;
+                    const uint64_t to   = (bytes - 1 - index) * 8;
+                    auto byte           = CloneExpr(*source);
+                    if (from != 0) {
+                        byte = Expr::LogicalShr(std::move(byte), from);
+                    }
+                    byte = Expr::BitwiseAnd(std::move(byte), Expr::Constant(0xFFULL));
+                    if (to != 0) {
+                        byte = Expr::Mul(std::move(byte), Expr::Constant(1ULL << to));
+                    }
+                    result = result == nullptr ? std::move(byte)
+                                               : Expr::BitwiseOr(std::move(result), std::move(byte));
+                }
+                return result;
+            }
+
+            // A minimum or maximum: the comparison of the two whole words, and
+            // the `select` over it, written the way the `select` case writes one.
+            if (const auto *minmax = MinMaxOf(inst)) {
+                auto a = BuildExprFromIRImpl(
+                    minmax->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
+                    budget
+                );
+                auto b = BuildExprFromIRImpl(
+                    minmax->getArgOperand(1), leaves, tree_set, mask, phi_redirects, in_progress,
+                    budget
+                );
+                if (a == nullptr || b == nullptr) {
+                    return nullptr;
+                }
+                auto cond = BuildComparison(
+                    MinMaxPredicate(*minmax), CloneExpr(*a), CloneExpr(*b)
+                );
+                if (cond == nullptr) {
+                    return nullptr;
+                }
+                // `select(c, A, B) == B ^ ((A ^ B) & -c)`, as above.
+                auto diff   = Expr::BitwiseXor(std::move(a), CloneExpr(*b));
+                auto masked = Expr::BitwiseAnd(std::move(diff), Expr::Negate(std::move(cond)));
+                return Expr::BitwiseXor(std::move(b), std::move(masked));
             }
 
             // A `ptradd`, read as the addition of its indices (see `ByteGepOf`).
