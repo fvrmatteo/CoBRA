@@ -67,6 +67,28 @@ namespace cobra {
         // Zero leaves the walk unbounded.
         uint32_t max_tree_nodes = 48;
 
+        // Decline a candidate whose tree stands on a value a loop carries.
+        //
+        // The collection looks through phis, handing on one arm, so a phi at the head
+        // of a loop can sit inside a tree or be one of its leaves - and then the
+        // expression the candidate describes is not one expression: the search is being
+        // asked for a closed form of a value that has none. The solver mostly answers
+        // `unknown`, which produces no rewrite at all.
+        //
+        // A candidate that reaches a **pointer offset** is kept whatever this says,
+        // because crossing the split with what reads the root shows the cost is not there:
+        // of the 2597 loop-carried candidates on one measured CFG, the 679 that reach an
+        // address cost 0.13 s of the 55.24 s, while `stored value` (29.69 s) and
+        // `compared` (24.97 s) are the whole of it. So this keeps every rewrite that can
+        // make a pointer fold.
+        //
+        // Not free even so, which is why it is a setting rather than a rule. On the same
+        // CFG and the same 11 runs, with the whole pass at 58.43 s and 321 rewrites: the
+        // candidates standing on a loop-carried value cost **55.27 s (95%)** and produced
+        // **42 of the 321 rewrites (13%)**. Declining the non-address ones is most of that
+        // 95% for 31 of those 42 - a trade worth offering and not worth making silently.
+        bool skip_loop_carried_phis = false;
+
         bool z3_verify = false;
         Z3VerificationSettings z3_settings;
         TechniqueFamily enabled_families = TechniqueFamily::kAll;

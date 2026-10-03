@@ -131,6 +131,14 @@ namespace cobra {
         uint64_t solver_proved_nanoseconds  = 0;
         uint64_t solver_refuted_nanoseconds = 0;
         uint64_t solver_unknown_nanoseconds = 0;
+        // Proofs not asked because the identical question had already run its budget out.
+        // See `OutcomeCache::RecordUnknown`: before it existed an UNKNOWN left no trace at
+        // all, so the same timeout was paid on every run, and on one replayed proof CFG
+        // that was 121.49 s of the 128.41 s the solver cost.
+        uint64_t solver_unknown_skipped = 0;
+        // Candidates turned down without being searched because their tree stands on a
+        // value a loop carries. See `CobraPassOptions::skip_loop_carried_phis`.
+        uint64_t declined_loop_carried = 0;
 
         // A rewrite that was found, and then lost to the instruction budget
         // when it was built into the IR: the search bought nothing. Counted
@@ -187,6 +195,27 @@ namespace cobra {
         // standing for that many or more.
         static constexpr unsigned kMaxVariableRow = 16;
         CandidateClass by_variables[kMaxVariableRow + 1];
+
+        // Whether the collected tree involves a loop-carried phi - a phi at the head of a
+        // loop, which the collection looks through and which therefore stands for a
+        // different value on every iteration.
+        //
+        // The question this answers is whether such a candidate ever earns its keep. A
+        // caller that rebuilds its function hundreds of times over a growing body pays for
+        // these on every rebuild, and if none of them is ever rewritten the search is pure
+        // loss. Index 1 is "touches one", index 0 is "does not".
+        CandidateClass by_loop_phi[2];
+
+        // The same split, crossed with what reads the candidate's root. The question this
+        // answers is the one that decides whether `skip_loop_carried_phis` is safe to turn
+        // on for a caller that needs addresses: a rewrite lost in the `kPointerOffset`
+        // column is an address that may stop folding, while one lost in `kStoredValue` or
+        // `kOther` is only an expression left larger than it had to be.
+        CandidateClass by_loop_phi_consumer[2][static_cast< unsigned >(CandidateConsumer::kCount)];
+        // And of those reaching a pointer offset, how many stood on leaves that are all
+        // constants already - an expression a plain constant fold would reach without the
+        // search - against at least one symbolic leaf.
+        CandidateClass by_loop_phi_constant_leaves[2];
     };
 
     // Statistics are collected only when they are asked for: classifying a
@@ -226,6 +255,7 @@ namespace cobra {
         // `unknown_accepted_timeouts` is how many of them were its time limit.
         uint64_t unknown_accepted          = 0;
         uint64_t unknown_accepted_timeouts = 0;
+
         // The solver answered unknown and the candidate was declined: the mode
         // said so, or the tree holds a comparison, where no probe vouches for
         // the rewrite and the mode is therefore not asked.

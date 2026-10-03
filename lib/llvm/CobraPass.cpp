@@ -546,6 +546,8 @@ namespace cobra {
             into.solver_proved_nanoseconds += run.solver_proved_nanoseconds;
             into.solver_refuted_nanoseconds += run.solver_refuted_nanoseconds;
             into.solver_unknown_nanoseconds += run.solver_unknown_nanoseconds;
+            into.solver_unknown_skipped += run.solver_unknown_skipped;
+            into.declined_loop_carried += run.declined_loop_carried;
             into.proved_over_budget += run.proved_over_budget;
             into.proved_over_budget_nanoseconds += run.proved_over_budget_nanoseconds;
             into.cached_over_budget += run.cached_over_budget;
@@ -583,6 +585,18 @@ namespace cobra {
             }
             for (unsigned index = 0; index <= CobraStatistics::kMaxVariableRow; ++index) {
                 Merge(into.by_variables[index], run.by_variables[index]);
+            }
+            for (unsigned index = 0; index < 2; ++index) {
+                Merge(into.by_loop_phi[index], run.by_loop_phi[index]);
+                Merge(into.by_loop_phi_constant_leaves[index], run.by_loop_phi_constant_leaves[index]);
+                for (unsigned consumer = 0;
+                     consumer < static_cast< unsigned >(CandidateConsumer::kCount); ++consumer)
+                {
+                    Merge(
+                        into.by_loop_phi_consumer[index][consumer],
+                        run.by_loop_phi_consumer[index][consumer]
+                    );
+                }
             }
         }
 
@@ -1036,6 +1050,43 @@ namespace cobra {
                     && ever_inserted_.contains(std::hash< std::string >{}(key));
             }
 
+            // ---- proofs that did not finish ------------------------------------------
+            //
+            // A third state, and it has to be a third state. A proof the solver could not
+            // finish says nothing about the rewrite, so it must never become a `nullptr`
+            // entry: that is a refusal, and every later encounter would be served it. But
+            // leaving *no* trace at all - which is what this did - means the identical
+            // query is asked again on the next run, and the next, each time running the
+            // whole budget out.
+            //
+            // Measured by replaying the step-1073 proof CFG of one exploration through the
+            // round pipeline, 11 runs: of 128.41 s spent in the solver, **121.49 s was
+            // spent on queries that came back UNKNOWN** - and `cobra-unknown-as-unsat` is
+            // off, so not one of them could ever have produced a rewrite. The same
+            // expressions, every run.
+            //
+            // So the question is remembered as having run out of time. The budget needs no
+            // separate field: `CandidateKey` already mixes in `z3_settings.timeout_ms`, and
+            // the per-candidate scale is a function of the tree size the key describes - so
+            // a run given a *larger* budget asks under a different key and is not skipped,
+            // which is what keeps the original concern ("one timeout and the tree is never
+            // examined again, however much budget a later run would have given it") true.
+            // Nothing is written into the IR, so nothing travels with it, and the entry is
+            // never served as an outcome - `Find` cannot see it.
+            void RecordUnknown(const std::string &key) {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                if (unknown_.size() >= kMaxUnknown) {
+                    unknown_.clear();
+                }
+                unknown_.insert(key);
+            }
+
+            // Whether a proof of this exact question has already run its budget out.
+            bool WasUnknown(const std::string &key) const {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                return unknown_.contains(key);
+            }
+
           private:
             // Bound the footprint on very large modules. The cache is two
             // generations: when the young one fills up it becomes the old one
@@ -1059,10 +1110,19 @@ namespace cobra {
 
             static size_t Generation() { return Legacy() ? 8192 : kGeneration; }
 
+            // Dropped whole when it fills rather than aged in generations: an entry here
+            // only ever saves a timeout, so losing one costs the budget once instead of
+            // costing a rewrite.
+            static constexpr size_t kMaxUnknown = size_t{ 1 } << 18;
+
             mutable std::mutex mutex_;
             std::unordered_map< std::string, Entry > young_;
             std::unordered_map< std::string, Entry > old_;
             std::unordered_set< size_t > ever_inserted_;
+            // The questions whose proof ran out of its budget, by the same content key the
+            // outcomes use. Deliberately not an `Entry`: an outcome is served to callers
+            // and a `nullptr` outcome is a refusal, which this must never become.
+            std::unordered_set< std::string > unknown_;
         };
 
         // Never destroyed: worker threads write to it (see `Speculation`).
@@ -1639,6 +1699,44 @@ namespace cobra {
         //
         // `COBRA_THREADS` sets the number of workers; 0 solves everything in
         // the loop, as the pass used to.
+        // Whether a phi is carried by a loop: one of its own incoming edges comes from a
+        // block it dominates, which is what a back edge is.
+        //
+        // Asked of the dominator tree the pass already builds rather than of `LoopInfo`,
+        // so it costs nothing extra.
+        bool IsLoopCarriedPhi(const llvm::PHINode *phi, const llvm::DominatorTree &dominators) {
+            if (phi == nullptr) {
+                return false;
+            }
+            for (const auto *incoming : phi->blocks()) {
+                if (dominators.dominates(phi->getParent(), incoming)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Whether this candidate's tree involves a value that stands for a different thing
+        // on every iteration of a loop.
+        //
+        // The collection looks through phis, handing on one arm, so a loop-carried phi can
+        // sit inside the tree or be one of its leaves. Either way the expression the
+        // candidate describes is not one expression: the search is being asked to find a
+        // closed form for a value that has none.
+        bool TouchesLoopCarriedPhi(const MBACandidate &cand, const llvm::DominatorTree &dominators) {
+            for (const auto *instruction : cand.tree) {
+                if (IsLoopCarriedPhi(llvm::dyn_cast_or_null< llvm::PHINode >(instruction), dominators)) {
+                    return true;
+                }
+            }
+            for (const auto *leaf : cand.leaf_values) {
+                if (IsLoopCarriedPhi(llvm::dyn_cast_or_null< llvm::PHINode >(leaf), dominators)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         class Speculation
         {
           public:
@@ -2085,15 +2183,51 @@ namespace cobra {
             const unsigned variables = static_cast< unsigned >(
                 std::min< size_t >(cand.var_names.size(), CobraStatistics::kMaxVariableRow)
             );
-            const uint32_t consumers = classify ? ConsumerMask(cand.root) : 0U;
+            // Asked unconditionally when the policy needs it: it decides whether a
+            // loop-carried candidate is one of the cheap address-reaching ones.
+            const uint32_t consumers = (classify || options_.skip_loop_carried_phis)
+                ? ConsumerMask(cand.root)
+                : 0U;
             const auto consumer      = PrimaryConsumer(consumers);
+            // Whether this candidate stands on a value a loop carries. The dominator tree
+            // is built on demand, here as well as for the rewrites, because this question
+            // is asked of every candidate.
+            if (!dominators) {
+                dominators.emplace(*cand.root->getFunction());
+            }
+            const bool loop_phi = TouchesLoopCarriedPhi(cand, *dominators);
             const bool addresses =
                 (consumers & ConsumerBit(CandidateConsumer::kPointerOffset)) != 0;
 
             // What this candidate cost, filled in once the solve is done, and
             // added to every row it belongs to when its fate is known.
             uint64_t spent = 0;
+            // Whether every leaf is a constant: then the root is something a plain
+            // constant fold reaches and the search was never the thing that would settle
+            // it. Read here, before the solve, like everything else the report wants.
+            const bool constant_leaves =
+                !cand.leaf_values.empty()
+                && llvm::all_of(cand.leaf_values, [](const llvm::Value *leaf) {
+                       return llvm::isa< llvm::Constant >(leaf);
+                   });
             const auto account = [&](bool solved) {
+                const unsigned phi_row = loop_phi ? 1 : 0;
+                auto &by_phi = stats.by_loop_phi[phi_row];
+                ++by_phi.candidates;
+                by_phi.solved += solved ? 1 : 0;
+                by_phi.nanoseconds += spent;
+                if (classify) {
+                    auto &crossed = stats.by_loop_phi_consumer[phi_row][static_cast< unsigned >(consumer)];
+                    ++crossed.candidates;
+                    crossed.solved += solved ? 1 : 0;
+                    crossed.nanoseconds += spent;
+                }
+                if (constant_leaves) {
+                    auto &leaves = stats.by_loop_phi_constant_leaves[phi_row];
+                    ++leaves.candidates;
+                    leaves.solved += solved ? 1 : 0;
+                    leaves.nanoseconds += spent;
+                }
                 auto &by_variables = stats.by_variables[variables];
                 ++by_variables.candidates;
                 by_variables.solved += solved ? 1 : 0;
@@ -2115,6 +2249,33 @@ namespace cobra {
                     stats.pointer_offset_nanoseconds += spent;
                 }
             };
+
+            // Declined before anything is searched or proved, when the caller asked for
+            // that. After `account` so the row still counts it; nothing below has run, so
+            // its cost is the zero it reports.
+            //
+            // **Except the ones that reach an address**, and that exception is what makes
+            // the setting worth having. Crossing the loop-carried split with what reads the
+            // root, on the same CFG and the same 11 runs:
+            //
+            //     of the 2597 candidates standing on a loop-carried value
+            //       pointer offset   679 candidates   11 rewrites    0.13 s
+            //       stored value     542               8 rewrites   29.69 s
+            //       compared         398               7 rewrites   24.97 s
+            //       call argument    741               7 rewrites    0.16 s
+            //       other            237               9 rewrites    0.29 s
+            //
+            // The expensive ones are not the addresses. Keeping the address-reaching ones
+            // costs 0.13 s of the 55.24 s and keeps every rewrite that can make a pointer
+            // fold, which for a caller recovering control flow is the whole point of the
+            // pass. See `CobraPassOptions::skip_loop_carried_phis`.
+            const bool reaches_an_address =
+                (consumers & ConsumerBit(CandidateConsumer::kPointerOffset)) != 0;
+            if (loop_phi && options_.skip_loop_carried_phis && !reaches_an_address) {
+                ++stats.declined_loop_carried;
+                account(false);
+                continue;
+            }
 
             // A copy: queuing more candidates below can move `keys`.
             const std::string key = keys[index];
@@ -2373,6 +2534,23 @@ namespace cobra {
             // verified rewrite replaces the proposal in the cache, and a failed
             // proof replaces it with the rejection it would always have been.
             uint64_t verifying = 0;
+            // A proof of this exact question has already run its budget out, so asking it
+            // again at the same budget cannot do better - see `OutcomeCache::RecordUnknown`
+            // for what that was costing. Handled exactly as a fresh timeout is: the rewrite
+            // is discarded for this run and nothing is recorded against the tree.
+            const bool known_unknown = !outcome->verified && cache.WasUnknown(key);
+            if (known_unknown) {
+                ++stats.solver_unknown_skipped;
+                discard_rewrite();
+                const uint64_t rebuilding = since(rebuild_begin);
+                stats.rebuild_nanoseconds += rebuilding;
+                stats.rejected_nanoseconds += rebuilding;
+                spent += rebuilding;
+                ++stats.rejected_unverified;
+                account(false);
+                requeue_retries();
+                continue;
+            }
             if (!outcome->verified) {
                 const auto verify_begin  = std::chrono::steady_clock::now();
                 const uint64_t unknown_before = stats.solver_unknown_nanoseconds;
@@ -2388,7 +2566,9 @@ namespace cobra {
                 // a counterexample, and it will find it again.
                 const bool proof_unknown =
                     verified == nullptr && stats.solver_unknown_nanoseconds != unknown_before;
-                if (!proof_unknown) {
+                if (proof_unknown) {
+                    cache.RecordUnknown(key);
+                } else {
                     cache.Insert(key, verified);
                 }
                 verifying = since(verify_begin);
@@ -2695,6 +2875,8 @@ namespace cobra {
         cost("    proved", stats.solver_proved_nanoseconds);
         cost("    refuted", stats.solver_refuted_nanoseconds);
         cost("    unknown", stats.solver_unknown_nanoseconds);
+        part("    not re-asked, already unknown", stats.solver_unknown_skipped);
+        part("  declined, stands on a loop-carried value", stats.declined_loop_carried);
         line("  found, then over the IR budget", stats.proved_over_budget,
              stats.proved_over_budget_nanoseconds);
         part("  cached rewrite over the IR budget", stats.cached_over_budget);
@@ -2760,6 +2942,46 @@ namespace cobra {
                 << llvm::format("%12llu", stats.reaching_pointer_offset)
                 << llvm::format("%9llu", stats.solved_reaching_pointer_offset)
                 << llvm::format("%10.2f s\n", seconds(stats.pointer_offset_nanoseconds));
+        }
+
+        out << "  by whether the tree stands on a loop-carried value:\n";
+        for (unsigned index = 0; index < 2; ++index) {
+            const auto &row = stats.by_loop_phi[index];
+            if (row.candidates == 0) {
+                continue;
+            }
+            out << "    "
+                << llvm::left_justify(index == 1 ? "touches a loop-carried phi" : "does not", 30)
+                << llvm::format("%12llu", row.candidates) << llvm::format("%9llu", row.solved)
+                << llvm::format("%10.2f s\n", seconds(row.nanoseconds));
+        }
+
+        for (unsigned phi_row = 0; phi_row < 2; ++phi_row) {
+            bool any = false;
+            for (unsigned index = 0; index < static_cast< unsigned >(CandidateConsumer::kCount); ++index) {
+                any |= stats.by_loop_phi_consumer[phi_row][index].candidates != 0;
+            }
+            if (!any) {
+                continue;
+            }
+            out << (phi_row == 1 ? "    of those touching a loop-carried phi, by consumer:\n"
+                                 : "    of those that do not, by consumer:\n");
+            for (unsigned index = 0; index < static_cast< unsigned >(CandidateConsumer::kCount); ++index) {
+                const auto &row = stats.by_loop_phi_consumer[phi_row][index];
+                if (row.candidates == 0) {
+                    continue;
+                }
+                out << "      "
+                    << llvm::left_justify(NameOf(static_cast< CandidateConsumer >(index)), 28)
+                    << llvm::format("%12llu", row.candidates) << llvm::format("%9llu", row.solved)
+                    << llvm::format("%10.2f s\n", seconds(row.nanoseconds));
+            }
+            const auto &leaves = stats.by_loop_phi_constant_leaves[phi_row];
+            if (leaves.candidates != 0) {
+                out << "      " << llvm::left_justify("(every leaf a constant)", 28)
+                    << llvm::format("%12llu", leaves.candidates) << llvm::format("%9llu", leaves.solved)
+                    << llvm::format("%10.2f s\n", seconds(leaves.nanoseconds));
+            }
         }
 
         out << "  by independent leaves:\n";
