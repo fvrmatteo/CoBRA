@@ -26,6 +26,9 @@ namespace cobra {
             if (&inst == reuse.before || inst.getParent() == nullptr) {
                 return false;
             }
+            if (reuse.replaced != nullptr && reuse.replaced->contains(&inst)) {
+                return false;
+            }
             if (inst.hasPoisonGeneratingAnnotations()
                 && (reuse.poisons_root == nullptr || !reuse.poisons_root->contains(&inst)))
             {
@@ -259,6 +262,12 @@ namespace cobra {
             }
             case Expr::Kind::kShr: {
                 auto *operand = child(0);
+                // A shift by the width or more is 0 everywhere CoBRA reasons
+                // about it (`ModShr`, the solver, the ring normal form); `lshr`
+                // would make it poison instead, or wrap a huge amount around.
+                if (expr.constant_val >= int_ty->getBitWidth()) {
+                    return llvm::ConstantInt::get(int_ty, 0);
+                }
                 auto *amount  = llvm::ConstantInt::get(int_ty, expr.constant_val);
                 return EmitBinary(llvm::Instruction::LShr, operand, amount, builder, "cobra.shr", reuse);
             }

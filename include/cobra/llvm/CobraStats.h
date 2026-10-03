@@ -126,6 +126,24 @@ namespace cobra {
         // (offered only under `sweep`, see ProposeRewrite).
         uint64_t leaf_identities = 0;
         uint64_t enumeration_nanoseconds    = 0;
+        // Proofs settled by `ProveEqualByRingNormalForm` before any solver is
+        // asked, how many were attempted, and the time all the attempts took.
+        uint64_t ring_attempted   = 0;
+        uint64_t ring_proved      = 0;
+        uint64_t ring_nanoseconds = 0;
+        // Readers whose poison-generating flags were dropped after a rewrite
+        // proved on part of the bits (`DropAssumptionsOfReaders`), and queued
+        // candidates declined because a rewrite since gave their root readers
+        // that look at more bits than they were collected for.
+        uint64_t reader_flags_dropped = 0;
+        uint64_t demanded_grew        = 0;
+        // Queued candidates passed by: an unreachable root, a tree that holds
+        // a root replaced earlier in the run, no expression to prove against
+        // (with the solver on); and worker tasks withdrawn for them.
+        uint64_t unreachable_roots              = 0;
+        uint64_t stale_trees                    = 0;
+        uint64_t declined_no_expression         = 0;
+        uint64_t background_withdrawn_unneeded  = 0;
         uint64_t solver_calls               = 0;
         uint64_t solver_nanoseconds         = 0;
         uint64_t solver_proved_nanoseconds  = 0;

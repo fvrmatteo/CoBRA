@@ -8,6 +8,7 @@
 #include "cobra/core/CompiledExpr.h"
 #include "cobra/core/ExprCost.h"
 #include "cobra/core/ExprTraversal.h"
+#include "cobra/core/RingProof.h"
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/core/Simplifier.h"
@@ -16,6 +17,7 @@
     #include "cobra/verify/Z3Verifier.h"
 #endif
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
@@ -542,6 +544,15 @@ namespace cobra {
             into.search_found_nanoseconds += run.search_found_nanoseconds;
             into.leaf_identities += run.leaf_identities;
             into.enumeration_nanoseconds += run.enumeration_nanoseconds;
+            into.ring_attempted += run.ring_attempted;
+            into.ring_proved += run.ring_proved;
+            into.ring_nanoseconds += run.ring_nanoseconds;
+            into.reader_flags_dropped += run.reader_flags_dropped;
+            into.demanded_grew += run.demanded_grew;
+            into.unreachable_roots += run.unreachable_roots;
+            into.stale_trees += run.stale_trees;
+            into.declined_no_expression += run.declined_no_expression;
+            into.background_withdrawn_unneeded += run.background_withdrawn_unneeded;
             into.solver_calls += run.solver_calls;
             into.solver_nanoseconds += run.solver_nanoseconds;
             into.solver_proved_nanoseconds += run.solver_proved_nanoseconds;
@@ -984,6 +995,14 @@ namespace cobra {
             key += '|';
             if (cand.expr != nullptr) {
                 AppendExprKey(*cand.expr, key);
+            } else {
+                // Without an expression the key is the signature alone, which
+                // two different trees can share - and with the solver off a
+                // rewrite found for one would be served to the other unprobed.
+                // Such a key is never shared.
+                static std::atomic< uint64_t > unshared{ 0 };
+                key += "|unshared:";
+                key += std::to_string(unshared.fetch_add(1, std::memory_order_relaxed));
             }
             return key;
         }
@@ -1097,6 +1116,30 @@ namespace cobra {
                 }
                 auto &recorded = unknown_[key];
                 recorded       = std::max(recorded, scale);
+            }
+
+            // Records that the rewrite cached under `key` was refuted: the
+            // enumeration or the solver found an input it gets wrong.
+            //
+            // `Insert` will not let a refusal displace a non-null entry, which
+            // is right for a *proved* rewrite and wrong for the unverified
+            // proposal the proof just refuted: kept, it is served to the next
+            // candidate with this key, which rebuilds the rewrite and proves it
+            // wrong again, and the one after that. A refutation is definite, so
+            // it replaces the proposal; a proved rewrite is still never
+            // displaced.
+            void Refute(const std::string &key) {
+                {
+                    const std::lock_guard< std::mutex > lock(mutex_);
+                    for (auto *generation : { &young_, &old_ }) {
+                        if (auto it = generation->find(key);
+                            it != generation->end() && it->second != nullptr && !it->second->verified)
+                        {
+                            it->second = nullptr;
+                        }
+                    }
+                }
+                Insert(key, nullptr);
             }
 
             // Whether a proof of this exact question has already run out of a budget at
@@ -1454,6 +1497,51 @@ namespace cobra {
                 .verified           = false });
         }
 
+        // `COBRA_RING_PROOF=0` sends every question past the enumeration to the
+        // solver, as before the ring normal form existed.
+        bool RingProofEnabled() {
+            static const bool enabled = [] {
+                const char *choice = std::getenv("COBRA_RING_PROOF");
+                return choice == nullptr || std::string_view(choice) != "0";
+            }();
+            return enabled;
+        }
+
+        // `COBRA_RING_CHECK=1`: every ring proof is also checked by evaluating both
+        // sides on random and boundary inputs, and one they disagree on is
+        // reported and not taken. A check on the prover, not a proof: for
+        // validating it on a real workload.
+        bool RingProofSurvivesSampling(const Expr &lhs, const Expr &rhs, const MBACandidate &cand) {
+            static const bool check = std::getenv("COBRA_RING_CHECK") != nullptr;
+            if (!check) {
+                return true;
+            }
+            const auto variables = static_cast< uint32_t >(cand.var_names.size());
+            const uint64_t mask  = Bitmask(cand.bitwidth);
+            uint64_t state       = 0x9E3779B97F4A7C15ULL ^ std::hash< std::string >{}(Render(lhs, cand.var_names, cand.bitwidth));
+            const auto next      = [&] {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                return state;
+            };
+            static const uint64_t kBoundary[] = { 0, 1, 2, ~uint64_t{ 0 }, ~uint64_t{ 0 } - 1,
+                                                  uint64_t{ 1 } << 63, (uint64_t{ 1 } << 63) - 1 };
+            std::vector< uint64_t > values(variables);
+            for (int round = 0; round < 4096; ++round) {
+                for (auto &value : values) {
+                    value = (round < 64 ? kBoundary[next() % 7] : next()) & mask;
+                }
+                if (EvalExpr(lhs, values, cand.bitwidth) != EvalExpr(rhs, values, cand.bitwidth)) {
+                    llvm::errs() << "CoBRA: COBRA_RING_CHECK: a ring proof does not survive sampling\n  lhs "
+                                 << Render(lhs, cand.var_names, cand.bitwidth) << "\n  rhs "
+                                 << Render(rhs, cand.var_names, cand.bitwidth) << "\n";
+                    return false;
+                }
+            }
+            return true;
+        }
+
         // How many times `z3_settings.timeout_ms` the proof of `cand` is given: one per
         // `kNodesPerBudget` instructions of its IR tree, at least one and at most
         // `kMaxBudgetScale`. See `VerifyCandidate` for why the budget grows with the tree.
@@ -1526,6 +1614,21 @@ namespace cobra {
                     return nullptr;
                 }
                 proved = decided.has_value();
+
+                // Then by algebra, before any solver: a normal form over the ring
+                // settles in microseconds what bit-blasting a multiplier cannot in
+                // seconds (see `ProveEqualByRingNormalForm`). It only ever proves,
+                // so what it does not settle goes on to the solver as before.
+                if (!proved && RingProofEnabled()) {
+                    const auto ring_begin = std::chrono::steady_clock::now();
+                    ++stats.ring_attempted;
+                    proved = ProveEqualByRingNormalForm(*original, *rewritten, cand.bitwidth);
+                    if (proved && !RingProofSurvivesSampling(*original, *rewritten, cand)) {
+                        proved = false;
+                    }
+                    stats.ring_nanoseconds += since(ring_begin);
+                    stats.ring_proved += proved ? 1 : 0;
+                }
             }
 
 #ifdef COBRA_HAS_Z3
@@ -1780,6 +1883,63 @@ namespace cobra {
             return false;
         }
 
+        // Drops the poison-generating flags and metadata of every reader the
+        // rewrite of `replaced` may have changed - what LLVM's BDCE does in
+        // `clearAssumptionsOfUsers`, and for the same reason.
+        //
+        // The rewrite is proved equal to the tree on the bits its readers
+        // demand, and demanded bits are worked out ignoring `nuw`/`nsw`,
+        // `exact`, `or disjoint`, `trunc nuw`/`nsw` and `zext nneg`: `or
+        // disjoint %r, 256` does not demand bit 8 of `%r`, yet it is poison if
+        // that bit is set. A rewrite that differs from the tree only on bits
+        // nobody demands can therefore turn such a reader into poison where
+        // the original was defined. Every reader is cleared, and so is every
+        // reader of a reader that does not demand all of its own bits - only
+        // through those can a changed bit travel on.
+        //
+        // `readers` are the root's readers as they were before the rewrite was
+        // put in: not the replacement's, which may be a constant read all over
+        // the module or a value the rest of the function already used.
+        uint64_t DropAssumptionsOfReaders(
+            llvm::ArrayRef< llvm::Instruction * > readers, DemandedBitsOracle &demanded
+        ) {
+            uint64_t dropped = 0;
+            llvm::SmallPtrSet< llvm::Instruction *, 16 > visited;
+            llvm::SmallVector< llvm::Instruction *, 16 > work;
+            for (llvm::Instruction *reader : readers) {
+                if (visited.insert(reader).second) {
+                    work.push_back(reader);
+                }
+            }
+            while (!work.empty()) {
+                llvm::Instruction *reader = work.pop_back_val();
+                if (reader->hasPoisonGeneratingAnnotations()) {
+                    reader->dropPoisonGeneratingAnnotations();
+                    ++dropped;
+                }
+                // Only an integer reader that some of its own bits go unread
+                // in can pass a changed bit on; a wider-than-64-bit one is
+                // followed too, since the oracle does not answer for it.
+                auto *type = llvm::dyn_cast< llvm::IntegerType >(reader->getType());
+                if (type == nullptr) {
+                    continue;
+                }
+                if (type->getBitWidth() <= 64
+                    && demanded.MaskOf(reader) == Bitmask(type->getBitWidth()))
+                {
+                    continue;
+                }
+                for (llvm::User *user : reader->users()) {
+                    if (auto *next = llvm::dyn_cast< llvm::Instruction >(user);
+                        next != nullptr && visited.insert(next).second)
+                    {
+                        work.push_back(next);
+                    }
+                }
+            }
+            return dropped;
+        }
+
         class Speculation
         {
           public:
@@ -1855,6 +2015,20 @@ namespace cobra {
                 }
                 ++stats.background_settled;
                 return true;
+            }
+
+            // The loop will not ask for `key`: a task no worker has started is
+            // withdrawn, so the workers do not spend time on it and `Drain`
+            // does not wait for it. One already running is left to finish.
+            void Withdraw(const std::string &key, CobraStatistics &stats) {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                auto found = by_key_.find(key);
+                if (found == by_key_.end() || found->second->state != Task::kPending) {
+                    return;
+                }
+                found->second->state = Task::kWithdrawn;
+                by_key_.erase(found);
+                ++stats.background_withdrawn_unneeded;
             }
 
             // Withdraws everything not started and waits for what is running,
@@ -2109,7 +2283,7 @@ namespace cobra {
         std::vector< std::string > keys;
         const auto queue_key = [&](const MBACandidate &queued) {
             keys.push_back(CandidateKey(queued, options_));
-            if (speculation.Enabled() && !cache.Find(keys.back()).has_value()) {
+            if (speculation.Enabled() && queued.expr != nullptr && !cache.Find(keys.back()).has_value()) {
                 const uint32_t budget = options_.cost_model == MbaCostModel::kTreeInstructions
                     ? queued.tree_size
                     : queued.dying_count;
@@ -2148,6 +2322,9 @@ namespace cobra {
         // function until the run ends.
         std::optional< llvm::DominatorTree > dominators;
         llvm::DenseSet< const llvm::Instruction * > retired;
+        // Rewrites applied so far in this run, and the roots they replaced.
+        uint64_t rewrites_this_run = 0;
+        llvm::DenseSet< const llvm::Value * > replaced_roots;
 
         for (size_t index = 0; index < candidates.size(); ++index) {
             auto &cand = candidates[index];
@@ -2155,9 +2332,76 @@ namespace cobra {
             // A root an earlier rewrite replaced has no readers left. Its
             // re-cuts and inner roots were queued before that happened, and
             // solving them now buys nothing.
+            // Every way of passing a queued candidate by without solving it
+            // also takes back what was handed to the workers for it.
+            const auto pass_by = [&] {
+                if (speculation.Enabled()) {
+                    speculation.Withdraw(keys[index], stats);
+                }
+            };
+
             if (cand.root->use_empty()) {
                 ++stats.dead_roots;
+                pass_by();
                 continue;
+            }
+
+            // An unreachable root is no value at all, and reading what dominates
+            // it is meaningless there: every definition dominates an
+            // unreachable use, so a rewrite could read the root's own readers
+            // and close a cycle through it.
+            if (!dominators) {
+                dominators.emplace(f);
+            }
+            if (!dominators->isReachableFromEntry(cand.root->getParent())) {
+                ++stats.unreachable_roots;
+                pass_by();
+                continue;
+            }
+
+            // A tree collected before a root inside it was replaced describes
+            // values the root no longer reads: the replaced root stays in the
+            // function until the run ends, unread, still computing the old tree
+            // with its old flags and its own reading of what may be poison. As
+            // a leaf it would be read back by the rewrite; inside the tree it
+            // is a shape the next run will not see. Either way the tree is left
+            // for the next run, which collects it from the simplified function.
+            //
+            // Measured both ways over a whole exploration, with identical
+            // labels: skipping only trees that *read* a replaced root as a leaf
+            // cost 98.5 s and emitted 2814 instructions; skipping every tree
+            // that holds one cost 45.5 s and emitted 2756 - the trees built on
+            // a replaced root were mostly the ones the solver ran out of time on.
+            if (!replaced_roots.empty()
+                && (llvm::any_of(cand.tree, [&](const llvm::Instruction *node) {
+                        return replaced_roots.contains(node);
+                    })
+                    || llvm::any_of(cand.leaf_values, [&](const llvm::Value *leaf) {
+                           return replaced_roots.contains(leaf);
+                       })))
+            {
+                ++stats.stale_trees;
+                pass_by();
+                continue;
+            }
+
+            // The demanded mask was read when the candidate was queued. A
+            // rewrite since then can give the root readers it did not have -
+            // an earlier rewrite may *be* this root, read back as the cheapest
+            // way to build its replacement - and a proof on the old, narrower
+            // mask says nothing about the bits those readers look at. So the
+            // mask is read again, and a candidate whose readers now look at
+            // more than it was collected for is left for the next run, which
+            // collects it afresh.
+            if (rewrites_this_run != 0 && cand.root->getType()->isIntegerTy()
+                && cand.root->getType()->getIntegerBitWidth() <= 64)
+            {
+                const uint64_t now = demanded_bits.MaskOf(cand.root) & Bitmask(cand.bitwidth);
+                if ((now & ~cand.demanded_mask) != 0) {
+                    ++stats.demanded_grew;
+                    pass_by();
+                    continue;
+                }
             }
 
             // Only a full collection speaks for the tree rooted at an
@@ -2351,7 +2595,20 @@ namespace cobra {
                 (consumers & ConsumerBit(CandidateConsumer::kPointerOffset)) != 0;
             if (loop_phi && options_.skip_loop_carried_phis && !reaches_an_address) {
                 ++stats.declined_loop_carried;
+                pass_by();
                 account(false);
+                continue;
+            }
+
+            // Without an expression there is nothing for the solver to prove
+            // the rewrite against, and `VerifyCandidate` turns every such
+            // rewrite down: searching for one is time spent on an answer that
+            // cannot be used. Treated exactly as that refusal is.
+            if (cand.expr == nullptr && options_.z3_verify) {
+                ++stats.declined_no_expression;
+                account(false);
+                record_rejection();
+                requeue_retries();
                 continue;
             }
 
@@ -2512,6 +2769,7 @@ namespace cobra {
                 }
                 reuse.before     = cand.root;
                 reuse.dominators = &*dominators;
+                reuse.replaced   = &replaced_roots;
                 if (cand.poison_reaches_root) {
                     poisons_root.insert(cand.tree.begin(), cand.tree.end());
                     reuse.poisons_root = &poisons_root;
@@ -2631,8 +2889,8 @@ namespace cobra {
             }
             if (!outcome->verified) {
                 const auto verify_begin  = std::chrono::steady_clock::now();
-                const uint64_t unknown_before = stats.solver_unknown_nanoseconds;
-                auto verified            = VerifyCandidate(cand, *outcome, options_, stats);
+                bool unknown             = false;
+                auto verified            = VerifyCandidate(cand, *outcome, options_, stats, &unknown);
                 // A proof that did not finish says nothing about the rewrite,
                 // so it leaves no trace: neither a null in the cache nor a
                 // fingerprint on the root. Both would turn "the solver ran out
@@ -2642,8 +2900,9 @@ namespace cobra {
                 // again, however much budget a later run would have given it.
                 // A refutation is different and is recorded: the solver found
                 // a counterexample, and it will find it again.
-                const bool proof_unknown =
-                    verified == nullptr && stats.solver_unknown_nanoseconds != unknown_before;
+                // Read from the proof itself, not inferred from whether the
+                // unknown-time counter moved.
+                const bool proof_unknown = verified == nullptr && unknown;
                 if (cache.WasBackgroundUnknown(key)) {
                     ++(verified != nullptr ? stats.after_background_unknown_proved
                        : proof_unknown     ? stats.after_background_unknown_unknown
@@ -2652,6 +2911,8 @@ namespace cobra {
                 }
                 if (proof_unknown) {
                     cache.RecordUnknown(key, ProofBudgetScale(cand));
+                } else if (verified == nullptr) {
+                    cache.Refute(key);
                 } else {
                     cache.Insert(key, verified);
                 }
@@ -2661,9 +2922,8 @@ namespace cobra {
                 if (SlowReport().enabled && verifying / 1000000 >= SlowReport().threshold_ms) {
                     static uint64_t verify_sequence = 0;
                     const char *verdict = verified != nullptr ? "verified"
-                        : stats.solver_unknown_nanoseconds != unknown_before
-                        ? "verification unknown"
-                        : "verification refuted";
+                        : proof_unknown                       ? "verification unknown"
+                                                              : "verification refuted";
                     RecordCandidate(
                         SlowReport().directory + "/verify", verify_sequence, f, cand, outcome.get(),
                         verifying / 1000000, verdict
@@ -2727,7 +2987,22 @@ namespace cobra {
                     }
                 }
             }
+            // Proved on the demanded bits only: the root's readers whose flags
+            // read the rest must lose them (see `DropAssumptionsOfReaders`).
+            llvm::SmallVector< llvm::Instruction *, 8 > root_readers;
+            if (cand.demanded_mask != Bitmask(cand.bitwidth)) {
+                for (llvm::User *user : cand.root->users()) {
+                    if (auto *reader = llvm::dyn_cast< llvm::Instruction >(user)) {
+                        root_readers.push_back(reader);
+                    }
+                }
+            }
             cand.root->replaceAllUsesWith(new_val);
+            replaced_roots.insert(cand.root);
+            if (!root_readers.empty()) {
+                stats.reader_flags_dropped += DropAssumptionsOfReaders(root_readers, demanded_bits);
+            }
+            ++rewrites_this_run;
 
             // What this rewrite takes out of the function, for the rewrites
             // after it: an instruction of the tree goes once everything that
@@ -2769,7 +3044,10 @@ namespace cobra {
             // A replacement that is an instruction the function already held is
             // not CoBRA's output, and nothing has been learnt about it here.
             auto *new_inst = llvm::dyn_cast< llvm::Instruction >(new_val);
-            if (new_inst != nullptr && !reuse.seen.contains(new_inst)) {
+            // Nor is a leaf the rewrite came down to: it was never solved.
+            if (new_inst != nullptr && !reuse.seen.contains(new_inst)
+                && !llvm::is_contained(cand.leaf_values, new_val))
+            {
                 if (auto new_fp = ComputeMbaFingerprint(new_inst, options_.max_tree_nodes)) {
                     // The replacement has the root's readers, so its demand is
                     // the root's.
@@ -2955,6 +3233,22 @@ namespace cobra {
             part("    a tree equal to one of its inputs (sweep)", stats.leaf_identities);
         }
         cost("  proving by running every input", stats.enumeration_nanoseconds);
+        line("  proving in a ring normal form (attempts)", stats.ring_attempted, stats.ring_nanoseconds);
+        part("    proved without a solver", stats.ring_proved);
+        part("  readers' poison flags dropped after a partial-bits rewrite", stats.reader_flags_dropped);
+        part("  queued candidates whose root's readers grew", stats.demanded_grew);
+        part("  queued candidates on an unreachable root", stats.unreachable_roots);
+        part("  queued candidates over a root replaced this run", stats.stale_trees);
+        part("  candidates without an expression to prove", stats.declined_no_expression);
+        part("  worker tasks withdrawn for candidates passed by", stats.background_withdrawn_unneeded);
+        {
+            const auto phis = PhiArmStatistics();
+            if (phis.checked != 0) {
+                part("  transparent phi sets checked", phis.checked);
+                part("    other arms the same computation", phis.exact_accept);
+                part("    accepted by probes alone (not exact)", phis.probes_only);
+            }
+        }
         line("  proving with the solver", stats.solver_calls, stats.solver_nanoseconds);
         cost("    proved", stats.solver_proved_nanoseconds);
         cost("    refuted", stats.solver_refuted_nanoseconds);

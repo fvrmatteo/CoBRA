@@ -20,6 +20,7 @@
 #include "llvm/Support/Casting.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -78,6 +79,14 @@ namespace cobra {
 
     namespace {
 
+        // The low 64 bits of a constant of any width: `getZExtValue` asserts
+        // on a wider one, which a `trunc` of an i128 constant can bring into a
+        // tree that is itself at most 64 bits wide.
+        uint64_t LowWord(const llvm::ConstantInt *ci) {
+            return ci->getValue().getBitWidth() <= 64 ? ci->getZExtValue()
+                                                      : ci->getValue().trunc(64).getZExtValue();
+        }
+
         // Metadata kind holding an MbaFingerprint plus the options tag it was
         // recorded under. Unknown metadata is dropped rather than rewritten
         // when a pass rebuilds an instruction, so a lost record only costs a
@@ -109,7 +118,7 @@ namespace cobra {
                 return leaf;
             }
             if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(v)) {
-                const std::pair< uint64_t, uint32_t > c{ MixFingerprint(2, ci->getZExtValue()),
+                const std::pair< uint64_t, uint32_t > c{ MixFingerprint(2, LowWord(ci)),
                                                          0 };
                 memo[v] = c;
                 return c;
@@ -642,8 +651,14 @@ namespace cobra {
                 if (v == phi) {
                     return true;
                 }
-                if (!seen.insert(v).second || seen.size() > kMaxVisited) {
+                if (!seen.insert(v).second) {
                     continue;
+                }
+                // Out of budget is not "no cycle": the walk has not looked at
+                // everything the phi reaches, and reading a loop-carried phi
+                // as transparent is the miscompilation described above.
+                if (seen.size() > kMaxVisited) {
+                    return true;
                 }
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
                 if (inst == nullptr) {
@@ -1079,7 +1094,7 @@ namespace cobra {
 
                 if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(v)) {
                     const auto index = static_cast< uint32_t >(consts_.size());
-                    consts_.push_back(ci->getZExtValue() & mask_);
+                    consts_.push_back(LowWord(ci) & mask_);
                     const uint32_t slot = Emit(Op::kConst, index, 0);
                     slot_of[v]          = slot;
                     return slot;
@@ -1471,7 +1486,7 @@ namespace cobra {
 
             // Constant
             if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(v)) {
-                return Expr::Constant(ci->getZExtValue() & mask);
+                return Expr::Constant(LowWord(ci) & mask);
             }
 
             const auto tree_width = static_cast< uint32_t >(std::popcount(mask));
@@ -1595,7 +1610,10 @@ namespace cobra {
                 if (child == nullptr) {
                     return nullptr;
                 }
-                uint64_t mul_val = 1ULL << shift_amt->getZExtValue();
+                // `shl` by the width or more is poison; 0 refines it and keeps
+                // the C++ shift defined.
+                const uint64_t amount  = shift_amt->getValue().getLimitedValue(64);
+                uint64_t mul_val       = amount >= 64 ? 0 : 1ULL << amount;
                 return mask_to_width(Expr::Mul(std::move(child), Expr::Constant(mul_val)));
             }
 
@@ -1830,7 +1848,111 @@ namespace cobra {
         // evaluate identically for random inputs.  Returns false if
         // any arm diverges, indicating the phi should be treated as
         // a leaf instead.
+        std::atomic< uint64_t > phi_arms_checked{ 0 };
+        std::atomic< uint64_t > phi_arms_probes_accept{ 0 };
+        std::atomic< uint64_t > phi_arms_exact_accept{ 0 };
+        std::atomic< uint64_t > phi_arms_probes_only{ 0 };
+
+        // Whether `a` and `b` compute the same value: the very same value, or
+        // the same operation - opcode, types, predicate, callee and attributes,
+        // as `isSameOperationAs` compares them - over operands that are in turn
+        // the same computation. Equal for every input by construction, which a
+        // probe is not: arms that differ only where an `icmp eq` or a `select`
+        // flips agree on almost every random input.
+        //
+        // A phi is only ever the same as itself, and nothing that touches
+        // memory is followed, since the same load on two paths can read two
+        // different things. Bounded: past `budget` pairs the answer is no.
+        bool SameComputation(
+            llvm::Value *a, llvm::Value *b,
+            llvm::DenseSet< std::pair< llvm::Value *, llvm::Value * > > &proven, unsigned &budget
+        ) {
+            if (a == b) {
+                return true;
+            }
+            if (a->getType() != b->getType()) {
+                return false;
+            }
+            auto *ia = llvm::dyn_cast< llvm::Instruction >(a);
+            auto *ib = llvm::dyn_cast< llvm::Instruction >(b);
+            if (ia == nullptr || ib == nullptr || llvm::isa< llvm::PHINode >(ia)
+                || llvm::isa< llvm::PHINode >(ib) || ia->mayReadOrWriteMemory()
+                || ib->mayReadOrWriteMemory() || !ia->isSameOperationAs(ib))
+            {
+                return false;
+            }
+            if (budget == 0) {
+                return false;
+            }
+            --budget;
+            if (!proven.insert({ a, b }).second) {
+                return true;
+            }
+            for (unsigned i = 0; i < ia->getNumOperands(); ++i) {
+                if (!SameComputation(ia->getOperand(i), ib->getOperand(i), proven, budget)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Whether every arm of every transparent phi is the same computation
+        // as the arm the collection followed.
+        bool PhiArmsAreTheSameComputation(
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
+        ) {
+            llvm::DenseSet< std::pair< llvm::Value *, llvm::Value * > > proven;
+            unsigned budget = 4096;
+            for (const auto &[phi_val, chosen] : phi_redirects) {
+                auto *phi = llvm::cast< llvm::PHINode >(phi_val);
+                for (llvm::Value *incoming : phi->incoming_values()) {
+                    if (!SameComputation(incoming, chosen, proven, budget)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool VerifyPhiArmsByProbes(
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+            const std::vector< llvm::Value * > &leaves, uint32_t bitwidth
+        );
+
+        // Whether the collection may read each transparent phi as the arm it
+        // followed. The tree is that arm, so every other arm has to be equal
+        // to it on every input, or the expression is not the value.
+        //
+        // This used to be decided by evaluating the arms on eight random
+        // inputs. That is no proof: arms that differ only where a comparison
+        // or a `select` flips agree on almost every random input, and the
+        // other arms' operations were evaluated without the width checks the
+        // followed arm passed (a `sext` read as a `zext`). Either way the
+        // rewrite was proved against an expression only one path computes.
+        // Now every other arm has to be the same computation, which is exact.
+        // `COBRA_PHI_ARMS=probes` puts the probes back, for measuring what the
+        // exact check costs in rewrites.
         bool VerifyPhiArms(
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+            const std::vector< llvm::Value * > &leaves, uint32_t bitwidth
+        ) {
+            if (phi_redirects.empty()) {
+                return true;
+            }
+            static const bool probes = [] {
+                const char *choice = std::getenv("COBRA_PHI_ARMS");
+                return choice != nullptr && std::string_view(choice) == "probes";
+            }();
+            const bool exact = PhiArmsAreTheSameComputation(phi_redirects);
+            const bool probed = VerifyPhiArmsByProbes(phi_redirects, leaves, bitwidth);
+            phi_arms_checked.fetch_add(1, std::memory_order_relaxed);
+            phi_arms_probes_accept.fetch_add(probed ? 1 : 0, std::memory_order_relaxed);
+            phi_arms_exact_accept.fetch_add(exact ? 1 : 0, std::memory_order_relaxed);
+            phi_arms_probes_only.fetch_add(probed && !exact ? 1 : 0, std::memory_order_relaxed);
+            return probes ? probed : exact;
+        }
+
+        bool VerifyPhiArmsByProbes(
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
             const std::vector< llvm::Value * > &leaves, uint32_t bitwidth
         ) {
@@ -1875,7 +1997,7 @@ namespace cobra {
                     // Evaluate chosen arm.
                     uint64_t chosen_val = 0;
                     if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(chosen)) {
-                        chosen_val = ci->getZExtValue() & mask;
+                        chosen_val = LowWord(ci) & mask;
                     } else {
                         chosen_val =
                             plan_for(chosen).Evaluate(inputs.data(), inputs.size(), slots);
@@ -1895,7 +2017,7 @@ namespace cobra {
 
                         uint64_t inc_val = 0;
                         if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(inc)) {
-                            inc_val = ci->getZExtValue() & mask;
+                            inc_val = LowWord(ci) & mask;
                         } else {
                             inc_val =
                                 plan_for(inc).Evaluate(inputs.data(), inputs.size(), slots);
@@ -2439,6 +2561,13 @@ namespace cobra {
                 ctx, { u64(fp.structure), u32(fp.depth), u32(fp.num_vars), u64(options_tag) }
             )
         );
+    }
+
+    PhiArmCounters PhiArmStatistics() {
+        return PhiArmCounters{ .checked       = phi_arms_checked.load(),
+                               .probes_accept = phi_arms_probes_accept.load(),
+                               .exact_accept  = phi_arms_exact_accept.load(),
+                               .probes_only   = phi_arms_probes_only.load() };
     }
 
     std::optional< MbaFingerprint >

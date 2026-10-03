@@ -6,6 +6,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Value.h"
@@ -45,6 +46,12 @@ namespace cobra {
         // when the value replaced was poison there too. Any other flagged
         // instruction is left alone and the operator is built without flags.
         const llvm::SmallPtrSetImpl< const llvm::Instruction * > *poisons_root = nullptr;
+
+        // Roots an earlier rewrite of the same run replaced. Each stays in the
+        // function, unread, until the run ends, still computing the old tree
+        // with its old flags, so it is never read back: its readers now read
+        // the replacement, and it is not the value they see.
+        const llvm::DenseSet< const llvm::Value * > *replaced = nullptr;
 
         // Filled in: the instructions read that the reconstruction did not
         // emit itself, each once, and the ones it did emit.

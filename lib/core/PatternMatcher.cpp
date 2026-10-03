@@ -187,8 +187,14 @@ namespace cobra {
             std::unique_ptr< Expr > masked = mask == Bitmask(bitwidth)
                 ? std::move(variable)
                 : Expr::BitwiseAnd(std::move(variable), Expr::Constant(mask));
-            auto candidate = kConstant == 0
-                ? std::move(masked)
+            // The whole word flipped is `~x`: spelled as the operator it is
+            // rather than as `-1 ^ x`, which the recognisers downstream do not
+            // read as a complement - spelled that way, eight expressions of the
+            // QSynth set stopped simplifying.
+            const bool whole = mask == Bitmask(bitwidth);
+            auto candidate   = kConstant == 0 ? std::move(masked)
+                : whole && kConstant == Bitmask(bitwidth)
+                ? Expr::BitwiseNot(std::move(masked))
                 : Expr::BitwiseXor(Expr::Constant(kConstant), std::move(masked));
 
             if (!IsBetter(ComputeCost(*candidate).cost, baseline_cost)) {
