@@ -7,6 +7,7 @@
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/CompiledExpr.h"
 #include "cobra/core/ExprCost.h"
+#include "cobra/core/ExprTraversal.h"
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/core/Simplifier.h"
@@ -567,6 +568,12 @@ namespace cobra {
             into.inner_nanoseconds += run.inner_nanoseconds;
             into.background_submitted += run.background_submitted;
             into.background_solved += run.background_solved;
+            into.background_unknown += run.background_unknown;
+            into.background_unknown_nanoseconds += run.background_unknown_nanoseconds;
+            into.after_background_unknown_proved += run.after_background_unknown_proved;
+            into.after_background_unknown_refuted += run.after_background_unknown_refuted;
+            into.after_background_unknown_unknown += run.after_background_unknown_unknown;
+            into.after_background_unknown_nanoseconds += run.after_background_unknown_nanoseconds;
             into.background_proofs_skipped += run.background_proofs_skipped;
             into.background_settled += run.background_settled;
             into.background_withdrawn += run.background_withdrawn;
@@ -887,6 +894,14 @@ namespace cobra {
                 log << "node-limit     " << cand.node_limit << "\n";
             }
             log << "variables      " << cand.var_names.size() << "\n";
+            if (cand.expr) {
+                // The tree as the solve reads it: its node count, which can be far
+                // above `tree-size` once the IR's sharing is expanded, and whether
+                // a comparison in it makes the proof the only check there is.
+                log << "expr-nodes     " << CountNodes(*cand.expr)
+                    << (ContainsComparison(*cand.expr) ? ", holds a comparison" : "") << "\n";
+            }
+            log << "consumer       " << NameOf(PrimaryConsumer(ConsumerMask(cand.root))) << "\n";
             log << "root           " << PrintedValue(cand.root) << "\n";
             if (cand.expr) {
                 log << "expression-in  " << RenderSSA(*cand.expr, cand.var_names) << "\n";
@@ -1065,26 +1080,46 @@ namespace cobra {
             // off, so not one of them could ever have produced a rewrite. The same
             // expressions, every run.
             //
-            // So the question is remembered as having run out of time. The budget needs no
-            // separate field: `CandidateKey` already mixes in `z3_settings.timeout_ms`, and
-            // the per-candidate scale is a function of the tree size the key describes - so
-            // a run given a *larger* budget asks under a different key and is not skipped,
-            // which is what keeps the original concern ("one timeout and the tree is never
-            // examined again, however much budget a later run would have given it") true.
-            // Nothing is written into the IR, so nothing travels with it, and the entry is
-            // never served as an outcome - `Find` cannot see it.
-            void RecordUnknown(const std::string &key) {
+            // So the question is remembered as having run out of time, together with the
+            // budget it ran out of. `CandidateKey` mixes in `z3_settings.timeout_ms`, but the
+            // proof's budget is that times a scale read from the candidate's IR tree size
+            // (`ProofBudgetScale`), which the key does not describe: two candidates with the
+            // same key can be given different budgets. A question is therefore skipped only
+            // when it already ran out of a budget at least as large as the one it would be
+            // given now, which is what keeps the original concern ("one timeout and the tree
+            // is never examined again, however much budget a later run would have given it")
+            // true. Nothing is written into the IR, so nothing travels with it, and the entry
+            // is never served as an outcome - `Find` cannot see it.
+            void RecordUnknown(const std::string &key, uint32_t scale) {
                 const std::lock_guard< std::mutex > lock(mutex_);
                 if (unknown_.size() >= kMaxUnknown) {
                     unknown_.clear();
                 }
-                unknown_.insert(key);
+                auto &recorded = unknown_[key];
+                recorded       = std::max(recorded, scale);
             }
 
-            // Whether a proof of this exact question has already run its budget out.
-            bool WasUnknown(const std::string &key) const {
+            // Whether a proof of this exact question has already run out of a budget at
+            // least as large as `scale` gives it.
+            bool WasUnknown(const std::string &key, uint32_t scale) const {
                 const std::lock_guard< std::mutex > lock(mutex_);
-                return unknown_.contains(key);
+                const auto found = unknown_.find(key);
+                return found != unknown_.end() && found->second >= scale;
+            }
+
+            // Which of those a worker thread recorded, for the report alone: it says
+            // whether the loop, had it asked again, would have done any better.
+            void MarkBackgroundUnknown(const std::string &key) {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                if (background_unknown_.size() >= kMaxUnknown) {
+                    background_unknown_.clear();
+                }
+                background_unknown_.insert(key);
+            }
+
+            bool WasBackgroundUnknown(const std::string &key) const {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                return background_unknown_.contains(key);
             }
 
           private:
@@ -1122,7 +1157,9 @@ namespace cobra {
             // The questions whose proof ran out of its budget, by the same content key the
             // outcomes use. Deliberately not an `Entry`: an outcome is served to callers
             // and a `nullptr` outcome is a refusal, which this must never become.
-            std::unordered_set< std::string > unknown_;
+            // The budget scale each one ran out of (see `RecordUnknown`).
+            std::unordered_map< std::string, uint32_t > unknown_;
+            std::unordered_set< std::string > background_unknown_;
         };
 
         // Never destroyed: worker threads write to it (see `Speculation`).
@@ -1417,6 +1454,18 @@ namespace cobra {
                 .verified           = false });
         }
 
+        // How many times `z3_settings.timeout_ms` the proof of `cand` is given: one per
+        // `kNodesPerBudget` instructions of its IR tree, at least one and at most
+        // `kMaxBudgetScale`. See `VerifyCandidate` for why the budget grows with the tree.
+        uint32_t ProofBudgetScale(const MBACandidate &cand) {
+            constexpr uint32_t kNodesPerBudget = 8;
+            constexpr uint32_t kMaxBudgetScale = 8;
+            return std::min(
+                kMaxBudgetScale,
+                std::max(1U, static_cast< uint32_t >(cand.tree_size) / kNodesPerBudget)
+            );
+        }
+
         // Prove `proposal` equal to the tree of `cand` on the bits its readers
         // look at. `cand` need not be the candidate the rewrite was found for:
         // any candidate with the same key has the same tree, width, demanded
@@ -1523,14 +1572,8 @@ namespace cobra {
                 // keeps the worst case bounded. Nothing here accepts an
                 // unproved rewrite: a timeout is still a timeout, this only
                 // decides how long the solver is given before it is called one.
-                constexpr uint32_t kNodesPerBudget = 8;
-                constexpr uint32_t kMaxBudgetScale = 8;
                 auto settings = options.z3_settings;
-                const auto scale = std::min(
-                    kMaxBudgetScale,
-                    std::max(1U, static_cast< uint32_t >(cand.tree_size) / kNodesPerBudget)
-                );
-                settings.timeout_ms *= scale;
+                settings.timeout_ms *= ProofBudgetScale(cand);
                 const auto solver_begin = std::chrono::steady_clock::now();
                 auto z3_result          = VerifyExprsWithStrategy(
                     *proved_ast, *z3_expr, cand.var_names, cand.bitwidth, settings
@@ -1767,6 +1810,12 @@ namespace cobra {
                 task->input.expr          = cand.expr ? CloneExpr(*cand.expr) : nullptr;
                 task->input.evaluator     = cand.evaluator;
                 task->input.demanded_mask = cand.demanded_mask;
+                // The proof's budget is scaled by it (`ProofBudgetScale`). Without it a
+                // worker proved every rewrite at the unscaled budget, ran out of time on
+                // the larger trees, and left the loop to ask the same question again at
+                // the budget it should have had: over one exploration, 63 worker timeouts
+                // (64 s) followed by 63 proofs on the loop (153 s), of which 3 succeeded.
+                task->input.tree_size     = cand.tree_size;
                 task->leaf_needs_cast.reserve(cand.leaf_values.size());
                 for (const auto *leaf : cand.leaf_values) {
                     task->leaf_needs_cast.push_back(
@@ -1871,15 +1920,29 @@ namespace cobra {
             // abandoned, on the ActionRPG VM leaving an obfuscated store
             // address unsimplified and the exploration stuck on the store.
             //
-            // Leaving it unproved costs nothing that was not going to be paid:
-            // the entry carries the proposal the search found, and the loop
-            // proves it when it comes to build the rewrite, which is where a
-            // run without workers proves it too. `COBRA_BACKGROUND_UNKNOWN=refute`
-            // restores the old reading.
+            // The entry carries the proposal the search found, unproved. The
+            // worker proves at the budget the loop would (`ProofBudgetScale`),
+            // so its timeout is recorded the way the loop records its own
+            // (`OutcomeCache::RecordUnknown`) and the loop does not ask the
+            // identical question again; a later run that gives the tree a
+            // larger budget does. `COBRA_BACKGROUND_UNKNOWN=refute` restores the
+            // old reading, and `=retry` has the loop prove it again.
             static bool RetryUnknown() {
                 static const bool retry = [] {
                     const char *choice = std::getenv("COBRA_BACKGROUND_UNKNOWN");
                     return choice == nullptr || std::string_view(choice) != "refute";
+                }();
+                return retry;
+            }
+
+            // `COBRA_BACKGROUND_UNKNOWN=retry`: a worker's timeout is not recorded, and the
+            // loop proves the rewrite again when it reaches it, as it did when the worker
+            // proved at a smaller budget than the loop. For measuring what the second
+            // proof buys; the report counts what it came to.
+            static bool RetryUnknownOnTheLoop() {
+                static const bool retry = [] {
+                    const char *choice = std::getenv("COBRA_BACKGROUND_UNKNOWN");
+                    return choice != nullptr && std::string_view(choice) == "retry";
                 }();
                 return retry;
             }
@@ -1951,6 +2014,7 @@ namespace cobra {
                            ) < task.budget)
                     {
                         bool unknown  = false;
+                        const auto verify_begin = std::chrono::steady_clock::now();
                         auto verified = VerifyCandidate(
                             task.input, *proposal, task.options, stats, &unknown
                         );
@@ -1958,6 +2022,20 @@ namespace cobra {
                             entry = std::move(verified);
                         } else if (!(unknown && RetryUnknown())) {
                             entry = nullptr;
+                        }
+                        // The same question at the same budget the loop would ask it
+                        // with, so its timeout is recorded exactly as the loop's own is
+                        // (`OutcomeCache::RecordUnknown`): the loop does not ask again.
+                        // The rewrite stays unproved in the cache, never refused.
+                        if (verified == nullptr && unknown) {
+                            ++stats.background_unknown;
+                            stats.background_unknown_nanoseconds += Since(verify_begin);
+                            if (!RetryUnknownOnTheLoop()) {
+                                SharedOutcomeCache().RecordUnknown(
+                                    task.key, ProofBudgetScale(task.input)
+                                );
+                            }
+                            SharedOutcomeCache().MarkBackgroundUnknown(task.key);
                         }
                     } else {
                         ++stats.background_proofs_skipped;
@@ -2538,7 +2616,7 @@ namespace cobra {
             // again at the same budget cannot do better - see `OutcomeCache::RecordUnknown`
             // for what that was costing. Handled exactly as a fresh timeout is: the rewrite
             // is discarded for this run and nothing is recorded against the tree.
-            const bool known_unknown = !outcome->verified && cache.WasUnknown(key);
+            const bool known_unknown = !outcome->verified && cache.WasUnknown(key, ProofBudgetScale(cand));
             if (known_unknown) {
                 ++stats.solver_unknown_skipped;
                 discard_rewrite();
@@ -2566,8 +2644,14 @@ namespace cobra {
                 // a counterexample, and it will find it again.
                 const bool proof_unknown =
                     verified == nullptr && stats.solver_unknown_nanoseconds != unknown_before;
+                if (cache.WasBackgroundUnknown(key)) {
+                    ++(verified != nullptr ? stats.after_background_unknown_proved
+                       : proof_unknown     ? stats.after_background_unknown_unknown
+                                           : stats.after_background_unknown_refuted);
+                    stats.after_background_unknown_nanoseconds += since(verify_begin);
+                }
                 if (proof_unknown) {
-                    cache.RecordUnknown(key);
+                    cache.RecordUnknown(key, ProofBudgetScale(cand));
                 } else {
                     cache.Insert(key, verified);
                 }
@@ -2898,6 +2982,14 @@ namespace cobra {
             line("  solved by a worker (worker time)", stats.background_solved,
                  stats.background_nanoseconds);
             part("    left unproved, plainly over budget", stats.background_proofs_skipped);
+            line("    proof ran out of budget, left to the loop", stats.background_unknown,
+                 stats.background_unknown_nanoseconds);
+            line("      the loop proved it again", stats.after_background_unknown_proved
+                     + stats.after_background_unknown_refuted + stats.after_background_unknown_unknown,
+                 stats.after_background_unknown_nanoseconds);
+            part("        proved", stats.after_background_unknown_proved);
+            part("        refuted", stats.after_background_unknown_refuted);
+            part("        unknown again", stats.after_background_unknown_unknown);
             line("  answers the loop waited for", stats.background_settled,
                  stats.background_wait_nanoseconds);
             part("  withdrawn, solved by the loop", stats.background_withdrawn);
