@@ -1,6 +1,8 @@
 #include "ExprParser.h"
 #include "cobra/core/Classifier.h"
 #include "cobra/core/Expr.h"
+#include "cobra/core/ExprUtils.h"
+#include "cobra/core/SignatureChecker.h"
 #include "cobra/core/ExprCost.h"
 #include "cobra/core/PassContract.h"
 #include "cobra/core/Profile.h"
@@ -10,6 +12,7 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include <map>
+#include <random>
 #include <string>
 #include <tuple>
 
@@ -367,20 +370,66 @@ TEST(GAMBADataset, QSynthEA) {
     // still reading a lifting pass's stand-in variable (`v0`, `r0`, ...) is
     // reported as unsupported instead of simplified (guard failed) - those were
     // never functions of the inputs.
-    EXPECT_EQ(stats.simplified, 448);
-    EXPECT_EQ(stats.unsupported, 52);
+    //
+    // Then +5 once every answer is checked against the input in the input's
+    // variables before it is given (QSynthEAAnswersAreTheInputsFunction): six
+    // wrong answers are no longer given, the search goes on past them and finds
+    // right ones for most, and most of the stand-in results are caught there
+    // too, before the guard.
+    EXPECT_EQ(stats.simplified, 453);
+    EXPECT_EQ(stats.unsupported, 47);
     EXPECT_EQ(stats.failed_simplify, 0);
 
     // Every unsupported result carries a structured reason code.
     EXPECT_EQ(stats.has_structured_reason, stats.unsupported);
-    EXPECT_EQ(stats.by_category[ReasonCategory::kVerifyFailed], 6);
-    EXPECT_EQ(stats.by_category[ReasonCategory::kGuardFailed], 28);
-    EXPECT_EQ(stats.by_category[ReasonCategory::kSearchExhausted], 18);
+    EXPECT_EQ(stats.by_category[ReasonCategory::kVerifyFailed], 9);
+    EXPECT_EQ(stats.by_category[ReasonCategory::kGuardFailed], 6);
+    EXPECT_EQ(stats.by_category[ReasonCategory::kSearchExhausted], 31);
 
     // Decomposition cause frames propagated into cause_chain.
     // MixedRewrite unsupported outcomes should carry delegated
     // decomposition causes (not just top-level reason_code).
     EXPECT_GT(stats.decomp_cause_frames, 0) << "No decomposition causes found in cause chains";
+}
+
+// Six QSynth expressions came back "simplified" and verified while wrong on
+// almost every input: a residual was solved in a variable space with a
+// variable dropped that is spurious only on {0,1}, checked against that space
+// alone, and returned. Every answer has to be the input's function, in the
+// input's variables.
+TEST(GAMBADataset, QSynthEAAnswersAreTheInputsFunction) {
+    std::ifstream file(DATASET_DIR "/gamba/qsynth_ea.txt");
+    ASSERT_TRUE(file.is_open());
+    std::vector< std::string > lines;
+    for (std::string line; std::getline(file, line);) { lines.push_back(line); }
+
+    for (const int line_num : { 273, 275, 277, 346, 433, 478 }) {
+        const std::string &line = lines[static_cast< size_t >(line_num - 1)];
+        const std::string obfuscated = trim(line.substr(0, find_separator(line)));
+        auto parsed = ParseAndEvaluate(obfuscated, 64);
+        auto ast    = ParseToAst(obfuscated, 64);
+        ASSERT_TRUE(parsed.has_value() && ast.has_value()) << "line " << line_num;
+        auto folded = FoldConstantBitwise(std::move(ast.value().expr), 64);
+
+        Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+        auto result = Simplify(parsed.value().sig, parsed.value().vars, folded.get(), opts);
+        ASSERT_TRUE(result.has_value()) << "line " << line_num;
+        if (result.value().kind != SimplifyOutcome::Kind::kSimplified) { continue; }
+
+        auto answer      = CloneExpr(*result.value().expr);
+        const auto &vars = parsed.value().vars;
+        const auto &real = result.value().real_vars;
+        if (!real.empty() && real.size() < vars.size()) {
+            RemapVarIndices(*answer, BuildVarSupport(vars, real));
+        }
+        std::mt19937_64 rng(static_cast< uint64_t >(line_num));
+        std::vector< uint64_t > inputs(vars.size());
+        for (int round = 0; round < 256; ++round) {
+            for (auto &value : inputs) { value = rng(); }
+            ASSERT_EQ(EvalExpr(*folded, inputs, 64), EvalExpr(*answer, inputs, 64))
+                << "line " << line_num << ": " << Render(*result.value().expr, real);
+        }
+    }
 }
 
 TEST(GAMBADataset, LokiTiny) {

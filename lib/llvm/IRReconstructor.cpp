@@ -182,17 +182,28 @@ namespace cobra {
 
     llvm::Value *ReconstructIr(
         const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
-        const std::vector< uint32_t > &var_map, llvm::ArrayRef< llvm::Value * > leaf_override,
-        IrReuse *reuse
+        const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse
     ) {
         auto *int_ty = builder.getIntNTy(candidate.bitwidth);
-        const auto leaf_value = [&](uint32_t index) {
-            return leaf_override.empty() ? candidate.leaf_values[index]
-                                         : leaf_override[index];
+        const auto leaf_value = [&](uint32_t index) -> llvm::Value * {
+            if (leaves == nullptr) {
+                return candidate.leaf_values[index];
+            }
+            if (leaves->freeze_on_use[index]) {
+                auto *frozen = builder.CreateFreeze(leaves->values[index], "cobra.freeze");
+                if (reuse != nullptr) {
+                    if (auto *inst = llvm::dyn_cast< llvm::Instruction >(frozen)) {
+                        reuse->created.insert(inst);
+                    }
+                }
+                leaves->values[index]        = frozen;
+                leaves->freeze_on_use[index] = false;
+            }
+            return leaves->values[index];
         };
         const auto child = [&](unsigned index) {
             return ReconstructIr(
-                *expr.children[index], candidate, builder, var_map, leaf_override, reuse
+                *expr.children[index], candidate, builder, var_map, leaves, reuse
             );
         };
 

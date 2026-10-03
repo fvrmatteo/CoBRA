@@ -120,6 +120,11 @@ namespace cobra {
         // original had made defined. Restoring that is `leaf_override`'s job at
         // reconstruction time; this is the flag that says it is owed.
         bool spans_freeze = false;
+
+        // Whether the collected tree holds a `select`, which reads only the arm
+        // it takes: a leaf under the other one may be poison while the root is
+        // not. The rewrite owes those leaves a freeze just as for `spans_freeze`.
+        bool spans_select = false;
     };
 
     // The `node_limit` a boundary cut carries: past any re-cut ladder, so the

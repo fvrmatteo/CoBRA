@@ -65,23 +65,36 @@ namespace cobra {
         unsigned found = 0;
     };
 
+    // The leaves a rewrite reads, and which of them it has to freeze first.
+    //
+    // A tree collected through a `freeze` or a `select` can be defined where a
+    // leaf is poison: the `freeze` makes it so, and a `select` does not read the
+    // arm it does not take. The rewrite reads every leaf it names directly, so
+    // such a leaf has to be frozen - but only once, and only if the rewrite
+    // reads it at all: a freeze nothing reads is an instruction the rewrite is
+    // charged for and gains nothing from.
+    struct LeafSupply
+    {
+        std::vector< llvm::Value * > values;
+        std::vector< bool > freeze_on_use;
+    };
+
     // Convert a simplified Expr tree back to LLVM IR instructions.
     // var_map remaps simplified variable indices to original leaf indices
     // (needed when aux variable elimination reduced the variable set).
     // If empty, identity mapping is assumed.
     //
-    // `leaf_override`, when given, stands in for `candidate.leaf_values` one for
-    // one. It is how a caller hands the rewrite values it has already prepared -
-    // frozen leaves for a tree that was collected through a `freeze` - without
-    // disturbing the candidate, which the driver still needs intact if the
-    // rewrite goes on to be rejected.
+    // `leaves`, when given, stands in for `candidate.leaf_values` one for one,
+    // freezing a leaf the first time the rewrite reads it when it is marked so
+    // (see `LeafSupply`), without disturbing the candidate, which the driver
+    // still needs intact if the rewrite goes on to be rejected.
     //
     // `reuse`, when given, lets the reconstruction read instructions the
     // function already holds (see `IrReuse`).
     llvm::Value *ReconstructIr(
         const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
         const std::vector< uint32_t > &var_map                 = {},
-        llvm::ArrayRef< llvm::Value * > leaf_override          = {},
+        LeafSupply *leaves                                     = nullptr,
         IrReuse *reuse                                         = nullptr
     );
 

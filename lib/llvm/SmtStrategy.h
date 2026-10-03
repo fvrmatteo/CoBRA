@@ -48,6 +48,13 @@ namespace cobra {
         uint64_t sweep_proved      = 0;
         uint64_t sweep_generalized = 0;
         uint64_t sweep_synthesized = 0;
+        // Compiled-question "equal" answers an independent check overturned
+        // (sampling or the solver as built: a wrong fold), folded answers the
+        // solver as built confirmed, and folded answers it could not decide in
+        // its brief budget.
+        uint64_t llvm_refuted       = 0;
+        uint64_t folded_confirmed   = 0;
+        uint64_t folded_unconfirmed = 0;
     };
 
     SmtStrategyCounters SmtStrategyStatistics();

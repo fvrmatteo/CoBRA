@@ -1572,6 +1572,29 @@ namespace cobra {
                         continue;
                     }
 
+                    // The answer is checked against the input itself, in the
+                    // input's variables, before it is given. A candidate is
+                    // marked verified by the pass that produced it, and that
+                    // pass checks it against the problem *it* was given -
+                    // which for a residual solved after a variable was
+                    // dropped is the input with that variable fixed: one that
+                    // is spurious on {0,1} but not at full width. Six QSynth
+                    // expressions came back "verified" and wrong on almost
+                    // every input that way, one of them dropping a variable
+                    // altogether (`c & -c`). The probe count is the final
+                    // answer's: one of the six was wrong on 7% of inputs.
+                    if (context.evaluator.has_value()) {
+                        const auto answer = internal::VerifyInOriginalSpace(
+                            *context.evaluator, context.original_vars, cand->real_vars,
+                            *normalized_expr, context.bitwidth, kFinalAnswerProbeCount
+                        );
+                        if (!answer.passed) {
+                            item.metadata.candidate_failed_verification = true;
+                            refresh_best_unsupported();
+                            continue;
+                        }
+                    }
+
                     telemetry.queue_high_water =
                         static_cast< uint32_t >(worklist.HighWaterMark());
                     return Ok(ToSimplifyOutcome(

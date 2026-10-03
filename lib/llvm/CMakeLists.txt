@@ -53,6 +53,7 @@ llvm_map_components_to_libnames(cobra_llvm_llvm_libs
     Core
     Passes
     Support
+    TransformUtils
 )
 
 add_library(cobra-llvm STATIC $<TARGET_OBJECTS:cobra-llvm-obj>)

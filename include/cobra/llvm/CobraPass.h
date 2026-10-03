@@ -9,6 +9,24 @@
 
 namespace cobra {
 
+    // Which leaves a rewrite freezes before reading them.
+    //
+    // A rewrite reads its leaves directly. Where the tree did not - through a
+    // `freeze`, through the arm of a `select` it did not take - a leaf that is
+    // poison could leave the root defined, and a leaf that is `undef` and read
+    // more than once by the rewrite could be read as two different values.
+    enum class LeafFreezing : uint8_t {
+        // Every leaf that can be poison while the root is defined (behind a
+        // `freeze`, a `select`'s arm or a phi only), and every `undef` leaf the
+        // rewrite reads more than once. Exact for LLVM's semantics.
+        kSound,
+
+        // Only a tree collected through a `freeze`, and then every leaf that may
+        // be poison. For a host that keeps its IR free of poison and `undef` by
+        // construction, where a `freeze` only stands in the way of folding.
+        kAcrossFreeze,
+    };
+
     // What a rewrite has to be cheaper than before it is worth committing.
     enum class MbaCostModel : uint8_t {
         // Every instruction the tree was built from, which is the expression
@@ -88,6 +106,9 @@ namespace cobra {
         // **42 of the 321 rewrites (13%)**. Declining the non-address ones is most of that
         // 95% for 31 of those 42 - a trade worth offering and not worth making silently.
         bool skip_loop_carried_phis = false;
+
+        // See `LeafFreezing`.
+        LeafFreezing leaf_freezing = LeafFreezing::kSound;
 
         bool z3_verify = false;
         Z3VerificationSettings z3_settings;

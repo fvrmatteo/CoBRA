@@ -144,6 +144,9 @@ namespace cobra {
         uint64_t stale_trees                    = 0;
         uint64_t declined_no_expression         = 0;
         uint64_t background_withdrawn_unneeded  = 0;
+        // Timeouts not recorded because the thread had the processor for less
+        // than 70% of the wall-clock budget (`HadTheProcessor`).
+        uint64_t unknown_starved = 0;
         uint64_t solver_calls               = 0;
         uint64_t solver_nanoseconds         = 0;
         uint64_t solver_proved_nanoseconds  = 0;

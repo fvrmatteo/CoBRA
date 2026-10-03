@@ -23,6 +23,10 @@ namespace cobra {
     // fails to surface against shape-non-deterministic rewrites.
     inline constexpr uint32_t kResidualGateProbeCount = 64;
 
+    // Probes for the last check of all, on the answer `Simplify` is about to
+    // give, against the input in the input's variables. Paid once per call.
+    inline constexpr uint32_t kFinalAnswerProbeCount = 256;
+
     struct CheckResult
     {
         bool passed;
