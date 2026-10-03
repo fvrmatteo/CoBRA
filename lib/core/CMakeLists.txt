@@ -58,6 +58,7 @@ target_sources(cobra-core PRIVATE
     SemilinearPasses.cpp
     SignaturePasses.cpp
     VerifyCandidate.cpp
+    RingProof.cpp
     LiftingPasses.cpp
 )
 

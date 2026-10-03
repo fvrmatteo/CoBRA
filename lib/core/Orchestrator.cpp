@@ -1237,7 +1237,62 @@ namespace cobra {
 
     } // namespace
 
+    namespace {
+        Result< SimplifyOutcome > SimplifyUnchecked(
+            const std::vector< uint64_t > &sig, const std::vector< std::string > &vars,
+            const Expr *input_expr, const Options &opts
+        );
+
+        // The largest variable index `expr` reads, plus one.
+        uint32_t VariableBound(const Expr &expr) {
+            uint32_t bound = expr.kind == Expr::Kind::kVariable ? expr.var_index + 1 : 0;
+            for (const auto &child : expr.children) {
+                bound = std::max(bound, VariableBound(*child));
+            }
+            return bound;
+        }
+    } // namespace
+
+    // A result has to be a function of the inputs. The lifting passes stand a
+    // subexpression in for a fresh variable (`v0`, `r0`, ...) and substitute it
+    // back once the outer expression is solved; a path that does not leaves the
+    // stand-in in the result - on the QSynth set, 21 of 468 "simplified"
+    // expressions - and a result over a variable nobody supplies is no
+    // simplification at all: a host cannot build it, and a check that
+    // evaluates it reads past the end of its inputs. Such a result is
+    // reported as unsupported.
     Result< SimplifyOutcome > Simplify(
+        const std::vector< uint64_t > &sig, const std::vector< std::string > &vars,
+        const Expr *input_expr, const Options &opts
+    ) {
+        auto result = SimplifyUnchecked(sig, vars, input_expr, opts);
+        if (!result.has_value() || result.value().kind != SimplifyOutcome::Kind::kSimplified
+            || result.value().expr == nullptr)
+        {
+            return result;
+        }
+        auto &outcome      = result.value();
+        const auto &names  = outcome.real_vars.empty() ? vars : outcome.real_vars;
+        const bool foreign = std::any_of(
+            outcome.real_vars.begin(), outcome.real_vars.end(), [&](const std::string &name) {
+                return std::find(vars.begin(), vars.end(), name) == vars.end();
+            }
+        );
+        if (!foreign && VariableBound(*outcome.expr) <= names.size()) {
+            return result;
+        }
+        outcome.kind     = SimplifyOutcome::Kind::kUnchangedUnsupported;
+        outcome.expr     = input_expr != nullptr ? CloneExpr(*input_expr) : nullptr;
+        outcome.real_vars.clear();
+        outcome.verified = false;
+        outcome.diag.reason_code =
+            ReasonCode{ ReasonCategory::kGuardFailed, ReasonDomain::kOrchestrator, 0 };
+        outcome.diag.reason = "the result reads a variable that is not an input";
+        return result;
+    }
+
+    namespace {
+    Result< SimplifyOutcome > SimplifyUnchecked(
         const std::vector< uint64_t > &sig, const std::vector< std::string > &vars,
         const Expr *input_expr, const Options &opts
     ) {
@@ -1819,5 +1874,6 @@ namespace cobra {
             input_expr, telemetry, context.bitwidth, input_cost
         ));
     }
+    } // namespace
 
 } // namespace cobra

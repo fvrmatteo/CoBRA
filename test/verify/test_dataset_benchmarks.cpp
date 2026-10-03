@@ -361,15 +361,21 @@ TEST(GAMBADataset, QSynthEA) {
     // +2 vs prior baseline: two cases with structurally-repeated XOR operands
     // (one previously verify-failed, one search-exhausted) now collapse via the
     // exact XOR self-cancellation exhaustion fallback (T^T==0).
-    EXPECT_EQ(stats.simplified, 468);
-    EXPECT_EQ(stats.unsupported, 32);
+    //
+    // Then: +2, and 8 no longer lost, once the unary masked-XOR recovery spells
+    // a whole-word flip as `~x` rather than `-1 ^ x`; and -22 once a result
+    // still reading a lifting pass's stand-in variable (`v0`, `r0`, ...) is
+    // reported as unsupported instead of simplified (guard failed) - those were
+    // never functions of the inputs.
+    EXPECT_EQ(stats.simplified, 448);
+    EXPECT_EQ(stats.unsupported, 52);
     EXPECT_EQ(stats.failed_simplify, 0);
 
     // Every unsupported result carries a structured reason code.
     EXPECT_EQ(stats.has_structured_reason, stats.unsupported);
     EXPECT_EQ(stats.by_category[ReasonCategory::kVerifyFailed], 6);
-    EXPECT_EQ(stats.by_category[ReasonCategory::kGuardFailed], 6);
-    EXPECT_EQ(stats.by_category[ReasonCategory::kSearchExhausted], 20);
+    EXPECT_EQ(stats.by_category[ReasonCategory::kGuardFailed], 28);
+    EXPECT_EQ(stats.by_category[ReasonCategory::kSearchExhausted], 18);
 
     // Decomposition cause frames propagated into cause_chain.
     // MixedRewrite unsupported outcomes should carry delegated

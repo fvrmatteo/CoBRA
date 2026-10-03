@@ -282,4 +282,17 @@ namespace cobra {
     std::optional< MbaFingerprint >
     ComputeMbaFingerprint(llvm::Instruction *inst, uint32_t max_tree_nodes = 0);
 
+    // How often a collection looked through a phi, and on what grounds: the
+    // sets of transparent phis checked, those whose other arms the random
+    // probes accepted, and those whose other arms are the same computation as
+    // the arm followed (`COBRA_PHI_ARMS` picks which of the two decides).
+    struct PhiArmCounters
+    {
+        uint64_t checked        = 0;
+        uint64_t probes_accept  = 0;
+        uint64_t exact_accept   = 0;
+        uint64_t probes_only    = 0;
+    };
+    PhiArmCounters PhiArmStatistics();
+
 } // namespace cobra

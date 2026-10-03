@@ -80,6 +80,16 @@ static std::unique_ptr< Expr > run_semilinear(
 }
 
 // Test 1: carry erasure
+#ifdef COBRA_HAS_Z3
+namespace {
+    // The default budget is 500 ms, which a 64-bit multiplier identity can
+    // overrun when the suite runs in parallel: the test then failed on a
+    // timeout, not on a wrong rewrite. A generous budget keeps it a test of the
+    // rewrite - a false one is still refuted, and a timeout is still a failure.
+    [[maybe_unused]] const cobra::Z3VerificationSettings kProofBudget{ .timeout_ms = 30000 };
+} // namespace
+#endif
+
 TEST(SemilinearIntegration, CarryErasure) {
     // (x & 0xFF) + 1
     auto input =
@@ -90,7 +100,7 @@ TEST(SemilinearIntegration, CarryErasure) {
     ASSERT_NE(result, nullptr);
 
 #ifdef COBRA_HAS_Z3
-    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64);
+    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64, kProofBudget);
     EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
 #endif
 }
@@ -138,7 +148,7 @@ TEST(SemilinearIntegration, LinearInDisguise) {
         << "Expected no AND in simplified output, got: " << rendered;
 
 #ifdef COBRA_HAS_Z3
-    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64);
+    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64, kProofBudget);
     EXPECT_TRUE(verify.equivalent);
 #endif
 }
@@ -210,7 +220,7 @@ TEST(SemilinearIntegration, XorConstantCancellation) {
         << "Expected no AND in simplified output, got: " << rendered;
 
 #ifdef COBRA_HAS_Z3
-    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64);
+    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64, kProofBudget);
     EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
 #endif
 }
@@ -234,7 +244,7 @@ TEST(SemilinearIntegration, OrConstantCancellation) {
         << "Expected no AND in simplified output, got: " << rendered;
 
 #ifdef COBRA_HAS_Z3
-    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64);
+    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64, kProofBudget);
     EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
 #endif
 }
@@ -250,7 +260,7 @@ TEST(SemilinearIntegration, ShrAtomRoundTrip) {
     EXPECT_NE(text.find(">>"), std::string::npos) << "Expected >> in output, got: " << text;
 
 #ifdef COBRA_HAS_Z3
-    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64);
+    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64, kProofBudget);
     EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
 #endif
 }
@@ -288,7 +298,7 @@ TEST(SemilinearIntegration, XorRecoveryZ3) {
     ASSERT_NE(result, nullptr);
 
 #ifdef COBRA_HAS_Z3
-    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64);
+    auto verify = Z3VerifyExprs(*input, *result, { "x" }, 64, kProofBudget);
     EXPECT_TRUE(verify.equivalent) << "Counterexample: " << verify.counterexample;
 #endif
 }
