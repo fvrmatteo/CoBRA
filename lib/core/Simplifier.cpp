@@ -16,11 +16,11 @@ namespace cobra {
         CheckResult VerifyInOriginalSpace(
             const Evaluator &eval, const std::vector< std::string > &all_vars,
             const std::vector< std::string > &real_vars, const Expr &reduced_expr,
-            uint32_t bitwidth
+            uint32_t bitwidth, uint32_t num_samples
         ) {
             const auto kAllCount = static_cast< uint32_t >(all_vars.size());
             if (real_vars.empty() || real_vars.size() == all_vars.size()) {
-                return FullWidthCheckEval(eval, kAllCount, reduced_expr, bitwidth);
+                return FullWidthCheckEval(eval, kAllCount, reduced_expr, bitwidth, num_samples);
             }
             auto idx_map = TryBuildVarSupport(all_vars, real_vars);
             if (!idx_map.has_value()) {
@@ -28,7 +28,7 @@ namespace cobra {
             }
             auto remapped = CloneExpr(reduced_expr);
             RemapVarIndices(*remapped, *idx_map);
-            return FullWidthCheckEval(eval, kAllCount, *remapped, bitwidth);
+            return FullWidthCheckEval(eval, kAllCount, *remapped, bitwidth, num_samples);
         }
 
         bool IsPurelyArithmetic(const Expr &e) {

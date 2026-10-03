@@ -26,6 +26,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Analysis.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PassManager.h"
@@ -46,6 +47,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <ctime>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -155,6 +157,10 @@ namespace cobra {
                 analysis_.reset();
                 local_.Invalidate();
             }
+
+            // The function's dominator tree. The pass never changes the control
+            // flow, so the one built for the analysis serves the whole run.
+            const llvm::DominatorTree &Dominators() const { return dominators_; }
 
           private:
             enum class Mode : uint8_t { kLocal, kGlobal, kCheck };
@@ -553,6 +559,7 @@ namespace cobra {
             into.stale_trees += run.stale_trees;
             into.declined_no_expression += run.declined_no_expression;
             into.background_withdrawn_unneeded += run.background_withdrawn_unneeded;
+            into.unknown_starved += run.unknown_starved;
             into.solver_calls += run.solver_calls;
             into.solver_nanoseconds += run.solver_nanoseconds;
             into.solver_proved_nanoseconds += run.solver_proved_nanoseconds;
@@ -985,14 +992,18 @@ namespace cobra {
             key += std::to_string(options.z3_settings.rewrite_level);
             key += std::to_string(static_cast< int >(options.z3_settings.strategy));
             key += options.z3_settings.sweep ? "s" : "";
+            key += std::to_string(static_cast< uint64_t >(options.enabled_families));
+            key += ':';
+            key += std::to_string(std::hash< std::string >{}(options.z3_settings.llvm_passes));
             key += '|';
             key += std::to_string(cand.var_names.size());
             key += '|';
-            for (uint64_t v : cand.sig) {
-                key += std::to_string(v);
-                key += ',';
-            }
-            key += '|';
+            // The signature is the tree's values on the Boolean cube, so the
+            // expression below already determines it, and it is 2^variables
+            // numbers long: written out in full it was most of every key past
+            // a handful of variables, copied a dozen times per candidate and
+            // held in every cache entry. A key without an expression is never
+            // shared (below), so there it has nothing to tell apart either.
             if (cand.expr != nullptr) {
                 AppendExprKey(*cand.expr, key);
             } else {
@@ -1022,13 +1033,25 @@ namespace cobra {
             // if the cache is trimmed afterwards.
             using Entry = std::shared_ptr< const CandidateOutcome >;
 
-            std::optional< Entry > Find(const std::string &key) const {
+            // An entry served from the old generation is moved into the young
+            // one, so that what is still being asked for survives the next
+            // rotation instead of being dropped with what is not.
+            std::optional< Entry > Find(const std::string &key) {
                 const std::lock_guard< std::mutex > lock(mutex_);
                 if (auto it = young_.find(key); it != young_.end()) {
                     return it->second;
                 }
                 if (auto it = old_.find(key); it != old_.end()) {
-                    return it->second;
+                    Entry entry = it->second;
+                    if (!Legacy()) {
+                        old_.erase(it);
+                        if (young_.size() >= Generation()) {
+                            old_ = std::move(young_);
+                            young_.clear();
+                        }
+                        young_.emplace(key, entry);
+                    }
+                    return entry;
                 }
                 return std::nullopt;
             }
@@ -1236,6 +1259,15 @@ namespace cobra {
             tag = mix(tag, options.z3_settings.sweep ? 1 : 0);
             tag = mix(tag, static_cast< uint64_t >(options.enabled_families));
             tag = mix(tag, static_cast< uint64_t >(options.cost_model));
+            tag = mix(tag, std::hash< std::string >{}(options.z3_settings.llvm_passes));
+            tag = mix(tag, static_cast< uint64_t >(options.leaf_freezing));
+            // What the records mean changes with the pass itself as well as
+            // with its settings: a host that keeps `!cobra.mba` on IR it saves
+            // and loads again must not read a verdict an older build wrote
+            // under another fingerprint or another set of techniques. Bumped
+            // whenever either changes.
+            constexpr uint64_t kRecordVersion = 2;
+            tag = mix(tag, kRecordVersion);
             return tag;
         }
 
@@ -1305,11 +1337,15 @@ namespace cobra {
         // interpreter's conditional jump tests. Sixty-five thousand evaluations cost less
         // than the solver's start-up and leave nothing to believe.
         //
-        // Empty when the inputs are too many to walk.
+        // Empty when the inputs are too many to walk - by count, or by count
+        // times the size of the two sides: a million inputs over a tree the
+        // detector expanded to thousands of nodes is billions of evaluations,
+        // past any budget the solver it stands in for would have been given.
         std::optional< bool > DecideByEnumeration(
             const Expr &lhs, const Expr &rhs, uint32_t num_vars, uint32_t bitwidth
         ) {
-            constexpr uint32_t kMaxInputBits = 20;
+            constexpr uint32_t kMaxInputBits   = 20;
+            constexpr uint64_t kMaxEvaluations = uint64_t{ 1 } << 27;
 
             std::vector< uint32_t > widths(num_vars, 0);
             ReadWidths(lhs, bitwidth, widths);
@@ -1320,6 +1356,11 @@ namespace cobra {
                 if (input_bits > kMaxInputBits) {
                     return std::nullopt;
                 }
+            }
+
+            const uint64_t nodes = CountNodes(lhs) + CountNodes(rhs);
+            if ((nodes << input_bits) > kMaxEvaluations) {
+                return std::nullopt;
             }
 
             const auto compiled_lhs = CompileExpr(lhs, bitwidth);
@@ -1542,6 +1583,79 @@ namespace cobra {
             return true;
         }
 
+        // The leaves whose poison is the root's poison: reached from the root
+        // along operands that pass poison on - every operand of every
+        // operation, except a `select`'s arms (only the arm taken is read), a
+        // `freeze`'s operand (it stops poison) and a phi's (only one arm is
+        // read). The root is poison wherever such a leaf is, so a rewrite that
+        // reads one adds no poison and the leaf needs no freeze for it.
+        llvm::DenseSet< const llvm::Value * > LeavesPoisoningTheRoot(const MBACandidate &cand) {
+            const llvm::DenseSet< const llvm::Value * > tree(cand.tree.begin(), cand.tree.end());
+            const llvm::DenseSet< const llvm::Value * > leaves(
+                cand.leaf_values.begin(), cand.leaf_values.end()
+            );
+            llvm::DenseSet< const llvm::Value * > seen;
+            llvm::DenseSet< const llvm::Value * > poisoning;
+            llvm::SmallVector< const llvm::Value *, 32 > pending{ cand.root };
+            while (!pending.empty()) {
+                const llvm::Value *value = pending.pop_back_val();
+                if (!seen.insert(value).second) {
+                    continue;
+                }
+                if (leaves.contains(value)) {
+                    poisoning.insert(value);
+                    continue;
+                }
+                const auto *inst = llvm::dyn_cast< llvm::Instruction >(value);
+                if (inst == nullptr || !tree.contains(inst) || llvm::isa< llvm::FreezeInst >(inst)
+                    || llvm::isa< llvm::PHINode >(inst))
+                {
+                    continue;
+                }
+                if (const auto *select = llvm::dyn_cast< llvm::SelectInst >(inst)) {
+                    pending.push_back(select->getCondition());
+                    continue;
+                }
+                for (const llvm::Value *operand : inst->operands()) {
+                    pending.push_back(operand);
+                }
+            }
+            return poisoning;
+        }
+
+        // `COBRA_OLD=<a,b,...>` puts individual behaviours back as they were,
+        // for measuring what each one changes on a workload: `flags`
+        // (readers keep their flags), `fingerprint` (budget rejections and
+        // every rewrite's output recorded), `dce` (whole-function sweep).
+        bool Old(std::string_view behaviour) {
+            static const std::string chosen = [] {
+                const char *value = std::getenv("COBRA_OLD");
+                return value == nullptr ? std::string{} : "," + std::string(value) + ",";
+            }();
+            return chosen.find("," + std::string(behaviour) + ",") != std::string::npos;
+        }
+
+        // CPU time this thread has run, in nanoseconds.
+        uint64_t ThreadCpuNanoseconds() {
+            timespec now{};
+            if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) {
+                return 0;
+            }
+            return static_cast< uint64_t >(now.tv_sec) * 1000000000ULL
+                + static_cast< uint64_t >(now.tv_nsec);
+        }
+
+        // Whether a proof that ran out of its budget had the processor while it
+        // ran. The budget is wall-clock time, so on a machine busy with other
+        // work - other workers, the race's pool, the rest of the host - a
+        // thread can be given a fraction of it and run out for that reason
+        // alone. Such a timeout says nothing about the question, so it is not
+        // recorded: recorded, it would stop the question being asked again for
+        // the rest of the process.
+        bool HadTheProcessor(uint64_t wall_nanoseconds, uint64_t cpu_nanoseconds) {
+            return cpu_nanoseconds * 10 >= wall_nanoseconds * 7;
+        }
+
         // How many times `z3_settings.timeout_ms` the proof of `cand` is given: one per
         // `kNodesPerBudget` instructions of its IR tree, at least one and at most
         // `kMaxBudgetScale`. See `VerifyCandidate` for why the budget grows with the tree.
@@ -1700,8 +1814,33 @@ namespace cobra {
                 // unknown answer declines the candidate whatever the mode: taken
                 // as a yes, it folded the `icmp ult` behind an interpreter's
                 // conditional jump to true and the jump's displacement to a constant.
-                const bool declined_comparison =
-                    z3_result.equivalent && z3_result.unknown && ContainsComparison(*ast);
+                //
+                // The same holds for a comparison the rewrite introduces, and
+                // the bet needs the Boolean cube actually checked: a rewrite
+                // found by full-width random points alone (the leaf identities)
+                // never was. So an unknown answer is taken for a yes only when
+                // neither side compares and the rewrite matches the tree's
+                // signature on every Boolean input.
+                const auto cube_agrees = [&] {
+                    const auto variables = static_cast< uint32_t >(cand.var_names.size());
+                    if (variables > 20 || cand.sig.size() != (size_t{ 1 } << variables)) {
+                        return false;
+                    }
+                    std::vector< uint64_t > values(variables);
+                    for (size_t input = 0; input < cand.sig.size(); ++input) {
+                        for (uint32_t v = 0; v < variables; ++v) {
+                            values[v] = (input >> v) & 1;
+                        }
+                        if (EvalExpr(*z3_expr, values, cand.bitwidth)
+                            != (cand.sig[input] & cand.demanded_mask & Bitmask(cand.bitwidth)))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                const bool declined_comparison = z3_result.equivalent && z3_result.unknown
+                    && (ContainsComparison(*ast) || ContainsComparison(*z3_expr) || !cube_agrees());
                 CountVerification([&](VerificationCounters &counters) {
                     if (!z3_result.unknown) {
                         ++(z3_result.equivalent ? counters.proved_by_solver
@@ -2189,6 +2328,7 @@ namespace cobra {
                     {
                         bool unknown  = false;
                         const auto verify_begin = std::chrono::steady_clock::now();
+                        const uint64_t cpu_begin = ThreadCpuNanoseconds();
                         auto verified = VerifyCandidate(
                             task.input, *proposal, task.options, stats, &unknown
                         );
@@ -2203,8 +2343,11 @@ namespace cobra {
                         // The rewrite stays unproved in the cache, never refused.
                         if (verified == nullptr && unknown) {
                             ++stats.background_unknown;
-                            stats.background_unknown_nanoseconds += Since(verify_begin);
-                            if (!RetryUnknownOnTheLoop()) {
+                            const uint64_t wall = Since(verify_begin);
+                            stats.background_unknown_nanoseconds += wall;
+                            const bool had_it = HadTheProcessor(wall, ThreadCpuNanoseconds() - cpu_begin);
+                            stats.unknown_starved += had_it ? 0 : 1;
+                            if (!RetryUnknownOnTheLoop() && had_it) {
                                 SharedOutcomeCache().RecordUnknown(
                                     task.key, ProofBudgetScale(task.input)
                                 );
@@ -2320,7 +2463,8 @@ namespace cobra {
         // it - the pass never touches the control flow - and the instructions
         // earlier rewrites of this run left without readers, which stay in the
         // function until the run ends.
-        std::optional< llvm::DominatorTree > dominators;
+        // The oracle's: built once per run, and the control flow never changes.
+        const llvm::DominatorTree *dominators = &demanded_bits.Dominators();
         llvm::DenseSet< const llvm::Instruction * > retired;
         // Rewrites applied so far in this run, and the roots they replaced.
         uint64_t rewrites_this_run = 0;
@@ -2350,9 +2494,6 @@ namespace cobra {
             // it is meaningless there: every definition dominates an
             // unreachable use, so a rewrite could read the root's own readers
             // and close a cycle through it.
-            if (!dominators) {
-                dominators.emplace(f);
-            }
             if (!dominators->isReachableFromEntry(cand.root->getParent())) {
                 ++stats.unreachable_roots;
                 pass_by();
@@ -2514,9 +2655,6 @@ namespace cobra {
             // Whether this candidate stands on a value a loop carries. The dominator tree
             // is built on demand, here as well as for the rewrites, because this question
             // is asked of every candidate.
-            if (!dominators) {
-                dominators.emplace(*cand.root->getFunction());
-            }
             const bool loop_phi = TouchesLoopCarriedPhi(cand, *dominators);
             const bool addresses =
                 (consumers & ConsumerBit(CandidateConsumer::kPointerOffset)) != 0;
@@ -2746,14 +2884,58 @@ namespace cobra {
             // not to be poison are left alone, which is most of them - a load
             // carrying `!noundef`, an argument declared `noundef` - so this
             // usually costs nothing at all.
-            std::vector< llvm::Value * > frozen_leaves;
-            if (cand.spans_freeze) {
-                frozen_leaves = cand.leaf_values;
-                for (auto *&leaf : frozen_leaves) {
-                    if (!llvm::isGuaranteedNotToBePoison(leaf)) {
-                        leaf = builder.CreateFreeze(leaf, "cobra.freeze");
+            //
+            // A `select` asks for the same thing for a different reason: it does
+            // not read the arm it does not take, so a leaf under that arm can be
+            // poison while the root is not, and the rewrite reads every leaf it
+            // names (`select (icmp ult %n, 32), (lshr %x, %n), 0` is defined for
+            // every `%n`; a rewrite reading the `lshr` is not). A frozen leaf
+            // holds some value, and the rewrite is proved for every value of its
+            // leaves, so freezing one cannot change the result.
+            //
+            // A leaf is frozen the first time the rewrite reads it, not before:
+            // one the rewrite does not read would cost an instruction for nothing.
+            //
+            // An `undef` leaf the rewrite reads more than once is owed one in
+            // any tree. Each read of `undef` may see a different value, so
+            // `x + x` written for `2 * x` can produce a value the tree never
+            // could; read once, the leaf is one value and the proof covers it.
+            // Frozen, it is one value however often it is read. Loads the host
+            // marks `!noundef` and `noundef` arguments are known not to be
+            // `undef`, so this rarely costs anything.
+            std::vector< uint32_t > reads(cand.leaf_values.size(), 0);
+            {
+                llvm::SmallVector< const Expr *, 32 > pending{ outcome->expr.get() };
+                while (!pending.empty()) {
+                    const Expr *node = pending.pop_back_val();
+                    if (node->kind == Expr::Kind::kVariable) {
+                        const uint32_t leaf = var_map.empty() ? node->var_index : var_map[node->var_index];
+                        if (leaf < reads.size()) {
+                            ++reads[leaf];
+                        }
+                    }
+                    for (const auto &child : node->children) {
+                        pending.push_back(child.get());
                     }
                 }
+            }
+            LeafSupply leaf_supply;
+            const bool poison_owed = cand.spans_freeze || cand.spans_select;
+            const auto poisoning   = poison_owed ? LeavesPoisoningTheRoot(cand)
+                                                 : llvm::DenseSet< const llvm::Value * >{};
+            leaf_supply.values     = cand.leaf_values;
+            leaf_supply.freeze_on_use.reserve(cand.leaf_values.size());
+            bool freeze_leaves = false;
+            for (size_t index = 0; index < cand.leaf_values.size(); ++index) {
+                auto *leaf        = cand.leaf_values[index];
+                const bool poison = poison_owed && !poisoning.contains(leaf)
+                    && !llvm::isGuaranteedNotToBePoison(leaf);
+                const bool undef  = reads[index] > 1 && !llvm::isGuaranteedNotToBeUndef(leaf);
+                const bool freeze = options_.leaf_freezing == LeafFreezing::kAcrossFreeze
+                    ? cand.spans_freeze && !llvm::isGuaranteedNotToBePoison(leaf)
+                    : poison || undef;
+                leaf_supply.freeze_on_use.push_back(freeze);
+                freeze_leaves |= freeze;
             }
 
             // What the function already computes is read, not built again. A
@@ -2764,11 +2946,8 @@ namespace cobra {
             IrReuse reuse;
             llvm::SmallPtrSet< const llvm::Instruction *, 32 > poisons_root;
             if (ReuseInstructions()) {
-                if (!dominators.has_value()) {
-                    dominators.emplace(f);
-                }
                 reuse.before     = cand.root;
-                reuse.dominators = &*dominators;
+                reuse.dominators = dominators;
                 reuse.replaced   = &replaced_roots;
                 if (cand.poison_reaches_root) {
                     poisons_root.insert(cand.tree.begin(), cand.tree.end());
@@ -2777,7 +2956,7 @@ namespace cobra {
             }
 
             auto *new_val = ReconstructIr(
-                *outcome->expr, cand, builder, var_map, frozen_leaves,
+                *outcome->expr, cand, builder, var_map, freeze_leaves ? &leaf_supply : nullptr,
                 ReuseInstructions() ? &reuse : nullptr
             );
 
@@ -2860,8 +3039,16 @@ namespace cobra {
                     ++stats.proved_over_budget;
                     stats.proved_over_budget_nanoseconds += spent;
                 }
+                // Not recorded against the tree: the rewrite exists, and what
+                // it costs depends on more than the tree - which instructions
+                // the function already holds to read, which leaves need a
+                // freeze, how many of the tree's instructions die with the
+                // root. A later run may find it fits; the outcome cache keeps
+                // the search from being paid again.
                 account(false);
-                record_rejection();
+                if (Old("fingerprint")) {
+                    record_rejection();
+                }
                 requeue_retries();
                 continue;
             }
@@ -2889,6 +3076,7 @@ namespace cobra {
             }
             if (!outcome->verified) {
                 const auto verify_begin  = std::chrono::steady_clock::now();
+                const uint64_t cpu_begin = ThreadCpuNanoseconds();
                 bool unknown             = false;
                 auto verified            = VerifyCandidate(cand, *outcome, options_, stats, &unknown);
                 // A proof that did not finish says nothing about the rewrite,
@@ -2910,7 +3098,12 @@ namespace cobra {
                     stats.after_background_unknown_nanoseconds += since(verify_begin);
                 }
                 if (proof_unknown) {
-                    cache.RecordUnknown(key, ProofBudgetScale(cand));
+                    // See `HadTheProcessor`.
+                    if (HadTheProcessor(since(verify_begin), ThreadCpuNanoseconds() - cpu_begin)) {
+                        cache.RecordUnknown(key, ProofBudgetScale(cand));
+                    } else {
+                        ++stats.unknown_starved;
+                    }
                 } else if (verified == nullptr) {
                     cache.Refute(key);
                 } else {
@@ -2999,7 +3192,10 @@ namespace cobra {
             }
             cand.root->replaceAllUsesWith(new_val);
             replaced_roots.insert(cand.root);
-            if (!root_readers.empty()) {
+            // What the oracle knew described the function before the
+            // replacement; the walk below asks about the readers after it.
+            demanded_bits.Invalidate();
+            if (!root_readers.empty() && !Old("flags")) {
                 stats.reader_flags_dropped += DropAssumptionsOfReaders(root_readers, demanded_bits);
             }
             ++rewrites_this_run;
@@ -3045,7 +3241,17 @@ namespace cobra {
             // not CoBRA's output, and nothing has been learnt about it here.
             auto *new_inst = llvm::dyn_cast< llvm::Instruction >(new_val);
             // Nor is a leaf the rewrite came down to: it was never solved.
-            if (new_inst != nullptr && !reuse.seen.contains(new_inst)
+            //
+            // And only a full collection's: the replacement's own collection
+            // stops at the leaves the solve read only when those were where the
+            // tree really ended. A cut, a boundary cut, a shared-value cut or a
+            // collection stopped at `max_tree_nodes` has leaves inside the
+            // expression, and the replacement's fingerprint would then describe
+            // a larger tree - one nobody examined - and have it skipped.
+            const bool whole_tree = Old("fingerprint")
+                || (cand.node_limit == 0 && !cand.boundary_cut
+                    && (options_.max_tree_nodes == 0 || cand.tree_size < options_.max_tree_nodes));
+            if (whole_tree && new_inst != nullptr && !reuse.seen.contains(new_inst)
                 && !llvm::is_contained(cand.leaf_values, new_val))
             {
                 if (auto new_fp = ComputeMbaFingerprint(new_inst, options_.max_tree_nodes)) {
@@ -3064,19 +3270,20 @@ namespace cobra {
             );
         }
 
-        // DCE: iteratively erase dead instructions from replaced
-        // trees across the whole function.  Needs multiple passes
-        // because erasing %mul may make its operand %and dead.
-        if (changed) {
-            bool erased = true;
-            while (erased) {
+        // What the rewrites left without readers: the replaced roots, and
+        // whatever only they read, transitively. Seeded from the roots rather
+        // than swept over the whole function - which removed one level of a
+        // dead chain per sweep, took dead code CoBRA had nothing to do with,
+        // and judged deadness by `mayHaveSideEffects` alone, which an unread
+        // `landingpad` passes - so only CoBRA's leftovers go, each once, by
+        // LLVM's own rule for what may be deleted.
+        if (changed && Old("dce")) {
+            for (bool erased = true; erased;) {
                 erased = false;
                 for (auto &bb : f) {
                     llvm::SmallVector< llvm::Instruction *, 16 > dead;
                     for (auto &inst : bb) {
-                        if (inst.use_empty() && !inst.isTerminator()
-                            && !inst.mayHaveSideEffects())
-                        {
+                        if (inst.use_empty() && !inst.isTerminator() && !inst.mayHaveSideEffects()) {
                             dead.push_back(&inst);
                         }
                     }
@@ -3086,6 +3293,12 @@ namespace cobra {
                     }
                 }
             }
+        } else if (changed) {
+            llvm::SmallVector< llvm::WeakTrackingVH, 64 > dead;
+            for (const llvm::Value *root : replaced_roots) {
+                dead.emplace_back(const_cast< llvm::Value * >(root));
+            }
+            llvm::RecursivelyDeleteTriviallyDeadInstructions(dead);
         }
 
         if (speculation.Enabled()) {
@@ -3241,6 +3454,7 @@ namespace cobra {
         part("  queued candidates over a root replaced this run", stats.stale_trees);
         part("  candidates without an expression to prove", stats.declined_no_expression);
         part("  worker tasks withdrawn for candidates passed by", stats.background_withdrawn_unneeded);
+        part("  timeouts not recorded: the thread lacked the processor", stats.unknown_starved);
         {
             const auto phis = PhiArmStatistics();
             if (phis.checked != 0) {
@@ -3292,6 +3506,9 @@ namespace cobra {
         if (smt.compiled + smt.folded + smt.fallbacks != 0) {
             out << "  proofs compiled through LLVM (smt-strategy):\n";
             part("  answered by the optimizer alone", smt.folded);
+            part("    confirmed by the solver as built", smt.folded_confirmed);
+            part("    left to the optimizer (solver out of time)", smt.folded_unconfirmed);
+            part("  optimizer's 'equal' overturned by an independent check", smt.llvm_refuted);
             part("  optimized, then solved", smt.compiled);
             part("  not translatable, asked as built", smt.fallbacks);
             part("  race won by the compiled question", smt.race_compiled_won);

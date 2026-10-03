@@ -18,7 +18,8 @@ namespace cobra::internal {
 
     CheckResult VerifyInOriginalSpace(
         const Evaluator &eval, const std::vector< std::string > &all_vars,
-        const std::vector< std::string > &real_vars, const Expr &reduced_expr, uint32_t bitwidth
+        const std::vector< std::string > &real_vars, const Expr &reduced_expr, uint32_t bitwidth,
+        uint32_t num_samples = kDefaultProbeCount
     );
 
 } // namespace cobra::internal

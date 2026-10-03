@@ -18,6 +18,8 @@ namespace cobra {
 
 #include <bitwuzla/cpp/bitwuzla.h>
 
+#include "cobra/core/BitWidth.h"
+#include "cobra/core/SignatureChecker.h"
 #include "cobra/verify/Sweep.h"
 
 #include "llvm/IR/Constants.h"
@@ -38,6 +40,7 @@ namespace cobra {
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <optional>
 #include <pthread.h>
 #include <unordered_map>
@@ -62,7 +65,14 @@ namespace cobra {
             std::atomic< uint64_t > sweep_proved{ 0 };
             std::atomic< uint64_t > sweep_generalized{ 0 };
             std::atomic< uint64_t > sweep_synthesized{ 0 };
+            std::atomic< uint64_t > llvm_refuted{ 0 };
+            std::atomic< uint64_t > folded_confirmed{ 0 };
+            std::atomic< uint64_t > folded_unconfirmed{ 0 };
         };
+
+        // Whether the last `Check` on this thread was answered by the
+        // optimizer alone, without a solver.
+        thread_local bool last_check_folded = false;
 
         Counters &Stats() {
             static auto *counters = new Counters;
@@ -165,17 +175,25 @@ namespace cobra {
                 pipeline = text;
                 function_passes.reset();
                 module_passes.reset();
+                // A failed parse hands back an `llvm::Error` that has to be
+                // consumed: left unchecked, a build with ABI-breaking checks
+                // aborts the process on it - which the first attempt, as a
+                // function pipeline, does for every module pipeline.
                 llvm::FunctionPassManager fpm;
-                if (!builder->parsePassPipeline(fpm, text)) {
+                if (auto error = builder->parsePassPipeline(fpm, text); !error) {
                     function_passes.emplace(std::move(fpm));
                     usable = true;
                     return true;
+                } else {
+                    llvm::consumeError(std::move(error));
                 }
                 llvm::ModulePassManager mpm;
-                if (!builder->parsePassPipeline(mpm, text)) {
+                if (auto error = builder->parsePassPipeline(mpm, text); !error) {
                     module_passes.emplace(std::move(mpm));
                     usable = true;
                     return true;
+                } else {
+                    llvm::consumeError(std::move(error));
                 }
                 usable = false;
                 return false;
@@ -478,6 +496,28 @@ namespace cobra {
 
         enum class Answer : uint8_t { kEqual, kDiffer, kUnknown, kUntranslatable };
 
+        // `settings` with what is left of the budget before `deadline`, or
+        // nothing when it has run out. Both sides of a race share the one
+        // budget the question was given: a side that starts late gets what
+        // is left, not a fresh budget of its own, so a race never costs more
+        // than the time it was given.
+        std::optional< Z3VerificationSettings > RemainingBudget(
+            const Z3VerificationSettings &settings, std::chrono::steady_clock::time_point deadline
+        ) {
+            if (settings.timeout_ms == 0 || deadline == std::chrono::steady_clock::time_point::max()) {
+                return settings;
+            }
+            const auto left = std::chrono::duration_cast< std::chrono::milliseconds >(
+                deadline - std::chrono::steady_clock::now()
+            );
+            if (left.count() <= 0) {
+                return std::nullopt;
+            }
+            auto remaining       = settings;
+            remaining.timeout_ms = static_cast< uint32_t >(left.count());
+            return remaining;
+        }
+
         // `lhs != rhs` as an LLVM function, optimized when `optimize` says so,
         // and handed to Bitwuzla. `stop` ends the solver run early.
         Answer Check(
@@ -485,6 +525,7 @@ namespace cobra {
             const Z3VerificationSettings &settings, bool optimize, const std::atomic< bool > &stop,
             bool &timed_out
         ) {
+            last_check_folded = false;
             auto &compiler = ThreadCompiler();
             if (optimize && !compiler.Configure(settings.llvm_passes)) {
                 return Answer::kUntranslatable;
@@ -528,6 +569,7 @@ namespace cobra {
             if (const auto *constant = llvm::dyn_cast< llvm::ConstantInt >(returned)) {
                 if (optimize) {
                     Stats().folded.fetch_add(1, std::memory_order_relaxed);
+                    last_check_folded = true;
                 }
                 return constant->isZero() ? Answer::kEqual : Answer::kDiffer;
             }
@@ -651,6 +693,9 @@ namespace cobra {
                 enum State : uint8_t { kQueued, kRunning, kDone, kWithdrawn } state = kQueued;
                 Answer answer  = Answer::kUnknown;
                 bool timed_out = false;
+                // When the question's budget runs out, counted from when it was
+                // asked rather than from when a pool thread got to it.
+                std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max();
             };
 
             static RacePool &Instance() {
@@ -710,12 +755,18 @@ namespace cobra {
                     }
                     bool timed_out = false;
                     Answer answer  = Answer::kUntranslatable;
-                    try {
-                        answer = Check(
-                            *job->lhs, *job->rhs, job->num_vars, job->bitwidth, job->settings,
-                            /*optimize=*/false, job->asker_answered, timed_out
-                        );
-                    } catch (...) {
+                    const auto budget = RemainingBudget(job->settings, job->deadline);
+                    if (!budget.has_value()) {
+                        answer    = Answer::kUnknown;
+                        timed_out = true;
+                    } else {
+                        try {
+                            answer = Check(
+                                *job->lhs, *job->rhs, job->num_vars, job->bitwidth, *budget,
+                                /*optimize=*/false, job->asker_answered, timed_out
+                            );
+                        } catch (...) {
+                        }
                     }
                     if (answer == Answer::kEqual || answer == Answer::kDiffer) {
                         job->answered.store(true, std::memory_order_relaxed);
@@ -738,6 +789,59 @@ namespace cobra {
 
         bool Definite(Answer answer) { return answer == Answer::kEqual || answer == Answer::kDiffer; }
 
+
+        // An "equal" from the compiled question rests on the LLVM optimizer as
+        // well as on the solver: it was asked of what the optimizer made of the
+        // question, and when the optimizer folded it to `false` no solver was
+        // asked at all. A miscompilation there is an accepted rewrite that is
+        // wrong, so the answer is checked independently of LLVM before it is
+        // given:
+        //
+        // - both sides are evaluated directly on random and boundary inputs,
+        //   which a wrong "equal" almost never survives;
+        // - a folded answer is also put to the solver as built, briefly. A
+        //   counterexample overrides it; a timeout leaves it standing, since
+        //   the folds are what the solver cannot do in time (a product by an
+        //   odd constant, say), and is counted.
+        Answer ConfirmCompiledEqual(
+            const Expr &lhs, const Expr &rhs, const std::vector< std::string > &var_names,
+            uint32_t bitwidth, const Z3VerificationSettings &settings, bool folded
+        ) {
+            const uint64_t mask = Bitmask(bitwidth);
+            static constexpr uint64_t kBoundary[] = {
+                0, 1, 2, ~uint64_t{ 0 }, ~uint64_t{ 0 } - 1, uint64_t{ 1 } << 63,
+                (uint64_t{ 1 } << 63) - 1, 0x5555555555555555ULL, 0xAAAAAAAAAAAAAAAAULL,
+            };
+            std::mt19937_64 rng(0xC0B7A5EEDULL ^ (var_names.size() << 8) ^ bitwidth);
+            std::vector< uint64_t > values(var_names.size());
+            for (int round = 0; round < 256; ++round) {
+                for (auto &value : values) {
+                    value = (round < 32 ? kBoundary[rng() % std::size(kBoundary)] : rng()) & mask;
+                }
+                if (EvalExpr(lhs, values, bitwidth) != EvalExpr(rhs, values, bitwidth)) {
+                    Stats().llvm_refuted.fetch_add(1, std::memory_order_relaxed);
+                    return Answer::kDiffer;
+                }
+            }
+            if (!folded) {
+                return Answer::kEqual;
+            }
+            auto brief       = settings;
+            brief.timeout_ms = std::min< uint32_t >(settings.timeout_ms == 0 ? 250 : settings.timeout_ms, 250);
+            brief.unknown_result_mode = Z3UnknownResultMode::kFail;
+            const auto direct = Z3VerifyExprs(lhs, rhs, var_names, bitwidth, brief);
+            if (!direct.unknown) {
+                if (direct.equivalent) {
+                    Stats().folded_confirmed.fetch_add(1, std::memory_order_relaxed);
+                    return Answer::kEqual;
+                }
+                Stats().llvm_refuted.fetch_add(1, std::memory_order_relaxed);
+                return Answer::kDiffer;
+            }
+            Stats().folded_unconfirmed.fetch_add(1, std::memory_order_relaxed);
+            return Answer::kEqual;
+        }
+
     } // namespace
 
     Z3VerifyResult VerifyExprsWithStrategy(
@@ -751,8 +855,11 @@ namespace cobra {
         const std::atomic< bool > never{ false };
         if (settings.strategy == SmtStrategy::kLLVM || !RacePool::Instance().Enabled()) {
             bool timed_out = false;
-            const Answer answer =
+            Answer answer =
                 Check(lhs, rhs, var_names.size(), bitwidth, settings, /*optimize=*/true, never, timed_out);
+            if (answer == Answer::kEqual) {
+                answer = ConfirmCompiledEqual(lhs, rhs, var_names, bitwidth, settings, last_check_folded);
+            }
             if (answer == Answer::kUntranslatable) {
                 Stats().fallbacks.fetch_add(1, std::memory_order_relaxed);
                 return Z3VerifyExprs(lhs, rhs, var_names, bitwidth, settings);
@@ -767,11 +874,17 @@ namespace cobra {
         job->num_vars = var_names.size();
         job->bitwidth = bitwidth;
         job->settings = settings;
+        if (settings.timeout_ms > 0) {
+            job->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(settings.timeout_ms);
+        }
         RacePool::Instance().Submit(job);
 
         bool timed_out = false;
-        const Answer mine =
+        Answer mine =
             Check(lhs, rhs, var_names.size(), bitwidth, settings, /*optimize=*/true, job->answered, timed_out);
+        if (mine == Answer::kEqual) {
+            mine = ConfirmCompiledEqual(lhs, rhs, var_names, bitwidth, settings, last_check_folded);
+        }
 
         std::unique_lock< std::mutex > lock(job->mutex);
         if (Definite(mine)) {
@@ -791,9 +904,14 @@ namespace cobra {
             // No pool thread got to it: the question as built is asked here.
             job->state = RacePool::Job::kWithdrawn;
             lock.unlock();
-            theirs = Check(
-                lhs, rhs, var_names.size(), bitwidth, settings, /*optimize=*/false, never, theirs_timed_out
-            );
+            if (const auto budget = RemainingBudget(settings, job->deadline)) {
+                theirs = Check(
+                    lhs, rhs, var_names.size(), bitwidth, *budget, /*optimize=*/false, never, theirs_timed_out
+                );
+            } else {
+                theirs           = Answer::kUnknown;
+                theirs_timed_out = true;
+            }
         } else {
             job->finished.wait(lock, [&] { return job->state == RacePool::Job::kDone; });
             theirs           = job->answer;
@@ -824,7 +942,10 @@ namespace cobra {
                                     .sweep_lemmas      = stats.sweep_lemmas.load(),
                                     .sweep_proved      = stats.sweep_proved.load(),
                                     .sweep_generalized = stats.sweep_generalized.load(),
-                                    .sweep_synthesized = stats.sweep_synthesized.load() };
+                                    .sweep_synthesized = stats.sweep_synthesized.load(),
+                                    .llvm_refuted       = stats.llvm_refuted.load(),
+                                    .folded_confirmed   = stats.folded_confirmed.load(),
+                                    .folded_unconfirmed = stats.folded_unconfirmed.load() };
     }
 
 } // namespace cobra

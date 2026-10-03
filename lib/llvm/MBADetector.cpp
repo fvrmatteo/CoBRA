@@ -2,11 +2,13 @@
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/Expr.h"
+#include "cobra/core/ExprTraversal.h"
 #include "cobra/core/Simplifier.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -79,6 +81,16 @@ namespace cobra {
 
     namespace {
 
+        // See `Old` in CobraPass.cpp: `claim` puts back claiming the whole tree
+        // of a root skipped on its fingerprint.
+        bool OldClaim() {
+            static const bool old = [] {
+                const char *value = std::getenv("COBRA_OLD");
+                return value != nullptr && ("," + std::string(value) + ",").find(",claim,") != std::string::npos;
+            }();
+            return old;
+        }
+
         // The low 64 bits of a constant of any width: `getZExtValue` asserts
         // on a wider one, which a `trunc` of an i128 constant can bring into a
         // tree that is itself at most 64 bits wide.
@@ -126,6 +138,12 @@ namespace cobra {
             if (auto it = phi_redirects.find(v); it != phi_redirects.end()) {
                 auto through =
                     FingerprintNode(it->second, leaf_index, tree_set, phi_redirects, memo);
+                // Read through only because every arm is the same computation
+                // (`VerifyPhiArms`); how many arms there are is part of what
+                // that was decided on.
+                if (const auto *phi = llvm::dyn_cast< llvm::PHINode >(v)) {
+                    through.first = MixFingerprint(through.first, 6 + phi->getNumIncomingValues());
+                }
                 memo[v] = through;
                 return through;
             }
@@ -144,7 +162,26 @@ namespace cobra {
             // which keeps the hash deterministic instead of recursing forever.
             memo[v] = { 4, 0 };
 
-            uint64_t hash     = MixFingerprint(5, inst->getOpcode());
+            // The operation, not just its opcode: two comparisons with
+            // different predicates, two intrinsics behind one `call`, or two
+            // casts from different widths compute different things, and a
+            // verdict on one must not be read back for the other.
+            uint64_t hash = MixFingerprint(5, inst->getOpcode());
+            if (inst->getType()->isIntegerTy()) {
+                hash = MixFingerprint(hash, inst->getType()->getIntegerBitWidth());
+            }
+            if (const auto *cmp = llvm::dyn_cast< llvm::CmpInst >(inst)) {
+                hash = MixFingerprint(hash, cmp->getPredicate());
+            }
+            if (const auto *call = llvm::dyn_cast< llvm::CallBase >(inst)) {
+                const auto *callee = call->getCalledFunction();
+                hash               = MixFingerprint(
+                    hash, callee != nullptr ? static_cast< uint64_t >(callee->getIntrinsicID()) + 1 : 0
+                );
+            }
+            if (llvm::isa< llvm::CastInst >(inst) && inst->getOperand(0)->getType()->isIntegerTy()) {
+                hash = MixFingerprint(hash, inst->getOperand(0)->getType()->getIntegerBitWidth());
+            }
             uint32_t children = 0;
             for (llvm::Use &use : inst->operands()) {
                 auto child =
@@ -1455,6 +1492,21 @@ namespace cobra {
         // its signature is worked on.
         constexpr size_t kMaxExprNodes = 4096;
 
+        // A copy of `expr` charged to `budget`, or nothing when the budget
+        // cannot pay for it. Lowering a `select`, a minimum or maximum, or a
+        // byte swap writes an operand more than once, and a copy costs what the
+        // original did: uncharged, a chain of k selects held 2^k nodes and one
+        // of min/max 3^k, all inside a budget that only counted the IR visited.
+        std::unique_ptr< Expr > ChargedClone(const Expr &expr, size_t &budget) {
+            const size_t nodes = CountNodes(expr);
+            if (nodes > budget) {
+                budget = 0;
+                return nullptr;
+            }
+            budget -= nodes;
+            return CloneExpr(expr);
+        }
+
         std::unique_ptr< Expr > BuildExprFromIRImpl(
             llvm::Value *v, const std::vector< llvm::Value * > &leaves,
             const llvm::DenseSet< llvm::Value * > &tree_set, uint64_t mask,
@@ -1578,7 +1630,11 @@ namespace cobra {
                 // no pass has to handle a three-child node. The clone is taken
                 // before `else_arm` is moved from, since argument evaluation
                 // order is unspecified.
-                auto diff   = Expr::BitwiseXor(std::move(then_arm), CloneExpr(*else_arm));
+                auto else_copy = ChargedClone(*else_arm, budget);
+                if (else_copy == nullptr) {
+                    return nullptr;
+                }
+                auto diff   = Expr::BitwiseXor(std::move(then_arm), std::move(else_copy));
                 auto masked = Expr::BitwiseAnd(std::move(diff), Expr::Negate(std::move(cond)));
                 return Expr::BitwiseXor(std::move(else_arm), std::move(masked));
             }
@@ -1672,7 +1728,10 @@ namespace cobra {
                     --budget;
                     const uint64_t from = index * 8;
                     const uint64_t to   = (bytes - 1 - index) * 8;
-                    auto byte           = CloneExpr(*source);
+                    auto byte           = ChargedClone(*source, budget);
+                    if (byte == nullptr) {
+                        return nullptr;
+                    }
                     if (from != 0) {
                         byte = Expr::LogicalShr(std::move(byte), from);
                     }
@@ -1700,14 +1759,20 @@ namespace cobra {
                 if (a == nullptr || b == nullptr) {
                     return nullptr;
                 }
+                auto a_copy = ChargedClone(*a, budget);
+                auto b_copy = a_copy != nullptr ? ChargedClone(*b, budget) : nullptr;
+                auto b_again = b_copy != nullptr ? ChargedClone(*b, budget) : nullptr;
+                if (b_again == nullptr) {
+                    return nullptr;
+                }
                 auto cond = BuildComparison(
-                    MinMaxPredicate(*minmax), CloneExpr(*a), CloneExpr(*b)
+                    MinMaxPredicate(*minmax), std::move(a_copy), std::move(b_copy)
                 );
                 if (cond == nullptr) {
                     return nullptr;
                 }
                 // `select(c, A, B) == B ^ ((A ^ B) & -c)`, as above.
-                auto diff   = Expr::BitwiseXor(std::move(a), CloneExpr(*b));
+                auto diff   = Expr::BitwiseXor(std::move(a), std::move(b_again));
                 auto masked = Expr::BitwiseAnd(std::move(diff), Expr::Negate(std::move(cond)));
                 return Expr::BitwiseXor(std::move(b), std::move(masked));
             }
@@ -1944,12 +2009,17 @@ namespace cobra {
                 return choice != nullptr && std::string_view(choice) == "probes";
             }();
             const bool exact = PhiArmsAreTheSameComputation(phi_redirects);
-            const bool probed = VerifyPhiArmsByProbes(phi_redirects, leaves, bitwidth);
             phi_arms_checked.fetch_add(1, std::memory_order_relaxed);
-            phi_arms_probes_accept.fetch_add(probed ? 1 : 0, std::memory_order_relaxed);
             phi_arms_exact_accept.fetch_add(exact ? 1 : 0, std::memory_order_relaxed);
+            if (!probes) {
+                return exact;
+            }
+            // The probes are only run when they decide, which is also when
+            // what they accept beyond the exact check is worth counting.
+            const bool probed = VerifyPhiArmsByProbes(phi_redirects, leaves, bitwidth);
+            phi_arms_probes_accept.fetch_add(probed ? 1 : 0, std::memory_order_relaxed);
             phi_arms_probes_only.fetch_add(probed && !exact ? 1 : 0, std::memory_order_relaxed);
-            return probes ? probed : exact;
+            return probed;
         }
 
         bool VerifyPhiArmsByProbes(
@@ -2109,6 +2179,32 @@ namespace cobra {
                     continue;
                 }
 
+                // Verify transparent phis first: if any arm is not the same
+                // computation as the one followed, the tree is collected again
+                // with the phi as a leaf, and everything below - the polynomial
+                // check, the fingerprint, the expression - is about that tree.
+                // (They used to be taken from the first collection, so a tree
+                // whose phi turned out not to be transparent was fingerprinted,
+                // and its expression built, against a set of instructions it no
+                // longer held.)
+                if (!phi_redirects.empty() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
+                    tree_insts.clear();
+                    leaves.clear();
+                    phi_redirects.clear();
+                    CollectTree(
+                        &inst, bw, tree_insts, leaves, phi_redirects,
+                        /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
+                        max_tree_nodes, opaque
+                    );
+
+                    if (tree_insts.size() < min_ast_size) {
+                        continue;
+                    }
+                    if (leaves.size() > std::min(max_vars, kPreElimCap)) {
+                        continue;
+                    }
+                }
+
                 const llvm::DenseSet< llvm::Value * > tree_set(
                     tree_insts.begin(), tree_insts.end()
                 );
@@ -2117,13 +2213,46 @@ namespace cobra {
                     continue;
                 }
 
-                // Everything past this point — phi arm verification, the
-                // 2^leaves signature sweep, the AST build and the solve in the
-                // caller — is decided entirely by the tree just collected. If a
-                // previous run already reached this exact tree there is nothing
-                // new to learn, so claim its instructions and move on. The tree
-                // is still claimed because the enclosing root must keep winning
-                // over its inner nodes whether or not it gets re-examined.
+                // Which of the tree's instructions actually disappear if the root
+                // is replaced. The root always does; anything else only follows
+                // once every one of its readers has gone. A node that is also
+                // stored, or feeds a sibling computation, therefore survives and
+                // keeps its own operands alive with it.
+                //
+                // This is both the honest measure of what a rewrite buys and the
+                // right rule for claiming: a surviving node is not subsumed by
+                // the root, so it stays eligible to be simplified in its own
+                // right - whether the root is examined now or skipped below.
+                llvm::DenseSet< llvm::Instruction * > dying{ &inst };
+                for (bool growing = true; growing;) {
+                    growing = false;
+                    for (auto *ti : tree_insts) {
+                        if (dying.contains(ti)) {
+                            continue;
+                        }
+                        const bool kConsumed =
+                            llvm::all_of(ti->users(), [&](const llvm::User *u) {
+                                auto *ui = llvm::dyn_cast< llvm::Instruction >(u);
+                                return ui != nullptr && dying.contains(ui);
+                            });
+                        if (kConsumed) {
+                            dying.insert(ti);
+                            growing = true;
+                        }
+                    }
+                }
+
+                for (auto *ti : dying) {
+                    already_in_tree.insert(ti);
+                }
+
+                // Everything past this point — the 2^leaves signature sweep, the
+                // AST build and the solve in the caller — is decided entirely by
+                // the tree just collected. If a previous run already reached this
+                // exact tree there is nothing new to learn, so move on; its dying
+                // instructions are claimed above, exactly as an examined root's
+                // are. (Claiming the whole tree here took the root's shared
+                // operands away from the roots that read them as well.)
                 //
                 // A re-cut is exempt on both counts. Its fingerprint describes a
                 // partial view of the root, so matching it against the record —
@@ -2146,63 +2275,12 @@ namespace cobra {
                     && shared_cut == nullptr && FingerprintUnchanged(inst, fingerprint, options_tag))
                 {
                     ++NumFingerprintSkips;
-                    for (auto *ti : tree_insts) {
-                        already_in_tree.insert(ti);
+                    if (OldClaim()) {
+                        for (auto *ti : tree_insts) {
+                            already_in_tree.insert(ti);
+                        }
                     }
                     continue;
-                }
-
-                // Verify transparent phis — if any arm diverges,
-                // re-collect without phi transparency.
-                if (!phi_redirects.empty() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
-                    tree_insts.clear();
-                    leaves.clear();
-                    phi_redirects.clear();
-                    CollectTree(
-                        &inst, bw, tree_insts, leaves, phi_redirects,
-                        /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
-                        max_tree_nodes, opaque
-                    );
-
-                    if (tree_insts.size() < min_ast_size) {
-                        continue;
-                    }
-                    if (leaves.size() > std::min(max_vars, kPreElimCap)) {
-                        continue;
-                    }
-                }
-
-                // Which of the tree's instructions actually disappear if the root
-                // is replaced. The root always does; anything else only follows
-                // once every one of its readers has gone. A node that is also
-                // stored, or feeds a sibling computation, therefore survives and
-                // keeps its own operands alive with it.
-                //
-                // This is both the honest measure of what a rewrite buys and the
-                // right rule for claiming: a surviving node is not subsumed by
-                // the root, so it stays eligible to be simplified in its own
-                // right.
-                llvm::DenseSet< llvm::Instruction * > dying{ &inst };
-                for (bool growing = true; growing;) {
-                    growing = false;
-                    for (auto *ti : tree_insts) {
-                        if (dying.contains(ti)) {
-                            continue;
-                        }
-                        const bool kConsumed =
-                            llvm::all_of(ti->users(), [&](const llvm::User *u) {
-                                auto *ui = llvm::dyn_cast< llvm::Instruction >(u);
-                                return ui != nullptr && dying.contains(ui);
-                            });
-                        if (kConsumed) {
-                            dying.insert(ti);
-                            growing = true;
-                        }
-                    }
-                }
-
-                for (auto *ti : dying) {
-                    already_in_tree.insert(ti);
                 }
 
                 // `min_ast_size` is meant to keep the solver away from
@@ -2239,13 +2317,27 @@ namespace cobra {
                     sig[i] = plan->Evaluate(inputs.data(), num_vars, slots);
                 }
 
+                // Names are how a solved rewrite's variables are matched back
+                // to leaves (`TryBuildVarSupport`), so no two may be the same:
+                // an unnamed leaf's `v3` could otherwise be a named leaf's `v3`
+                // too, and the rewrite read the wrong one.
                 std::vector< std::string > var_names;
+                llvm::StringSet<> taken;
+                for (uint32_t v = 0; v < num_vars; ++v) {
+                    if (leaves[v]->hasName()) {
+                        taken.insert(leaves[v]->getName());
+                    }
+                }
                 for (uint32_t v = 0; v < num_vars; ++v) {
                     if (leaves[v]->hasName()) {
                         var_names.push_back(leaves[v]->getName().str());
-                    } else {
-                        var_names.push_back("v" + std::to_string(v));
+                        continue;
                     }
+                    std::string name = "v" + std::to_string(v);
+                    while (!taken.insert(name).second) {
+                        name += "'";
+                    }
+                    var_names.push_back(std::move(name));
                 }
 
                 const uint64_t mask = Bitmask(bw);
@@ -2310,7 +2402,13 @@ namespace cobra {
                                   .tree_size    = static_cast< uint32_t >(tree_insts.size()),
                                   .boundary_cut  = cut_arith_under_bitwise,
                                   .demanded_mask = demanded_mask,
-                                  .spans_freeze  = spans_freeze }
+                                  .spans_freeze  = spans_freeze,
+                                  .spans_select  = llvm::any_of(
+                                      tree_insts,
+                                      [](const llvm::Instruction *ti) {
+                                          return llvm::isa< llvm::SelectInst >(ti);
+                                      }
+                                  ) }
                 );
             }
         }
@@ -2581,10 +2679,23 @@ namespace cobra {
         llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
         std::vector< llvm::Value * > leaves;
         llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
+        const uint32_t bw = inst->getType()->getIntegerBitWidth();
         CollectTree(
-            inst, inst->getType()->getIntegerBitWidth(), tree_insts, leaves, phi_redirects,
-            /*try_phi_transparency=*/true, 0, false, max_tree_nodes
+            inst, bw, tree_insts, leaves, phi_redirects, /*try_phi_transparency=*/true, 0, false,
+            max_tree_nodes
         );
+        // As the detector collects it: a phi only read through when its arms
+        // are the same computation, or the fingerprint would describe a tree
+        // the detector never builds and never match.
+        if (!phi_redirects.empty() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
+            tree_insts.clear();
+            leaves.clear();
+            phi_redirects.clear();
+            CollectTree(
+                inst, bw, tree_insts, leaves, phi_redirects, /*try_phi_transparency=*/false, 0,
+                false, max_tree_nodes
+            );
+        }
 
         const llvm::DenseSet< llvm::Value * > tree_set(tree_insts.begin(), tree_insts.end());
         return FingerprintTree(inst, leaves, tree_set, phi_redirects);

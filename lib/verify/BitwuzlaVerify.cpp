@@ -89,7 +89,13 @@ namespace cobra {
                     );
                 }
                 case Expr::Kind::kShr: {
-                    // For kShr, constant_val carries the shift amount.
+                    // For kShr, constant_val carries the shift amount. A shift by
+                    // the width or more is 0, as everywhere else an Expr is read
+                    // (`ModShr`); the amount as a `bitwidth`-bit value would wrap
+                    // round past 2^bitwidth instead.
+                    if (expr.constant_val >= bitwidth) {
+                        return BvValue(tm, bitwidth, 0);
+                    }
                     auto operand = BuildSmtExpr(tm, *expr.children[0], var_terms, bitwidth);
                     auto amount  = BvValue(tm, bitwidth, expr.constant_val);
                     return tm.mk_term(bitwuzla::Kind::BV_SHR, { operand, amount });
