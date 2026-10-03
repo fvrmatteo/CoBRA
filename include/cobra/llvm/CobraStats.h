@@ -181,6 +181,16 @@ namespace cobra {
         uint64_t background_wait_nanoseconds  = 0;
         uint64_t background_drain_nanoseconds = 0;
         uint64_t background_nanoseconds       = 0;
+        // Proofs a worker could not finish, and what they cost it. Such a rewrite is left
+        // unproved for the loop to prove again (see `Speculation::RetryUnknown`).
+        uint64_t background_unknown             = 0;
+        uint64_t background_unknown_nanoseconds = 0;
+        // What the loop's own proof of such a rewrite came to: the question the worker
+        // already ran its budget out on, asked again at the same budget.
+        uint64_t after_background_unknown_proved   = 0;
+        uint64_t after_background_unknown_refuted  = 0;
+        uint64_t after_background_unknown_unknown  = 0;
+        uint64_t after_background_unknown_nanoseconds = 0;
 
         // The ladder, by the kind of second look.
         uint64_t boundary_nanoseconds = 0;
