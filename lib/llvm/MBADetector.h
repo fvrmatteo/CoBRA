@@ -54,10 +54,31 @@ namespace cobra {
     const llvm::GetElementPtrInst *ByteGepOf(const llvm::Value *v);
     llvm::Value *ByteGepBase(const llvm::GetElementPtrInst *gep);
 
+    // What LLVM's value tracking knows of a leaf's bits: the ones always zero
+    // and the ones always one, as masks over the tree width. A leaf is whatever
+    // the collection stopped at - a phi, a load, a value a cut kept opaque -
+    // and the tree reads it as a free variable; but a phi of a constant and a
+    // masked value has no bit outside the mask, and an identity written across
+    // that fact is invisible to a solver that is not told it: `(v ^ C) + v` is
+    // `C` exactly when `v` has no bit outside `C`. So every reading of the tree
+    // - the expression, the probe plan and the signature it yields, the
+    // fingerprint - masks the leaf by what is known, a rewrite is found, probed
+    // and proved under the same facts the tree was read under, and the facts
+    // are part of the tree's identity.
+    struct LeafBits
+    {
+        uint64_t zero = 0;
+        uint64_t one  = 0;
+        bool Informative() const { return zero != 0 || one != 0; }
+        bool operator==(const LeafBits &other) const = default;
+    };
+
     struct MBACandidate
     {
         llvm::Instruction *root;
         std::vector< llvm::Value * > leaf_values;
+        // One entry per leaf; what the reconstruction may drop a mask against.
+        std::vector< LeafBits > leaf_bits;
         std::vector< std::string > var_names;
         std::vector< uint64_t > sig;
         uint32_t bitwidth;

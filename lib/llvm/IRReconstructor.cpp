@@ -229,15 +229,44 @@ namespace cobra {
                 auto *rhs = child(1);
                 return EmitBinary(llvm::Instruction::Mul, lhs, rhs, builder, "cobra.mul", reuse);
             }
-            case Expr::Kind::kAnd: {
-                auto *lhs = child(0);
-                auto *rhs = child(1);
-                return EmitBinary(llvm::Instruction::And, lhs, rhs, builder, "cobra.and", reuse);
-            }
+            // A mask on a leaf that only says what the leaf's known bits already
+            // say is the tree's own reading of the leaf (`LeafBits`), not part of
+            // the answer: emitted, it would be an instruction InstCombine removes
+            // and the rewrite priced one higher than it is.
+            case Expr::Kind::kAnd:
             case Expr::Kind::kOr: {
+                const auto implied = [&](unsigned variable, unsigned constant) -> llvm::Value * {
+                    const auto &leaf = *expr.children[variable];
+                    const auto &mask = *expr.children[constant];
+                    if (leaf.kind != Expr::Kind::kVariable || mask.kind != Expr::Kind::kConstant) {
+                        return nullptr;
+                    }
+                    uint32_t leaf_idx = leaf.var_index;
+                    if (!var_map.empty()) {
+                        leaf_idx = var_map[leaf.var_index];
+                    }
+                    if (leaf_idx >= candidate.leaf_bits.size()) {
+                        return nullptr;
+                    }
+                    const auto &bits     = candidate.leaf_bits[leaf_idx];
+                    const uint64_t width = candidate.bitwidth >= 64 ? ~uint64_t{ 0 }
+                                                                    : (uint64_t{ 1 } << candidate.bitwidth) - 1;
+                    const bool redundant = expr.kind == Expr::Kind::kAnd
+                        ? ((~bits.zero & width) & ~mask.constant_val) == 0
+                        : (mask.constant_val & width & ~bits.one) == 0;
+                    return redundant ? child(variable) : nullptr;
+                };
+                if (auto *leaf = implied(0, 1)) {
+                    return leaf;
+                }
+                if (auto *leaf = implied(1, 0)) {
+                    return leaf;
+                }
                 auto *lhs = child(0);
                 auto *rhs = child(1);
-                return EmitBinary(llvm::Instruction::Or, lhs, rhs, builder, "cobra.or", reuse);
+                return expr.kind == Expr::Kind::kAnd
+                    ? EmitBinary(llvm::Instruction::And, lhs, rhs, builder, "cobra.and", reuse)
+                    : EmitBinary(llvm::Instruction::Or, lhs, rhs, builder, "cobra.or", reuse);
             }
             case Expr::Kind::kXor: {
                 auto *lhs = child(0);

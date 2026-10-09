@@ -10,6 +10,10 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/KnownBits.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instruction.h"
@@ -112,11 +116,14 @@ namespace cobra {
 
         // Hash and height of the subtree at `v`, memoized so a shared operand
         // is folded once no matter how many parents reach it.
+        const std::vector< LeafBits > kNoLeafBits;
+
         std::pair< uint64_t, uint32_t > FingerprintNode(
             llvm::Value *v, const llvm::DenseMap< llvm::Value *, uint32_t > &leaf_index,
             const llvm::DenseSet< llvm::Value * > &tree_set,
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
-            llvm::DenseMap< llvm::Value *, std::pair< uint64_t, uint32_t > > &memo
+            llvm::DenseMap< llvm::Value *, std::pair< uint64_t, uint32_t > > &memo,
+            const std::vector< LeafBits > &leaf_bits
         ) {
             if (auto it = memo.find(v); it != memo.end()) {
                 return it->second;
@@ -124,8 +131,16 @@ namespace cobra {
 
             // Leaves are checked before the redirect map so that a phi kept as
             // a leaf hashes by position, matching how it is later evaluated.
+            // What is known of the leaf's bits is part of the tree read, so it
+            // is part of the identity - and a leaf nothing is known about
+            // hashes as it always did.
             if (auto it = leaf_index.find(v); it != leaf_index.end()) {
-                const std::pair< uint64_t, uint32_t > leaf{ MixFingerprint(1, it->second), 0 };
+                uint64_t hash = MixFingerprint(1, it->second);
+                if (it->second < leaf_bits.size() && leaf_bits[it->second].Informative()) {
+                    hash = MixFingerprint(hash, leaf_bits[it->second].zero);
+                    hash = MixFingerprint(hash, leaf_bits[it->second].one);
+                }
+                const std::pair< uint64_t, uint32_t > leaf{ hash, 0 };
                 memo[v] = leaf;
                 return leaf;
             }
@@ -137,7 +152,7 @@ namespace cobra {
             }
             if (auto it = phi_redirects.find(v); it != phi_redirects.end()) {
                 auto through =
-                    FingerprintNode(it->second, leaf_index, tree_set, phi_redirects, memo);
+                    FingerprintNode(it->second, leaf_index, tree_set, phi_redirects, memo, leaf_bits);
                 // Read through only because every arm is the same computation
                 // (`VerifyPhiArms`); how many arms there are is part of what
                 // that was decided on.
@@ -185,7 +200,7 @@ namespace cobra {
             uint32_t children = 0;
             for (llvm::Use &use : inst->operands()) {
                 auto child =
-                    FingerprintNode(use.get(), leaf_index, tree_set, phi_redirects, memo);
+                    FingerprintNode(use.get(), leaf_index, tree_set, phi_redirects, memo, leaf_bits);
                 hash     = MixFingerprint(hash, child.first);
                 children = std::max(children, child.second);
             }
@@ -198,7 +213,8 @@ namespace cobra {
         MbaFingerprint FingerprintTree(
             llvm::Instruction *root, const std::vector< llvm::Value * > &leaves,
             const llvm::DenseSet< llvm::Value * > &tree_set,
-            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+            const std::vector< LeafBits > &leaf_bits = kNoLeafBits
         ) {
             llvm::DenseMap< llvm::Value *, uint32_t > leaf_index;
             for (uint32_t i = 0; i < leaves.size(); ++i) {
@@ -206,7 +222,7 @@ namespace cobra {
             }
 
             llvm::DenseMap< llvm::Value *, std::pair< uint64_t, uint32_t > > memo;
-            auto walked = FingerprintNode(root, leaf_index, tree_set, phi_redirects, memo);
+            auto walked = FingerprintNode(root, leaf_index, tree_set, phi_redirects, memo, leaf_bits);
 
             return MbaFingerprint{ .structure = walked.first,
                                    .depth     = walked.second,
@@ -902,17 +918,42 @@ namespace cobra {
         // still contain operand or phi cycles, so a back edge onto a node
         // that is still being lowered resolves to zero, while references
         // discovered after that node completes see its real value.
+        // What LLVM's value tracking knows of each leaf's bits where the tree
+        // reads it (`LeafBits`). Bits above a narrow leaf's own width are not
+        // news - `NarrowWidth` masks them wherever the leaf is read - so only
+        // the bits within that width count, and a leaf nothing is known about
+        // carries nothing.
+        std::vector< LeafBits > LeafBitsOf(
+            const std::vector< llvm::Value * > &leaves, uint32_t bw, const llvm::DataLayout &layout
+        ) {
+            std::vector< LeafBits > facts(leaves.size());
+            for (size_t i = 0; i < leaves.size(); ++i) {
+                auto *leaf = leaves[i];
+                if (!leaf->getType()->isIntegerTy() || leaf->getType()->getIntegerBitWidth() > 64) {
+                    continue;
+                }
+                const llvm::KnownBits known = llvm::computeKnownBits(leaf, layout);
+                const uint32_t narrow      = NarrowWidth(leaf, bw);
+                const uint64_t own         = (narrow == 0 ? Bitmask(bw) : Bitmask(narrow));
+                facts[i].zero              = known.Zero.getZExtValue() & own;
+                facts[i].one               = known.One.getZExtValue() & own;
+            }
+            return facts;
+        }
+
         class TreeEvalPlan
         {
           public:
             static TreeEvalPlan Build(
                 llvm::Instruction *root, const std::vector< llvm::Value * > &leaves,
                 uint32_t bitwidth,
-                const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
+                const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+                const std::vector< LeafBits > &leaf_bits = kNoLeafBits
             ) {
                 TreeEvalPlan plan;
-                plan.mask_ = Bitmask(bitwidth);
-                plan.bits_ = bitwidth;
+                plan.mask_      = Bitmask(bitwidth);
+                plan.bits_      = bitwidth;
+                plan.leaf_bits_ = leaf_bits;
 
                 llvm::DenseMap< llvm::Value *, uint32_t > leaf_index;
                 for (size_t i = 0; i < leaves.size(); ++i) {
@@ -1123,9 +1164,11 @@ namespace cobra {
                 auto leaf = leaf_index.find(v);
                 if (leaf != leaf_index.end()) {
                     // Probes hand a leaf any word; a narrow leaf only ever
-                    // holds its own width of it, and the Expr says the same.
-                    const uint32_t slot = MaskToWidth(v, Emit(Op::kInput, leaf->second, 0));
-                    slot_of[v]          = slot;
+                    // holds its own width of it, a leaf with known bits only
+                    // ever holds a word with them, and the Expr says the same.
+                    const uint32_t slot =
+                        ApplyLeafBits(leaf->second, MaskToWidth(v, Emit(Op::kInput, leaf->second, 0)));
+                    slot_of[v] = slot;
                     return slot;
                 }
 
@@ -1316,10 +1359,27 @@ namespace cobra {
                 return Emit(Op::kAnd, slot, ConstSlot(Bitmask(width)));
             }
 
+            // Clear the bits of leaf `index` known to be zero and set the ones
+            // known to be one, as the Expr does for the same leaf.
+            uint32_t ApplyLeafBits(uint32_t index, uint32_t slot) {
+                if (index >= leaf_bits_.size()) {
+                    return slot;
+                }
+                const auto &bits = leaf_bits_[index];
+                if (bits.zero != 0) {
+                    slot = Emit(Op::kAnd, slot, ConstSlot(~bits.zero & mask_));
+                }
+                if (bits.one != 0) {
+                    slot = Emit(Op::kOr, slot, ConstSlot(bits.one & mask_));
+                }
+                return slot;
+            }
+
             static constexpr uint32_t kZeroSlot = 0;
 
             std::vector< Node > nodes_;
             std::vector< uint64_t > consts_;
+            std::vector< LeafBits > leaf_bits_;
             uint32_t root_ = kZeroSlot;
             uint64_t mask_ = UINT64_MAX;
             uint32_t bits_ = 64;
@@ -1511,7 +1571,8 @@ namespace cobra {
             llvm::Value *v, const std::vector< llvm::Value * > &leaves,
             const llvm::DenseSet< llvm::Value * > &tree_set, uint64_t mask,
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
-            llvm::DenseSet< llvm::Value * > &in_progress, size_t &budget
+            llvm::DenseSet< llvm::Value * > &in_progress, size_t &budget,
+            const std::vector< LeafBits > &leaf_bits
         ) {
             if (budget == 0) {
                 return nullptr;
@@ -1532,7 +1593,7 @@ namespace cobra {
             auto pit = phi_redirects.find(v);
             if (pit != phi_redirects.end()) {
                 return BuildExprFromIRImpl(
-                    pit->second, leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    pit->second, leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
             }
 
@@ -1553,11 +1614,22 @@ namespace cobra {
                 return Expr::BitwiseAnd(std::move(expr), Expr::Constant(Bitmask(width)));
             };
 
-            // Leaf (variable)
+            // Leaf (variable), masked by what is known of its bits exactly as
+            // the probe plan masks the input it hands the same leaf.
             auto leaf_it = std::find(leaves.begin(), leaves.end(), v);
             if (leaf_it != leaves.end()) {
-                auto idx = static_cast< uint32_t >(leaf_it - leaves.begin());
-                return mask_to_width(Expr::Variable(idx));
+                auto idx   = static_cast< uint32_t >(leaf_it - leaves.begin());
+                auto leaf  = mask_to_width(Expr::Variable(idx));
+                if (idx < leaf_bits.size()) {
+                    const auto &bits = leaf_bits[idx];
+                    if (bits.zero != 0) {
+                        leaf = Expr::BitwiseAnd(std::move(leaf), Expr::Constant(~bits.zero & mask));
+                    }
+                    if (bits.one != 0) {
+                        leaf = Expr::BitwiseOr(std::move(leaf), Expr::Constant(bits.one & mask));
+                    }
+                }
+                return leaf;
             }
 
             auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
@@ -1570,7 +1642,7 @@ namespace cobra {
                 || inst->getOpcode() == llvm::Instruction::SExt)
             {
                 auto child = BuildExprFromIRImpl(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 if (child == nullptr) {
                     return nullptr;
@@ -1589,7 +1661,7 @@ namespace cobra {
             // Trunc keeps the low bits: a mask at the width it narrows to.
             if (inst->getOpcode() == llvm::Instruction::Trunc) {
                 auto child = BuildExprFromIRImpl(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 if (child == nullptr) {
                     return nullptr;
@@ -1601,10 +1673,10 @@ namespace cobra {
 
             if (auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
                 auto lhs = BuildExprFromIRImpl(
-                    cmp->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    cmp->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 auto rhs = BuildExprFromIRImpl(
-                    cmp->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    cmp->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 if (lhs == nullptr || rhs == nullptr) {
                     return nullptr;
@@ -1614,13 +1686,13 @@ namespace cobra {
 
             if (inst->getOpcode() == llvm::Instruction::Select) {
                 auto cond = BuildExprFromIRImpl(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 auto then_arm = BuildExprFromIRImpl(
-                    inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 auto else_arm = BuildExprFromIRImpl(
-                    inst->getOperand(2), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    inst->getOperand(2), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 if (cond == nullptr || then_arm == nullptr || else_arm == nullptr) {
                     return nullptr;
@@ -1646,7 +1718,7 @@ namespace cobra {
                     return nullptr;
                 }
                 auto child = BuildExprFromIRImpl(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 if (child == nullptr) {
                     return nullptr;
@@ -1661,7 +1733,7 @@ namespace cobra {
                     return nullptr;
                 }
                 auto child = BuildExprFromIRImpl(
-                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 if (child == nullptr) {
                     return nullptr;
@@ -1678,7 +1750,7 @@ namespace cobra {
             if (IsTransparentFreeze(inst)) {
                 return BuildExprFromIRImpl(
                     inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
-                    budget
+                    budget, leaf_bits
                 );
             }
 
@@ -1688,10 +1760,10 @@ namespace cobra {
                 const auto [amount, width] = FunnelShiftAmount(*fsh);
                 const bool kLeft           = fsh->getIntrinsicID() == llvm::Intrinsic::fshl;
                 auto a                     = BuildExprFromIRImpl(
-                    fsh->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    fsh->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 auto b = BuildExprFromIRImpl(
-                    fsh->getArgOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                    fsh->getArgOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
                 );
                 if (a == nullptr || b == nullptr) {
                     return nullptr;
@@ -1715,7 +1787,7 @@ namespace cobra {
                 const uint64_t bytes = ByteSwapBytes(*bswap);
                 auto source          = BuildExprFromIRImpl(
                     bswap->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
-                    budget
+                    budget, leaf_bits
                 );
                 if (source == nullptr) {
                     return nullptr;
@@ -1750,11 +1822,11 @@ namespace cobra {
             if (const auto *minmax = MinMaxOf(inst)) {
                 auto a = BuildExprFromIRImpl(
                     minmax->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
-                    budget
+                    budget, leaf_bits
                 );
                 auto b = BuildExprFromIRImpl(
                     minmax->getArgOperand(1), leaves, tree_set, mask, phi_redirects, in_progress,
-                    budget
+                    budget, leaf_bits
                 );
                 if (a == nullptr || b == nullptr) {
                     return nullptr;
@@ -1781,7 +1853,7 @@ namespace cobra {
             if (ByteGepOf(inst) != nullptr) {
                 auto index = BuildExprFromIRImpl(
                     inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress,
-                    budget
+                    budget, leaf_bits
                 );
                 if (index == nullptr) {
                     return nullptr;
@@ -1791,7 +1863,7 @@ namespace cobra {
                 }
                 auto below = BuildExprFromIRImpl(
                     inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
-                    budget
+                    budget, leaf_bits
                 );
                 if (below == nullptr) {
                     return nullptr;
@@ -1801,10 +1873,10 @@ namespace cobra {
 
             // Binary operations
             auto lhs = BuildExprFromIRImpl(
-                inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
             );
             auto rhs = BuildExprFromIRImpl(
-                inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget
+                inst->getOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
             );
             if (lhs == nullptr || rhs == nullptr) {
                 return nullptr;
@@ -1851,12 +1923,13 @@ namespace cobra {
         std::unique_ptr< Expr > BuildExprFromIR(
             llvm::Value *v, const std::vector< llvm::Value * > &leaves,
             const llvm::DenseSet< llvm::Value * > &tree_set, uint64_t mask,
-            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+            const std::vector< LeafBits > &leaf_bits = kNoLeafBits
         ) {
             llvm::DenseSet< llvm::Value * > in_progress;
             size_t budget = kMaxExprNodes;
             return BuildExprFromIRImpl(
-                v, leaves, tree_set, mask, phi_redirects, in_progress, budget
+                v, leaves, tree_set, mask, phi_redirects, in_progress, budget, leaf_bits
             );
         }
 
@@ -2160,11 +2233,6 @@ namespace cobra {
                     max_tree_nodes, opaque
                 );
 
-                if (tree_insts.size() < min_ast_size) {
-                    DeclinedRoot(inst, "smaller than min_ast_size", tree_insts.size(), leaves.size());
-                    continue;
-                }
-
                 // The sweep below is 2^leaves, so every leaf doubles the price
                 // of finding out whether the solver can use the tree at all.
                 // Auxiliary variables are eliminated only after it has been
@@ -2181,12 +2249,15 @@ namespace cobra {
 
                 // Verify transparent phis first: if any arm is not the same
                 // computation as the one followed, the tree is collected again
-                // with the phi as a leaf, and everything below - the polynomial
-                // check, the fingerprint, the expression - is about that tree.
-                // (They used to be taken from the first collection, so a tree
-                // whose phi turned out not to be transparent was fingerprinted,
-                // and its expression built, against a set of instructions it no
-                // longer held.)
+                // with the phi as a leaf, and everything below - the size gate,
+                // the polynomial check, the fingerprint, the expression - is
+                // about that tree. (They used to be taken from the first
+                // collection, so a tree whose phi turned out not to be
+                // transparent was fingerprinted, and its expression built,
+                // against a set of instructions it no longer held; and the size
+                // gate ran first, so a phi read through to a constant arm made a
+                // tree look two nodes small and declined it before the leaf it
+                // really is was ever seen.)
                 if (!phi_redirects.empty() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
                     tree_insts.clear();
                     leaves.clear();
@@ -2196,13 +2267,27 @@ namespace cobra {
                         /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
                         max_tree_nodes, opaque
                     );
-
-                    if (tree_insts.size() < min_ast_size) {
-                        continue;
-                    }
                     if (leaves.size() > std::min(max_vars, kPreElimCap)) {
                         continue;
                     }
+                }
+
+                // What is known of the leaves' bits is read into the tree as a
+                // mask on each such leaf, so it counts toward the size of the
+                // expression the tree stands for: `(v ^ C) + v` is two
+                // instructions and, with `v` known to lie inside `C`, the
+                // five-node expression `((v & C) ^ C) + (v & C)`, which is the
+                // one worth the solver's time.
+                const std::vector< LeafBits > leaf_bits =
+                    LeafBitsOf(leaves, bw, inst.getModule()->getDataLayout());
+                const size_t informative_leaves = static_cast< size_t >(
+                    std::count_if(leaf_bits.begin(), leaf_bits.end(), [](const LeafBits &bits) {
+                        return bits.Informative();
+                    })
+                );
+                if (tree_insts.size() + informative_leaves < min_ast_size) {
+                    DeclinedRoot(inst, "smaller than min_ast_size", tree_insts.size(), leaves.size());
+                    continue;
                 }
 
                 const llvm::DenseSet< llvm::Value * > tree_set(
@@ -2260,7 +2345,7 @@ namespace cobra {
                 // things, and it is only ever built because the full tree has
                 // already been tried and rejected in this very run.
                 const MbaFingerprint fingerprint = WithDemandedMask(
-                    FingerprintTree(&inst, leaves, tree_set, phi_redirects), demanded_mask, bw
+                    FingerprintTree(&inst, leaves, tree_set, phi_redirects, leaf_bits), demanded_mask, bw
                 );
                 // `COBRA_FINGERPRINT=off` examines every tree again, however
                 // it was left. The record says "this exact tree was examined
@@ -2305,7 +2390,7 @@ namespace cobra {
                 std::vector< uint64_t > sig(sig_len);
 
                 auto plan = std::make_shared< const TreeEvalPlan >(
-                    TreeEvalPlan::Build(&inst, leaves, bw, phi_redirects)
+                    TreeEvalPlan::Build(&inst, leaves, bw, phi_redirects, leaf_bits)
                 );
 
                 std::vector< uint64_t > inputs(num_vars);
@@ -2341,7 +2426,7 @@ namespace cobra {
                 }
 
                 const uint64_t mask = Bitmask(bw);
-                auto expr = BuildExprFromIR(&inst, leaves, tree_set, mask, phi_redirects);
+                auto expr = BuildExprFromIR(&inst, leaves, tree_set, mask, phi_redirects, leaf_bits);
 
                 // Build evaluator lambda for full-width verification.  The
                 // plan is shared rather than captured by value so that copying
@@ -2385,6 +2470,7 @@ namespace cobra {
                 candidates.push_back(
                     MBACandidate{ .root        = &inst,
                                   .leaf_values = std::move(leaves),
+                                  .leaf_bits   = leaf_bits,
                                   .var_names   = std::move(var_names),
                                   .sig         = std::move(sig),
                                   .bitwidth    = bw,
@@ -2698,7 +2784,10 @@ namespace cobra {
         }
 
         const llvm::DenseSet< llvm::Value * > tree_set(tree_insts.begin(), tree_insts.end());
-        return FingerprintTree(inst, leaves, tree_set, phi_redirects);
+        return FingerprintTree(
+            inst, leaves, tree_set, phi_redirects,
+            LeafBitsOf(leaves, bw, inst->getModule()->getDataLayout())
+        );
     }
 
 } // namespace cobra
