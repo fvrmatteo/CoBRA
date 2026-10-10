@@ -4,6 +4,7 @@
 #include "SmtStrategy.h"
 #include "MBADetector.h"
 #include "cobra/llvm/CobraStats.h"
+#include "../verify/VerifyCache.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/CompiledExpr.h"
 #include "cobra/core/ExprCost.h"
@@ -1175,6 +1176,28 @@ namespace cobra {
 
             // Which of those a worker thread recorded, for the report alone: it says
             // whether the loop, had it asked again, would have done any better.
+            // The memo of questions that ran out of budget, for `SaveUnknownMemo`.
+            std::vector< std::pair< std::string, uint32_t > > Unknowns() const {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                return { unknown_.begin(), unknown_.end() };
+            }
+
+            std::vector< std::string > BackgroundUnknowns() const {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                return { background_unknown_.begin(), background_unknown_.end() };
+            }
+
+            void RestoreUnknowns(
+                const std::vector< std::pair< std::string, uint32_t > > &unknowns,
+                const std::vector< std::string > &background
+            ) {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                unknown_.clear();
+                unknown_.insert(unknowns.begin(), unknowns.end());
+                background_unknown_.clear();
+                background_unknown_.insert(background.begin(), background.end());
+            }
+
             void MarkBackgroundUnknown(const std::string &key) {
                 const std::lock_guard< std::mutex > lock(mutex_);
                 if (background_unknown_.size() >= kMaxUnknown) {
@@ -3347,6 +3370,30 @@ namespace cobra {
         auto &state = Stats();
         const std::lock_guard< std::mutex > lock(state.mutex);
         return state.enabled;
+    }
+
+    UnknownMemo SaveUnknownMemo() {
+        UnknownMemo memo;
+        memo.outcomes   = SharedOutcomeCache().Unknowns();
+        memo.background = SharedOutcomeCache().BackgroundUnknowns();
+        for (auto &[key, result] : verify_detail::Cache().Unknowns()) {
+            memo.verify.push_back({ std::move(key), result.timed_out });
+        }
+        // Sorted, so that two equal memos are equal however the tables are laid out.
+        std::sort(memo.outcomes.begin(), memo.outcomes.end());
+        std::sort(memo.background.begin(), memo.background.end());
+        std::sort(memo.verify.begin(), memo.verify.end());
+        return memo;
+    }
+
+    void RestoreUnknownMemo(const UnknownMemo &memo) {
+        SharedOutcomeCache().RestoreUnknowns(memo.outcomes, memo.background);
+        for (const auto &[key, timed_out] : memo.verify) {
+            Z3VerifyResult result;
+            result.unknown   = true;
+            result.timed_out = timed_out;
+            verify_detail::Cache().Insert(key, result);
+        }
     }
 
     CobraStatistics Statistics() {

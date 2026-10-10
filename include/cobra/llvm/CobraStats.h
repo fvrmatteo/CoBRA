@@ -1,5 +1,8 @@
 #pragma once
 
+#include <utility>
+#include <vector>
+#include <string>
 #include <cstdint>
 
 namespace llvm {
@@ -258,6 +261,28 @@ namespace cobra {
 
     CobraStatistics Statistics();
     void ResetStatistics();
+
+    // What the pass remembers of the questions its solver ran out of budget on: a
+    // candidate whose proof timed out is not proved again under a budget as small, and a
+    // verification answered "unknown" is answered from the cache. A host that saves an
+    // analysis and resumes it later carries this over, so that the resumed run skips what
+    // the first one skipped. Everything else the caches hold is a memo: asked again, a
+    // question gets the answer it got before.
+    struct UnknownMemo
+    {
+        // A candidate's key and the largest budget scale it ran out under.
+        std::vector< std::pair< std::string, uint32_t > > outcomes;
+        // Keys a worker ran out of budget on.
+        std::vector< std::string > background;
+        // Verification queries answered "unknown", and whether the time limit was why.
+        std::vector< std::pair< std::string, bool > > verify;
+    };
+
+    // Sorted.
+    UnknownMemo SaveUnknownMemo();
+    // Replaces the candidates' memo with `memo`'s and adds its verification unknowns to
+    // the verification cache: for a process that has not run the pass yet.
+    void RestoreUnknownMemo(const UnknownMemo &memo);
 
     // The report, as a table. Prints nothing when the pass never ran.
     void PrintStatistics(llvm::raw_ostream &out);

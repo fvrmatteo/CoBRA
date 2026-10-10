@@ -113,6 +113,20 @@ namespace cobra::verify_detail {
             return kEntry->second;
         }
 
+        // The questions answered "unknown", for a host that saves its analysis and
+        // resumes it: asked again, an unknown is the one answer that can come out
+        // differently, so a resumed run has to remember the same ones.
+        std::vector< std::pair< std::string, Z3VerifyResult > > Unknowns() const {
+            const std::lock_guard< std::mutex > lock(mutex_);
+            std::vector< std::pair< std::string, Z3VerifyResult > > unknowns;
+            for (const auto &[key, result] : entries_) {
+                if (result.unknown) {
+                    unknowns.emplace_back(key, result);
+                }
+            }
+            return unknowns;
+        }
+
         Z3VerifyResult Insert(std::string key, const Z3VerifyResult &result) {
             const std::lock_guard< std::mutex > lock(mutex_);
             // Bounded because a run keeps producing new expressions; dropping
