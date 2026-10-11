@@ -585,6 +585,11 @@ namespace cobra {
             into.shared_nanoseconds += run.shared_nanoseconds;
             into.recut_nanoseconds += run.recut_nanoseconds;
             into.inner_nanoseconds += run.inner_nanoseconds;
+            into.slice_nanoseconds += run.slice_nanoseconds;
+            into.slice_asked += run.slice_asked;
+            into.slice_proved += run.slice_proved;
+            into.slice_refuted += run.slice_refuted;
+            into.slice_unknown += run.slice_unknown;
             into.background_submitted += run.background_submitted;
             into.background_solved += run.background_solved;
             into.background_unknown += run.background_unknown;
@@ -1649,7 +1654,10 @@ namespace cobra {
         // `COBRA_OLD=<a,b,...>` puts individual behaviours back as they were,
         // for measuring what each one changes on a workload: `flags`
         // (readers keep their flags), `fingerprint` (budget rejections and
-        // every rewrite's output recorded), `dce` (whole-function sweep).
+        // every rewrite's output recorded), `dce` (whole-function sweep),
+        // `slice` (no root is re-read at an extension's width; with
+        // `COBRA_SEXT=leaf` beside it, the two halves of the cross-width
+        // change).
         bool Old(std::string_view behaviour) {
             static const std::string chosen = [] {
                 const char *value = std::getenv("COBRA_OLD");
@@ -1913,6 +1921,163 @@ namespace cobra {
                 .real_var_positions = proposal.real_var_positions,
                 .accepted_unknown   = accepted_unknown,
                 .verified           = true });
+        }
+
+        // How many widths a root is asked about before the ladder moves on. The
+        // widths are the ones its own extensions name and they are tried
+        // narrowest first, so the first two are the ones a cross-width identity
+        // is written at; each one costs a proof.
+        constexpr unsigned kMaxSliceAttempts = 2;
+
+        // The width at which `cand`'s root can be read as a narrower problem,
+        // with how the root is recovered from those bits - or nothing, when it
+        // cannot.
+        //
+        // An obfuscator that writes a sign extension as `zext(x ^ m) ^ sext(m)`
+        // leaves an expression no single-width reading can fold: the two halves
+        // live at different widths, so neither LLVM's folds nor the semilinear
+        // synthesis ever presents them a common root, and the 64-bit tree
+        // stands as written. The same tree read at 32 bits is `(m ^ x) ^ m`,
+        // which cancels to `x` at once, and the 64-bit value is the sign
+        // extension of that.
+        //
+        // So the question is whether the root is an extension of its own low
+        // bits, and it is **proved**, not assumed: the claim is written as an
+        // identity over the tree's own expression -
+        //
+        //     zero: E == E & low         sign: E == ((E & low) ^ H) - H
+        //
+        // with `H` the top bit of the slice - and handed to the same proof
+        // machinery a rewrite is. LLVM's value tracking cannot answer it here,
+        // and that is the whole difficulty: it reads the two sides of the `xor`
+        // independently, and `zext i32` alone leaves 32 sign bits where the
+        // claim needs 33. The relation between the two sides is what makes the
+        // root a sign extension, and only something that reasons over the whole
+        // expression can see it.
+        //
+        // Probes come first and nearly always settle it: a root that is not an
+        // extension of its low bits says so on one of the first inputs, and
+        // then nothing is asked of the solver at all.
+        std::optional< std::pair< uint32_t, SliceExtension > > SliceToRead(
+            const MBACandidate &cand, const CobraPassOptions &options, CobraStatistics &stats
+        ) {
+            // Without an expression there is nothing to prove the claim over,
+            // and without a solver nothing to prove it with: the probes are
+            // evidence, not a proof, and a slice rewritten on them alone would
+            // be a guess about every bit above the slice.
+            if (cand.expr == nullptr || !options.z3_verify) {
+                return std::nullopt;
+            }
+            const auto widths = SliceWidthsOf(cand);
+            if (widths.empty()) {
+                return std::nullopt;
+            }
+
+            const uint32_t bw   = cand.bitwidth;
+            const uint64_t mask = Bitmask(bw);
+            const auto variables = static_cast< uint32_t >(cand.var_names.size());
+
+            // Both readings of every candidate width, narrowest and zero
+            // extension first: the narrowest slice is the smallest problem, and
+            // a zero extension is the cheaper cast of the two.
+            llvm::SmallVector< std::pair< uint32_t, SliceExtension >, 8 > hypotheses;
+            for (const uint32_t width : widths) {
+                hypotheses.push_back({ width, SliceExtension::kZero });
+                hypotheses.push_back({ width, SliceExtension::kSign });
+            }
+
+            // The shape itself, on one value: what the claim says about the
+            // bits above the slice.
+            const auto holds = [&](uint64_t value, uint32_t width, SliceExtension extension) {
+                const uint64_t low = Bitmask(width);
+                if (extension == SliceExtension::kZero) {
+                    return (value & ~low & mask) == 0;
+                }
+                const uint64_t sign = uint64_t{ 1 } << (width - 1);
+                return value == ((((value & low) ^ sign) - sign) & mask);
+            };
+
+            // Random and boundary inputs, as the ring check uses: a sign
+            // extension is decided by the top bit of the slice, so the values
+            // that have it set and clear are the ones that decide.
+            uint64_t state  = 0x9E3779B97F4A7C15ULL ^ cand.fingerprint.structure;
+            const auto next = [&] {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                return state;
+            };
+            static const uint64_t kBoundary[] = { 0,
+                                                  1,
+                                                  ~uint64_t{ 0 },
+                                                  uint64_t{ 1 } << 63,
+                                                  (uint64_t{ 1 } << 63) - 1,
+                                                  uint64_t{ 1 } << 31,
+                                                  (uint64_t{ 1 } << 31) - 1,
+                                                  uint64_t{ 1 } << 15 };
+            std::vector< uint64_t > values(variables);
+            constexpr unsigned kProbeRounds = 64;
+            for (unsigned round = 0; round < kProbeRounds && !hypotheses.empty(); ++round) {
+                for (auto &value : values) {
+                    value = (round < 16 ? kBoundary[next() % 8] : next()) & mask;
+                }
+                const uint64_t value = EvalExpr(*cand.expr, values, bw);
+                llvm::erase_if(hypotheses, [&](const std::pair< uint32_t, SliceExtension > &one) {
+                    return !holds(value, one.first, one.second);
+                });
+            }
+
+            unsigned attempts = 0;
+            for (const auto &[width, extension] : hypotheses) {
+                if (attempts++ >= kMaxSliceAttempts) {
+                    break;
+                }
+                const uint64_t low  = Bitmask(width);
+                const uint64_t sign = uint64_t{ 1 } << (width - 1);
+                auto sliced = Expr::BitwiseAnd(CloneExpr(*cand.expr), Expr::Constant(low));
+                auto claimed = extension == SliceExtension::kZero
+                    ? std::move(sliced)
+                    : Expr::Add(
+                          Expr::BitwiseXor(std::move(sliced), Expr::Constant(sign)),
+                          Expr::Constant((~sign + 1) & mask)
+                      );
+                ++stats.slice_asked;
+
+                // By running the inputs where there are few enough of them,
+                // exactly as a rewrite is checked: that is a proof and a
+                // refutation both, and it costs less than the solver's
+                // start-up.
+                if (const auto decided = DecideByEnumeration(*cand.expr, *claimed, variables, bw)) {
+                    ++(*decided ? stats.slice_proved : stats.slice_refuted);
+                    if (*decided) {
+                        return std::make_pair(width, extension);
+                    }
+                    continue;
+                }
+#ifdef COBRA_HAS_Z3
+                auto settings = options.z3_settings;
+                settings.timeout_ms *= ProofBudgetScale(cand);
+                const auto result = VerifyExprsWithStrategy(
+                    *cand.expr, *claimed, cand.var_names, bw, settings
+                );
+                // A claim about the root is not a rewrite of it, so an unknown
+                // answer is never taken for a yes here, whatever the host's
+                // mode says: the bits above the slice are not probed by the
+                // signature, so there is nothing behind the bet, and a slice
+                // taken on silence would replace the root by a different value.
+                // Nor is it recorded as a refusal - the solver ran out of time,
+                // it did not answer.
+                if (result.unknown) {
+                    ++stats.slice_unknown;
+                    continue;
+                }
+                ++(result.equivalent ? stats.slice_proved : stats.slice_refuted);
+                if (result.equivalent) {
+                    return std::make_pair(width, extension);
+                }
+#endif
+            }
+            return std::nullopt;
         }
 
         // `COBRA_REUSE=0`: build every rewrite from its leaves, as the pass used
@@ -2585,7 +2750,22 @@ namespace cobra {
             // reallocate `candidates`, and `cand` is a reference into it.
             const auto requeue_retries = [&] {
                 const auto retry_begin = std::chrono::steady_clock::now();
-                // The boundary cut first: it is the one reading of the root
+                // The slice first. Every other rung re-reads the root at its
+                // own width, so none of them can reach an identity the
+                // obfuscator wrote across an extension; and the slice is decided
+                // by a proof about the root rather than by a search for a
+                // rewrite, so a root that is not an extension of its low bits
+                // costs probes and nothing else.
+                const auto slice_begin = std::chrono::steady_clock::now();
+                std::vector< MBACandidate > slices;
+                if (const auto read = Old("slice") ? std::nullopt : SliceToRead(cand, options_, stats)) {
+                    slices = SliceMbaCandidate(
+                        cand, read->first, read->second, options_.min_ast_size, options_.max_vars,
+                        options_tag, options_.cost_model, options_.max_tree_nodes, demanded
+                    );
+                }
+                stats.slice_nanoseconds += since(slice_begin);
+                // The boundary cut: it is the one reading of the root
                 // the ladder below cannot reach, and it costs a single solve.
                 auto boundary = BoundaryCutMbaCandidate(
                     cand, options_.min_ast_size, options_.max_vars, options_tag,
@@ -2628,6 +2808,14 @@ namespace cobra {
                     options_.cost_model, options_.max_tree_nodes, demanded
                 );
                 stats.inner_nanoseconds += since(inner_begin);
+                for (auto &cut : slices) {
+                    if (attempted.insert({ cut.root, cut.node_limit }).second) {
+                        queue_key(cut);
+                        candidates.push_back(std::move(cut));
+                        origins.push_back(CandidateOrigin::kSlice);
+                        ++stats.requeued;
+                    }
+                }
                 for (auto &cut : boundary) {
                     if (attempted.insert({ cut.root, cut.node_limit }).second) {
                         queue_key(cut);
@@ -2982,6 +3170,21 @@ namespace cobra {
                 *outcome->expr, cand, builder, var_map, freeze_leaves ? &leaf_supply : nullptr,
                 ReuseInstructions() ? &reuse : nullptr
             );
+
+            // A slice was searched and proved on the low bits of its root, so
+            // what replaces the root is the extension the claim named
+            // (`SliceToRead`): the rewrite of the bits read, widened back to
+            // the root's type. Built here, before the emitted instructions are
+            // gathered, so the cast is priced with the rest of the rewrite -
+            // and it is the one instruction the whole reading costs, against a
+            // tree the other width could not fold at all.
+            if (new_val != nullptr && cand.slice_extension != SliceExtension::kNone) {
+                new_val = builder.CreateCast(
+                    cand.slice_extension == SliceExtension::kZero ? llvm::Instruction::ZExt
+                                                                  : llvm::Instruction::SExt,
+                    new_val, cand.root->getType(), "cobra.slice"
+                );
+            }
 
             llvm::SmallVector< llvm::Instruction *, 16 > emitted;
             for (auto it = kAtFront ? block->begin() : std::next(kMark); &*it != cand.root;
@@ -3355,6 +3558,7 @@ namespace cobra {
             case CandidateOrigin::kSharedCut:   return "re-read over its shared values";
             case CandidateOrigin::kRecut:       return "the same root, cut shorter";
             case CandidateOrigin::kInnerRoot:   return "a root the tree buried";
+            case CandidateOrigin::kSlice:       return "re-read at an extension's width";
             case CandidateOrigin::kCount:       break;
         }
         return "?";
@@ -3573,6 +3777,12 @@ namespace cobra {
         cost("  ladder: shared-value cuts", stats.shared_nanoseconds);
         cost("  ladder: re-cuts", stats.recut_nanoseconds);
         cost("  ladder: inner roots", stats.inner_nanoseconds);
+        cost("  ladder: slices", stats.slice_nanoseconds);
+        if (stats.slice_asked != 0) {
+            out << "    slices asked " << stats.slice_asked << ", proved " << stats.slice_proved
+                << ", refuted " << stats.slice_refuted << ", unknown " << stats.slice_unknown
+                << "\n";
+        }
 
         table("by where the candidate came from", "origin", stats.by_origin,
               static_cast< unsigned >(CandidateOrigin::kCount), [](unsigned index) {

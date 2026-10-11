@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
@@ -71,6 +72,21 @@ namespace cobra {
         uint64_t one  = 0;
         bool Informative() const { return zero != 0 || one != 0; }
         bool operator==(const LeafBits &other) const = default;
+    };
+
+    // How a root is recovered from the low bits of it a candidate reads, when
+    // the candidate reads fewer bits than the root's type holds (see
+    // `SliceMbaCandidate`).
+    enum class SliceExtension : uint8_t {
+        // The candidate reads the root at its own width, which is every
+        // candidate but a slice.
+        kNone,
+        // The root is the zero extension of the bits read: every bit above
+        // them is zero.
+        kZero,
+        // The root is their sign extension: every bit above them is a copy of
+        // the topmost bit read.
+        kSign,
     };
 
     struct MBACandidate
@@ -146,6 +162,12 @@ namespace cobra {
         // it takes: a leaf under the other one may be poison while the root is
         // not. The rewrite owes those leaves a freeze just as for `spans_freeze`.
         bool spans_select = false;
+
+        // For a slice: how the root is recovered from the `bitwidth` bits this
+        // candidate reads of it, proved before the candidate was built. A
+        // rewrite replaces the root with that extension of what the narrow bits
+        // were rewritten into, so the replacement has the root's own type.
+        SliceExtension slice_extension = SliceExtension::kNone;
     };
 
     // The `node_limit` a boundary cut carries: past any re-cut ladder, so the
@@ -161,6 +183,20 @@ namespace cobra {
 
     constexpr bool IsSharedCutLimit(uint32_t node_limit) {
         return node_limit <= kSharedCutLimit && node_limit > kSharedCutLimit - kSharedCutRungs;
+    }
+
+    // The `node_limit` a slice carries: its width below the shared-cut rungs,
+    // so that a slice is told apart from the root read whole and from every
+    // other cut of it - `attempted` is keyed on the pair - and so that the
+    // driver treats it as the partial view of the root it is, and records no
+    // verdict for the whole tree from it.
+    constexpr uint32_t kSliceCutLimit = kSharedCutLimit - kSharedCutRungs;
+    constexpr uint32_t kMaxSliceWidth = 64;
+
+    constexpr uint32_t SliceNodeLimit(uint32_t width) { return kSliceCutLimit - width; }
+
+    constexpr bool IsSliceCutLimit(uint32_t node_limit) {
+        return node_limit < kSliceCutLimit && node_limit >= kSliceCutLimit - kMaxSliceWidth;
     }
 
     // Find MBA candidates across a function.  Blocks are scanned in
@@ -296,6 +332,52 @@ namespace cobra {
         uint32_t max_shared_cuts, uint64_t options_tag,
         MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
         uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
+    );
+
+    // The widths at which the tree of `cand` could be read as a slice of its
+    // root: the source widths of the extensions it holds, narrowest first.
+    //
+    // An extension is where an obfuscator's expression crosses widths, and a
+    // crossing is what neither LLVM's folds nor the semilinear synthesis can
+    // see through: both work inside one width, so the two sides of
+    // `zext(x ^ m) ^ sext(m)` - which is `sext x` whenever `m` is `x`'s sign
+    // mask - never present a common root at 64 bits, and the expression stands.
+    // Read at 32 bits the same tree is `(m ^ x) ^ m`, which is `x` by
+    // cancellation, and the 64-bit value is the sign extension of that.
+    //
+    // So the widths worth re-reading a root at are the ones its own extensions
+    // name. Nothing here claims the root *is* an extension of its low bits;
+    // that is a separate question, answered by a proof before a slice is built
+    // (`SliceMbaCandidate`).
+    llvm::SmallVector< uint32_t, 4 > SliceWidthsOf(const MBACandidate &cand);
+
+    // The same root as `cand`, collected at `width` bits instead of the width
+    // of its type, for a root the caller has *proved* to be the `extension` of
+    // its low `width` bits.
+    //
+    // Reading a wide value at a narrower width is something the collection
+    // already does wherever a reader looks at nothing else - a truncation, or
+    // another node admitted the same way - because the low bits of a ring
+    // operation are a function of its operands' low bits
+    // (`WideNodeFitsTreeWidth`). What is new here is reading the *root* that
+    // way: the bits above the slice are not dropped but recovered, by the
+    // extension the caller proved, so the rewrite is the narrow answer extended
+    // and the root's readers see the value they saw before.
+    //
+    // The two halves are proved separately and compose: the caller's proof says
+    // the root is the extension of its low `width` bits, and the candidate's own
+    // verification - which runs at `width`, like any other candidate's - says
+    // the rewrite is those bits.
+    //
+    // Returns nothing for a candidate that is itself a cut, for a `ptradd`
+    // root, for a width that is not narrower than the root, and when the root
+    // has no reading at that width (the collection would make the root itself a
+    // leaf, and the candidate would be the identity).
+    std::vector< MBACandidate > SliceMbaCandidate(
+        const MBACandidate &cand, uint32_t width, SliceExtension extension,
+        uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,
+        const DemandedMaskFn &demanded = {}
     );
 
     // Record `fp` on `inst` so a later run can skip the tree rooted there.

@@ -50,6 +50,7 @@ namespace cobra {
         kSharedCut,   // the same root, read with the values it reads more than once kept whole
         kRecut,       // the same root, collected to a shorter tree
         kInnerRoot,   // a root the rejected tree buried
+        kSlice,       // the same root, read at the width of an extension it holds
         kCount
     };
 
@@ -221,6 +222,15 @@ namespace cobra {
         uint64_t shared_nanoseconds   = 0;
         uint64_t recut_nanoseconds    = 0;
         uint64_t inner_nanoseconds    = 0;
+        // The slice rung: what deciding whether a root is the extension of its
+        // low bits cost, proofs included, and how often the question was asked,
+        // proved and refuted. A root whose tree holds no extension from a
+        // narrower width is not asked at all.
+        uint64_t slice_nanoseconds    = 0;
+        uint64_t slice_asked          = 0;
+        uint64_t slice_proved         = 0;
+        uint64_t slice_refuted        = 0;
+        uint64_t slice_unknown        = 0;
 
         CandidateClass by_consumer[static_cast< unsigned >(CandidateConsumer::kCount)];
         CandidateClass by_origin[static_cast< unsigned >(CandidateOrigin::kCount)];

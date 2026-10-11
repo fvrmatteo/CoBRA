@@ -533,6 +533,40 @@ namespace cobra {
             return true;
         }
 
+        // The bit a sign extension copies, as a mask over the tree width, or
+        // zero when the extension is not modelled as the ring expression
+        // `(v ^ 2^(n-1)) - 2^(n-1)` - because it is not a sign extension, or
+        // because the node is wider than the tree and so reads through (see
+        // `FitsTreeWidth` and `WideNodeFitsTreeWidth`).
+        //
+        // One answer for the three readings of a tree - the collection's width
+        // check, the probe plan and the Expr - so none of them can model the
+        // extension differently from the others.
+        uint64_t SignBitOfExtensionSource(const llvm::Instruction *inst, uint32_t bw) {
+            // `COBRA_SEXT=leaf` restores the reading this replaced - a sign
+            // extension from anything wider than an `i1` is a leaf - so that
+            // what modelling it is worth is a measurement on a workload rather
+            // than a rebuild. The three readings all go through here, so the
+            // switch cannot leave them disagreeing.
+            static const bool leaf = [] {
+                const char *mode = std::getenv("COBRA_SEXT");
+                return mode != nullptr && std::string_view(mode) == "leaf";
+            }();
+            if (inst->getOpcode() != llvm::Instruction::SExt || !inst->getType()->isIntegerTy()
+                || inst->getType()->getIntegerBitWidth() > bw)
+            {
+                return 0;
+            }
+            if (leaf && !inst->getOperand(0)->getType()->isIntegerTy(1)) {
+                return 0;
+            }
+            const auto *source = inst->getOperand(0)->getType();
+            if (!source->isIntegerTy() || source->getIntegerBitWidth() >= bw) {
+                return 0;
+            }
+            return uint64_t{ 1 } << (source->getIntegerBitWidth() - 1);
+        }
+
         // Whether a node wider than the tree has an exact reading at the tree's
         // width `bw`, which is its low `bw` bits.
         //
@@ -656,14 +690,30 @@ namespace cobra {
             }
 
             // A zero extension is the identity on a value held zero-extended.
-            // A sign extension is only modelled from an i1, whose 0/1 the
-            // model reproduces exactly and whose extension is a negation; from
-            // anything wider it stays a leaf.
+            //
+            // A sign extension is the same value with the source's top bit
+            // copied into every bit above it, which on a value held
+            // zero-extended is `(v ^ 2^(n-1)) - 2^(n-1)` for a source of `n`
+            // bits: flipping the sign bit adds or subtracts `2^(n-1)`, and
+            // subtracting it back leaves `v` where the bit was clear and `v`
+            // with every higher bit set where it was set. That is a ring
+            // expression in the operators the model already has, exact at any
+            // width, so a sign extension is as transparent as a zero
+            // extension. It used to be modelled from an `i1` only - the same
+            // formula with `n = 1`, where it reads as a negation - and from
+            // anything wider the extension was a leaf, which cut the value it
+            // widens off from every other reading of that value: the obfuscator
+            // writes `zext(x ^ m) ^ sext(m)` for `sext x`, and with the `sext`
+            // a leaf the two halves of that identity never meet.
             if (inst->getOpcode() == llvm::Instruction::ZExt) {
                 return inst->getOperand(0)->getType()->isIntegerTy();
             }
             if (inst->getOpcode() == llvm::Instruction::SExt) {
-                return inst->getOperand(0)->getType()->isIntegerTy(1);
+                // Asked of the same helper the two readings below use, so a
+                // sign extension the model has no expression for stays a leaf
+                // rather than being collected and then read as a zero
+                // extension.
+                return SignBitOfExtensionSource(inst, bw) != 0;
             }
 
             // A truncation is a mask. The value it narrows may be wider than
@@ -1212,12 +1262,19 @@ namespace cobra {
                     || inst->getOpcode() == llvm::Instruction::SExt)
                 {
                     const uint32_t child = lower(inst->getOperand(0));
-                    // Sign-extending an i1 gives 0 or all-ones. Masking would
-                    // leave 0/1, disagreeing with the Expr the verifier builds.
+                    // A sign extension of a value held zero-extended is
+                    // `(v ^ 2^(n-1)) - 2^(n-1)` (see `FitsTreeWidth`). Masking
+                    // the child instead would leave the source's own bits and
+                    // model a zero extension, disagreeing with the Expr the
+                    // verifier builds. A node wider than the tree is a
+                    // different question: it is only admitted when the source
+                    // is at least as wide as the tree, and then the tree's bits
+                    // are the source's own, so it passes through.
                     if (inst->getOpcode() == llvm::Instruction::SExt
-                        && inst->getOperand(0)->getType()->isIntegerTy(1))
+                        && SignBitOfExtensionSource(inst, bits_) != 0)
                     {
-                        return MaskToWidth(v, Emit(Op::kSub, kZeroSlot, child));
+                        const uint32_t sign = ConstSlot(SignBitOfExtensionSource(inst, bits_));
+                        return MaskToWidth(v, Emit(Op::kSub, Emit(Op::kXor, child, sign), sign));
                     }
                     return Emit(Op::kMask, child, 0);
                 }
@@ -1647,13 +1704,18 @@ namespace cobra {
                 if (child == nullptr) {
                     return nullptr;
                 }
-                // Sign-extending an i1 gives 0 or all-ones, which is exactly
-                // the negation of the 0/1 value. Passing it through unchanged
-                // would leave 0/1 and model a different function than the IR.
-                if (inst->getOpcode() == llvm::Instruction::SExt
-                    && inst->getOperand(0)->getType()->isIntegerTy(1))
+                // A sign extension is `(v ^ 2^(n-1)) - 2^(n-1)` on the
+                // zero-extended value (see `FitsTreeWidth`); passing it
+                // through unchanged would model a zero extension instead. A
+                // node wider than the tree passes through, because it is only
+                // admitted when its source covers the tree's bits.
+                if (const uint64_t sign = SignBitOfExtensionSource(inst, tree_width);
+                    inst->getOpcode() == llvm::Instruction::SExt && sign != 0)
                 {
-                    return mask_to_width(Expr::Negate(std::move(child)));
+                    auto flipped = Expr::BitwiseXor(std::move(child), Expr::Constant(sign));
+                    return mask_to_width(
+                        Expr::Add(std::move(flipped), Expr::Constant((~sign + 1) & mask))
+                    );
                 }
                 return child;
             }
@@ -2192,12 +2254,22 @@ namespace cobra {
             uint32_t node_limit = kSharedCutLimit;
         };
 
+        // What a slice candidate is collected for: the width to read the root
+        // at, and how the root is recovered from those bits (see
+        // `SliceMbaCandidate`).
+        struct Slice
+        {
+            uint32_t width            = 0;
+            SliceExtension extension = SliceExtension::kNone;
+        };
+
         void BuildCandidates(
             llvm::ArrayRef< llvm::Instruction * > roots, uint32_t min_ast_size,
             uint32_t max_vars, MbaCostModel cost_model, uint64_t options_tag,
             std::vector< MBACandidate > &candidates, uint32_t max_nodes = 0,
             bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
-            const DemandedMaskFn &demanded = {}, const SharedCut *shared_cut = nullptr
+            const DemandedMaskFn &demanded = {}, const SharedCut *shared_cut = nullptr,
+            const Slice *slice = nullptr
         ) {
             const auto *opaque = shared_cut != nullptr ? &shared_cut->opaque : nullptr;
             llvm::DenseSet< llvm::Instruction * > already_in_tree;
@@ -2214,8 +2286,12 @@ namespace cobra {
                     DeclinedRoot(inst, "not an integer", 0, 0);
                     continue;
                 }
-                const uint32_t bw = ptradd ? 64u : inst.getType()->getIntegerBitWidth();
-                if (bw > 64) {
+                // A slice reads the root at the width the caller proved it to
+                // be an extension of, not at the width of its type.
+                const uint32_t bw = slice != nullptr ? slice->width
+                    : ptradd                         ? 64u
+                                                     : inst.getType()->getIntegerBitWidth();
+                if (bw > 64 || bw == 0) {
                     continue;
                 }
                 // A `ptradd`'s readers are pointers: every bit of the index is
@@ -2357,7 +2433,8 @@ namespace cobra {
                     return choice == nullptr || std::string_view(choice) != "off";
                 }();
                 if (skip_unchanged && max_nodes == 0 && !cut_arith_under_bitwise
-                    && shared_cut == nullptr && FingerprintUnchanged(inst, fingerprint, options_tag))
+                    && shared_cut == nullptr && slice == nullptr
+                    && FingerprintUnchanged(inst, fingerprint, options_tag))
                 {
                     ++NumFingerprintSkips;
                     if (OldClaim()) {
@@ -2482,9 +2559,11 @@ namespace cobra {
                                   .tree        = { tree_insts.begin(), tree_insts.end() },
                                   .dying       = { dying.begin(), dying.end() },
                                   .poison_reaches_root = poison_reaches_root,
-                                  .node_limit = shared_cut != nullptr ? shared_cut->node_limit
-                                      : cut_arith_under_bitwise      ? kBoundaryCutLimit
-                                                                     : max_nodes,
+                                  .node_limit = slice != nullptr
+                                      ? SliceNodeLimit(slice->width)
+                                      : shared_cut != nullptr ? shared_cut->node_limit
+                                      : cut_arith_under_bitwise ? kBoundaryCutLimit
+                                                                : max_nodes,
                                   .tree_size    = static_cast< uint32_t >(tree_insts.size()),
                                   .boundary_cut  = cut_arith_under_bitwise,
                                   .demanded_mask = demanded_mask,
@@ -2494,7 +2573,9 @@ namespace cobra {
                                       [](const llvm::Instruction *ti) {
                                           return llvm::isa< llvm::SelectInst >(ti);
                                       }
-                                  ) }
+                                  ),
+                                  .slice_extension = slice != nullptr ? slice->extension
+                                                                     : SliceExtension::kNone }
                 );
             }
         }
@@ -2614,6 +2695,79 @@ namespace cobra {
             return candidates;
         }
 
+        return candidates;
+    }
+
+    llvm::SmallVector< uint32_t, 4 > SliceWidthsOf(const MBACandidate &cand) {
+        llvm::SmallVector< uint32_t, 4 > widths;
+        // Only a full collection: a cut is a partial view of the root, so the
+        // extensions it happens to hold say nothing about where the root's
+        // own expression crosses widths. A `ptradd` root is an address, whose
+        // every bit is live (`BuildCandidates`), so there is no narrower
+        // reading of it either.
+        if (cand.root == nullptr || cand.node_limit != 0 || ByteGepOf(cand.root) != nullptr
+            || !cand.root->getType()->isIntegerTy())
+        {
+            return widths;
+        }
+        const uint32_t bw = cand.root->getType()->getIntegerBitWidth();
+        if (bw > 64) {
+            return widths;
+        }
+        for (const auto *node : cand.tree) {
+            if (node->getOpcode() != llvm::Instruction::ZExt
+                && node->getOpcode() != llvm::Instruction::SExt)
+            {
+                continue;
+            }
+            const auto *source = node->getOperand(0)->getType();
+            if (!source->isIntegerTy()) {
+                continue;
+            }
+            const uint32_t width = source->getIntegerBitWidth();
+            // A slice has to be narrower than the root to say anything, and
+            // wide enough to be a problem over words rather than over bits.
+            if (width < 2 || width >= bw) {
+                continue;
+            }
+            if (!llvm::is_contained(widths, width)) {
+                widths.push_back(width);
+            }
+        }
+        // Narrowest first: the narrowest slice is the strongest claim about the
+        // root and the smallest problem to hand the solver, and a root that is
+        // the extension of its low 8 bits is also the extension of its low 32,
+        // so the answer found at 8 covers the one at 32.
+        llvm::sort(widths);
+        return widths;
+    }
+
+    std::vector< MBACandidate > SliceMbaCandidate(
+        const MBACandidate &cand, uint32_t width, SliceExtension extension,
+        uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
+        MbaCostModel cost_model, uint32_t max_tree_nodes, const DemandedMaskFn &demanded
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr || cand.node_limit != 0 || ByteGepOf(cand.root) != nullptr
+            || !cand.root->getType()->isIntegerTy() || extension == SliceExtension::kNone
+            || width < 2 || width > kMaxSliceWidth
+            || width >= cand.root->getType()->getIntegerBitWidth())
+        {
+            return candidates;
+        }
+        const Slice cut{ .width = width, .extension = extension };
+        BuildCandidates(
+            { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0,
+            /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded,
+            /*shared_cut=*/nullptr, &cut
+        );
+        // The root has no reading at this width: the collection kept it as a
+        // leaf, so the candidate is the root read back as itself.
+        if (!candidates.empty()
+            && !llvm::is_contained(candidates.front().tree, candidates.front().root))
+        {
+            candidates.clear();
+        }
         return candidates;
     }
 
