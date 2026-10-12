@@ -2739,12 +2739,21 @@ namespace cobra {
             // cost 98.5 s and emitted 2814 instructions; skipping every tree
             // that holds one cost 45.5 s and emitted 2756 - the trees built on
             // a replaced root were mostly the ones the solver ran out of time on.
+            //
+            // The summands a sum-group candidate adds back (`sum_residual`) are
+            // read the same way, as they were when the candidate was queued, so
+            // a replaced one is the same stale reading: added back, it would give
+            // a replaced root a reader again - one the deletion of the run's
+            // leftovers below does not expect, and would delete from under it.
             if (!replaced_roots.empty()
                 && (llvm::any_of(cand.tree, [&](const llvm::Instruction *node) {
                         return replaced_roots.contains(node);
                     })
                     || llvm::any_of(cand.leaf_values, [&](const llvm::Value *leaf) {
                            return replaced_roots.contains(leaf);
+                       })
+                    || llvm::any_of(cand.sum_residual, [&](const auto &summand) {
+                           return replaced_roots.contains(summand.first);
                        })))
             {
                 ++stats.stale_trees;
@@ -3629,9 +3638,21 @@ namespace cobra {
                 }
             }
         } else if (changed) {
+            // `RecursivelyDeleteTriviallyDeadInstructions` deletes what it is
+            // given, readers or not - only an assertion checks - so a replaced
+            // root something reads again is not given to it. None should be: a
+            // candidate that would read one is stale (above). One that is all
+            // the same is a defect to find, and is said; deleting it would leave
+            // its reader reading a deleted value.
             llvm::SmallVector< llvm::WeakTrackingVH, 64 > dead;
             for (const llvm::Value *root : replaced_roots) {
-                dead.emplace_back(const_cast< llvm::Value * >(root));
+                if (root->use_empty()) {
+                    dead.emplace_back(const_cast< llvm::Value * >(root));
+                    continue;
+                }
+                llvm::errs() << "CoBRA: a replaced root is read again, and is left in place: ";
+                root->print(llvm::errs());
+                llvm::errs() << "\n";
             }
             llvm::RecursivelyDeleteTriviallyDeadInstructions(dead);
         }
