@@ -690,11 +690,27 @@ namespace cobra {
         // a carry picked by a comparison of the whole word and merged into a
         // half of it is the shape this is for. One wider than the tree is left
         // to `WideNodeFitsTreeWidth`, which does not take it.
-        bool FitsTreeWidth(const llvm::Instruction *inst, uint32_t bw) {
+        //
+        // `narrow_comparisons` (the boolean cut, see `BooleanCutMbaCandidate`)
+        // also takes an equality or unsigned comparison of narrower operands,
+        // in a `select` condition as well. Held zero-extended, two values are
+        // equal, and ordered without regard to sign, exactly as they are at
+        // their own width; only a signed predicate reads the bit that is not
+        // there, and it stays a leaf.
+        bool ComparesExactlyNarrow(const llvm::ICmpInst &cmp, uint32_t bw) {
+            const auto *ty = cmp.getOperand(0)->getType();
+            return ty->isIntegerTy() && ty->getIntegerBitWidth() <= bw
+                && (cmp.isEquality() || cmp.isUnsigned());
+        }
+
+        bool FitsTreeWidth(const llvm::Instruction *inst, uint32_t bw, bool narrow_comparisons = false) {
             if (ByteGepOf(inst) != nullptr) {
                 return bw == 64; // the index width, which is the pointer width
             }
             if (const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
+                if (narrow_comparisons && ComparesExactlyNarrow(*cmp, bw)) {
+                    return true;
+                }
                 return IsTreeWidthInt(cmp->getOperand(0), bw)
                     && IsSupportedPredicate(cmp->getPredicate());
             }
@@ -722,6 +738,9 @@ namespace cobra {
                     return true;
                 }
                 const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(cond);
+                if (cmp != nullptr && narrow_comparisons && ComparesExactlyNarrow(*cmp, bw)) {
+                    return true;
+                }
                 return cmp != nullptr && IsTreeWidthInt(cmp->getOperand(0), bw)
                     && IsSupportedPredicate(cmp->getPredicate());
             }
@@ -874,7 +893,8 @@ namespace cobra {
             bool try_phi_transparency = true, uint32_t max_nodes = 0,
             bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
             const llvm::DenseSet< const llvm::Value * > *opaque = nullptr,
-            const llvm::DenseMap< llvm::Value *, llvm::Value * > *reads_as = nullptr
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > *reads_as = nullptr,
+            bool narrow_comparisons = false
         ) {
             // A re-cut's budget and the cap on any collection are both
             // budgets on the same walk; the tighter one applies.
@@ -927,7 +947,8 @@ namespace cobra {
                     continue;
                 }
 
-                if ((inst != nullptr) && IsMbaInstruction(inst) && FitsTreeWidth(inst, bw)) {
+                if ((inst != nullptr) && IsMbaInstruction(inst)
+                    && FitsTreeWidth(inst, bw, narrow_comparisons)) {
                     // LShr with variable shift amount is unsupported —
                     // treat the whole instruction as a leaf.
                     if (inst->getOpcode() == llvm::Instruction::LShr
@@ -1012,7 +1033,7 @@ namespace cobra {
                         }
                         auto *inc_inst = llvm::dyn_cast< llvm::Instruction >(inc);
                         if ((inc_inst == nullptr) || !IsMbaOpcode(inc_inst->getOpcode())
-                            || !FitsTreeWidth(inc_inst, bw))
+                            || !FitsTreeWidth(inc_inst, bw, narrow_comparisons))
                         {
                             all_mba = false;
                             break;
@@ -2588,7 +2609,8 @@ namespace cobra {
             std::vector< MBACandidate > &candidates, uint32_t max_nodes = 0,
             bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
             const DemandedMaskFn &demanded = {}, const SharedCut *shared_cut = nullptr,
-            const Slice *slice = nullptr, const SumGroup *sum_group = nullptr
+            const Slice *slice = nullptr, const SumGroup *sum_group = nullptr,
+            bool boolean_cut = false
         ) {
             const auto *opaque = shared_cut != nullptr ? &shared_cut->opaque : nullptr;
             // The summands this group leaves out, read as zero wherever the
@@ -2636,7 +2658,7 @@ namespace cobra {
                 CollectTree(
                     &inst, bw, tree_insts, leaves, phi_redirects,
                     /*try_phi_transparency=*/true, max_nodes, cut_arith_under_bitwise,
-                    max_tree_nodes, opaque, reads_as
+                    max_tree_nodes, opaque, reads_as, /*narrow_comparisons=*/boolean_cut
                 );
 
                 // The sweep below is 2^leaves, so every leaf doubles the price
@@ -2679,7 +2701,7 @@ namespace cobra {
                     CollectTree(
                         &inst, bw, tree_insts, leaves, phi_redirects,
                         /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
-                        max_tree_nodes, opaque, reads_as
+                        max_tree_nodes, opaque, reads_as, /*narrow_comparisons=*/boolean_cut
                     );
                     if (leaves.size() > std::min(max_vars, kPreElimCap)) {
                         continue;
@@ -2770,7 +2792,7 @@ namespace cobra {
                     const char *choice = std::getenv("COBRA_FINGERPRINT");
                     return choice == nullptr || std::string_view(choice) != "off";
                 }();
-                if (skip_unchanged && max_nodes == 0 && !cut_arith_under_bitwise
+                if (skip_unchanged && max_nodes == 0 && !cut_arith_under_bitwise && !boolean_cut
                     && shared_cut == nullptr && slice == nullptr && sum_group == nullptr
                     && FingerprintUnchanged(inst, fingerprint, options_tag))
                 {
@@ -2907,6 +2929,7 @@ namespace cobra {
                                       : slice != nullptr ? SliceNodeLimit(slice->width)
                                       : shared_cut != nullptr ? shared_cut->node_limit
                                       : cut_arith_under_bitwise ? kBoundaryCutLimit
+                                      : boolean_cut             ? kBooleanCutLimit
                                                                 : max_nodes,
                                   .tree_size    = static_cast< uint32_t >(tree_insts.size()),
                                   .boundary_cut  = cut_arith_under_bitwise,
@@ -3207,6 +3230,23 @@ namespace cobra {
         if (!candidates.empty() && candidates.front().tree_size >= cand.tree_size) {
             candidates.clear();
         }
+        return candidates;
+    }
+
+    std::vector< MBACandidate > BooleanCutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model, uint32_t max_tree_nodes,
+        const DemandedMaskFn &demanded
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr || cand.node_limit != 0) {
+            return candidates;
+        }
+        BuildCandidates(
+            { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0,
+            /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded, nullptr, nullptr, nullptr,
+            /*boolean_cut=*/true
+        );
         return candidates;
     }
 

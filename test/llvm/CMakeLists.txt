@@ -18,7 +18,11 @@ message(STATUS "LLVM pass tests: opt=${OPT_BIN} FileCheck=${FILECHECK_BIN}")
 # solver backend. One named `test_*_verified_sweep.ll` also wants the word-level
 # sweep, which is what makes the proofs of a tree equal to one of its own inputs
 # affordable. One named `test_*_dying_cost.ll` is about what a rewrite removes,
-# and runs with `cobra-simplify<dying-cost>`.
+# and runs with `cobra-simplify<dying-cost>`. One named
+# `test_*_verified_boolean.ll` reads a tree's conditions as variables, with every
+# rewrite proved by the solver (`cobra-simplify<verified-boolean>`); one named
+# `test_*_unverified_boolean.ll` asks for that reading without the solver, which
+# must then change nothing (`cobra-simplify<boolean>`).
 #
 # A test may also pin the environment the pass runs in, next to the test itself:
 #
@@ -41,6 +45,13 @@ function(cobra_add_ll_test TEST_FILE)
             return()
         endif()
         set(PIPELINE "cobra-simplify<verified-sweep>")
+    elseif(TEST_NAME MATCHES "_verified_boolean$")
+        if(NOT COBRA_VERIFY_BACKEND)
+            return()
+        endif()
+        set(PIPELINE "cobra-simplify<verified-boolean>")
+    elseif(TEST_NAME MATCHES "_unverified_boolean$")
+        set(PIPELINE "cobra-simplify<boolean>")
     elseif(TEST_NAME MATCHES "_verified$")
         if(NOT COBRA_VERIFY_BACKEND)
             return()

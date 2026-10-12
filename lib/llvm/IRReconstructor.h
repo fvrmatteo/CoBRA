@@ -91,11 +91,21 @@ namespace cobra {
     //
     // `reuse`, when given, lets the reconstruction read instructions the
     // function already holds (see `IrReuse`).
+    //
+    // `condition_forms` (a rewrite of the boolean reading, see
+    // `CobraPassOptions::boolean_variables`) builds what such a rewrite says of
+    // its conditions in the forms the IR writes them, which is also what lets
+    // it read the ones the function holds: the negation of a sign bit,
+    // `-(x >> (w - 1))`, as `ashr x, w - 1`; the negation of a comparison as its
+    // sign extension; a comparison flipped with `^ 1` as the inverse predicate;
+    // `x + -y` as `x - y`; and `B ^ ((A ^ B) & -c)`, which is how a `select` of a
+    // comparison reads, as that `select`. Each is the same value.
     llvm::Value *ReconstructIr(
         const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
         const std::vector< uint32_t > &var_map                 = {},
         LeafSupply *leaves                                     = nullptr,
-        IrReuse *reuse                                         = nullptr
+        IrReuse *reuse                                         = nullptr,
+        bool condition_forms                                   = false
     );
 
 } // namespace cobra

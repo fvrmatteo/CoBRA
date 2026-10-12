@@ -52,6 +52,7 @@ namespace cobra {
         kInnerRoot,   // a root the rejected tree buried
         kSlice,       // the same root, read at the width of an extension it holds
         kSumGroup,    // one group of the root's sum, read at the width of an extension it holds
+        kBooleanCut,  // the same root, read with the comparisons of narrow values taken in
         kCount
     };
 
@@ -130,6 +131,15 @@ namespace cobra {
         // Trees found by random inputs to compute one of their own inputs
         // (offered only under `sweep`, see ProposeRewrite).
         uint64_t leaf_identities = 0;
+        // `boolean_variables`: the trees read with their conditions as
+        // variables, the conditions found in them, the pairs the solver proved
+        // the same condition (or its negation) and the pairs it could not
+        // decide, and the rewrites the reading found.
+        uint64_t boolean_trees      = 0;
+        uint64_t boolean_conditions = 0;
+        uint64_t boolean_merged     = 0;
+        uint64_t boolean_undecided  = 0;
+        uint64_t boolean_found      = 0;
         uint64_t enumeration_nanoseconds    = 0;
         // Proofs settled by `ProveEqualByRingNormalForm` before any solver is
         // asked, how many were attempted, and the time all the attempts took.

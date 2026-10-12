@@ -1,4 +1,5 @@
 #include "IRReconstructor.h"
+#include "cobra/core/ExprUtils.h"
 #include "MBADetector.h"
 #include "cobra/core/Expr.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -164,6 +165,23 @@ namespace cobra {
             return Built(builder.CreateICmp(predicate, lhs, rhs, name), reuse);
         }
 
+        llvm::Value *EmitSelect(
+            llvm::Value *cond, llvm::Value *then_value, llvm::Value *else_value,
+            llvm::IRBuilder<> &builder, const char *name, IrReuse *reuse
+        ) {
+            if (reuse != nullptr) {
+                auto *found = FindReader(then_value, else_value, *reuse, [&](const llvm::Instruction &inst) {
+                    const auto *select = llvm::dyn_cast< llvm::SelectInst >(&inst);
+                    return select != nullptr && select->getCondition() == cond
+                        && select->getTrueValue() == then_value && select->getFalseValue() == else_value;
+                });
+                if (found != nullptr) {
+                    return Read(found, *reuse);
+                }
+            }
+            return Built(builder.CreateSelect(cond, then_value, else_value, name), reuse);
+        }
+
         llvm::Value *MaterializeAtCandidateWidth(
             llvm::Value *value, llvm::IntegerType *target_ty, llvm::IRBuilder<> &builder,
             IrReuse *reuse
@@ -182,7 +200,8 @@ namespace cobra {
 
     llvm::Value *ReconstructIr(
         const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
-        const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse
+        const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse,
+        bool condition_forms
     ) {
         auto *int_ty = builder.getIntNTy(candidate.bitwidth);
         const auto leaf_value = [&](uint32_t index) -> llvm::Value * {
@@ -203,8 +222,40 @@ namespace cobra {
         };
         const auto child = [&](unsigned index) {
             return ReconstructIr(
-                *expr.children[index], candidate, builder, var_map, leaves, reuse
+                *expr.children[index], candidate, builder, var_map, leaves, reuse, condition_forms
             );
+        };
+        const auto build = [&](const Expr &node) {
+            return ReconstructIr(node, candidate, builder, var_map, leaves, reuse, condition_forms);
+        };
+        // A comparison as the `i1` it is, its predicate inverted when `^ 1`
+        // flips it; null for anything else.
+        const auto condition = [&](const Expr &node) -> llvm::Value * {
+            const Expr *cmp = &node;
+            bool inverted   = false;
+            if (node.kind == Expr::Kind::kXor && node.children.size() == 2) {
+                for (unsigned side = 0; side < 2; ++side) {
+                    const auto &other = *node.children[1 - side];
+                    if (IsComparison(node.children[side]->kind) && other.kind == Expr::Kind::kConstant
+                        && other.constant_val == 1)
+                    {
+                        cmp      = node.children[side].get();
+                        inverted = true;
+                    }
+                }
+            }
+            if (!IsComparison(cmp->kind)) {
+                return nullptr;
+            }
+            auto predicate = cmp->kind == Expr::Kind::kCmpEq ? llvm::CmpInst::ICMP_EQ
+                : cmp->kind == Expr::Kind::kCmpUlt           ? llvm::CmpInst::ICMP_ULT
+                                                             : llvm::CmpInst::ICMP_SLT;
+            if (inverted) {
+                predicate = llvm::CmpInst::getInversePredicate(predicate);
+            }
+            auto *lhs = build(*cmp->children[0]);
+            auto *rhs = build(*cmp->children[1]);
+            return EmitCompare(predicate, lhs, rhs, builder, "cobra.cond", reuse);
         };
 
         switch (expr.kind) {
@@ -220,6 +271,19 @@ namespace cobra {
             }
 
             case Expr::Kind::kAdd: {
+                // `x + -y` is `x - y`, the way the IR writes it (and a
+                // constant minus a value with it).
+                if (condition_forms) {
+                    for (unsigned side = 0; side < 2; ++side) {
+                        if (expr.children[side]->kind == Expr::Kind::kNeg) {
+                            auto *minuend    = build(*expr.children[1 - side]);
+                            auto *subtrahend = build(*expr.children[side]->children[0]);
+                            return EmitBinary(
+                                llvm::Instruction::Sub, minuend, subtrahend, builder, "cobra.sub", reuse
+                            );
+                        }
+                    }
+                }
                 auto *lhs = child(0);
                 auto *rhs = child(1);
                 return EmitBinary(llvm::Instruction::Add, lhs, rhs, builder, "cobra.add", reuse);
@@ -281,6 +345,39 @@ namespace cobra {
                     : EmitBinary(llvm::Instruction::Or, lhs, rhs, builder, "cobra.or", reuse);
             }
             case Expr::Kind::kXor: {
+                // `B ^ ((A ^ B) & -c)` is how a `select` of a comparison is read
+                // (`BuildExprFromIRImpl`): built as the `select` it was.
+                if (condition_forms) {
+                    for (unsigned side = 0; side < 2; ++side) {
+                        const auto &other  = *expr.children[side];
+                        const auto &masked = *expr.children[1 - side];
+                        if (masked.kind != Expr::Kind::kAnd) {
+                            continue;
+                        }
+                        for (unsigned mside = 0; mside < 2; ++mside) {
+                            const auto &diff = *masked.children[mside];
+                            const auto &neg  = *masked.children[1 - mside];
+                            if (diff.kind != Expr::Kind::kXor || neg.kind != Expr::Kind::kNeg) {
+                                continue;
+                            }
+                            for (unsigned dside = 0; dside < 2; ++dside) {
+                                if (!ExprStructurallyEqual(*diff.children[1 - dside], other)) {
+                                    continue;
+                                }
+                                auto *cond = condition(*neg.children[0]);
+                                if (cond == nullptr) {
+                                    continue;
+                                }
+                                auto *then_value = build(*diff.children[dside]);
+                                auto *else_value = build(other);
+                                return EmitSelect(cond, then_value, else_value, builder, "cobra.select", reuse);
+                            }
+                        }
+                    }
+                    if (auto *flipped = condition(expr); flipped != nullptr) {
+                        return EmitCast(llvm::Instruction::ZExt, flipped, int_ty, builder, "cobra.condext", reuse);
+                    }
+                }
                 auto *lhs = child(0);
                 auto *rhs = child(1);
                 return EmitBinary(llvm::Instruction::Xor, lhs, rhs, builder, "cobra.xor", reuse);
@@ -308,6 +405,19 @@ namespace cobra {
                 return EmitBinary(llvm::Instruction::Xor, operand, neg_one, builder, "cobra.not", reuse);
             }
             case Expr::Kind::kNeg: {
+                if (condition_forms) {
+                    const auto &negated = *expr.children[0];
+                    if (negated.kind == Expr::Kind::kShr
+                        && negated.constant_val + 1 == int_ty->getBitWidth())
+                    {
+                        auto *value  = build(*negated.children[0]);
+                        auto *amount = llvm::ConstantInt::get(int_ty, negated.constant_val);
+                        return EmitBinary(llvm::Instruction::AShr, value, amount, builder, "cobra.sign", reuse);
+                    }
+                    if (auto *cmp = condition(negated); cmp != nullptr) {
+                        return EmitCast(llvm::Instruction::SExt, cmp, int_ty, builder, "cobra.condsext", reuse);
+                    }
+                }
                 auto *operand = child(0);
                 auto *zero    = llvm::ConstantInt::get(int_ty, 0);
                 return EmitBinary(llvm::Instruction::Sub, zero, operand, builder, "cobra.neg", reuse);

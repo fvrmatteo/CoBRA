@@ -12,6 +12,7 @@
 #include "cobra/core/RingProof.h"
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/SignatureChecker.h"
+#include "cobra/core/SignatureEval.h"
 #include "cobra/core/Simplifier.h"
 
 #ifdef COBRA_HAS_Z3
@@ -19,9 +20,11 @@
 #endif
 
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -104,6 +107,12 @@ namespace cobra {
             // the cache holds it unverified, and the next candidate with the
             // same key that fits the budget pays for the proof.
             bool verified = false;
+            // Found by reading the tree's conditions as variables
+            // (`CobraPassOptions::boolean_variables`). Such a rewrite stands on
+            // the merges of conditions the solver proved, and it is accepted
+            // only on the solver's own proof that it equals the tree - see
+            // `VerifyCandidate`.
+            bool boolean_reading = false;
         };
 
         // Which bits of a value its readers look at, as LLVM's demanded-bits
@@ -550,6 +559,11 @@ namespace cobra {
             into.search_found += run.search_found;
             into.search_found_nanoseconds += run.search_found_nanoseconds;
             into.leaf_identities += run.leaf_identities;
+            into.boolean_trees += run.boolean_trees;
+            into.boolean_conditions += run.boolean_conditions;
+            into.boolean_merged += run.boolean_merged;
+            into.boolean_undecided += run.boolean_undecided;
+            into.boolean_found += run.boolean_found;
             into.enumeration_nanoseconds += run.enumeration_nanoseconds;
             into.ring_attempted += run.ring_attempted;
             into.ring_proved += run.ring_proved;
@@ -1003,6 +1017,10 @@ namespace cobra {
             key += std::to_string(static_cast< int >(options.z3_settings.strategy));
             key += options.z3_settings.sweep ? "s" : "";
             key += std::to_string(static_cast< uint64_t >(options.enabled_families));
+            key += options.boolean_variables ? "|b" : "";
+            // The boolean cut is searched by the boolean reading alone, so its
+            // verdict is not the one an identical tree read the ordinary way has.
+            key += cand.node_limit == kBooleanCutLimit ? "B" : "";
             key += ':';
             key += std::to_string(std::hash< std::string >{}(options.z3_settings.llvm_passes));
             key += '|';
@@ -1293,6 +1311,7 @@ namespace cobra {
             tag = mix(tag, static_cast< uint64_t >(options.cost_model));
             tag = mix(tag, std::hash< std::string >{}(options.z3_settings.llvm_passes));
             tag = mix(tag, static_cast< uint64_t >(options.leaf_freezing));
+            tag = mix(tag, options.boolean_variables ? 1 : 0);
             // What the records mean changes with the pass itself as well as
             // with its settings: a host that keeps `!cobra.mba` on IR it saves
             // and loads again must not read a verdict an older build wrote
@@ -1419,6 +1438,471 @@ namespace cobra {
         // `COBRA_OLD` (defined below, declared here because the search needs it).
         bool Old(std::string_view behaviour);
 
+#ifdef COBRA_HAS_Z3
+        // `CobraPassOptions::boolean_variables`: a tree read with every condition
+        // in it as a variable that is 0 or 1.
+        namespace boolean_reading {
+
+            // At most how many of the low bits of `expr` can be set, on any input
+            // of a tree `bw` wide.
+            uint32_t SignificantBits(const Expr &expr, uint32_t bw) {
+                switch (expr.kind) {
+                    case Expr::Kind::kConstant:
+                        return static_cast< uint32_t >(std::bit_width(expr.constant_val & Bitmask(bw)));
+                    case Expr::Kind::kCmpEq:
+                    case Expr::Kind::kCmpUlt:
+                    case Expr::Kind::kCmpSlt:
+                        return 1;
+                    case Expr::Kind::kAnd:
+                        return std::min(
+                            SignificantBits(*expr.children[0], bw), SignificantBits(*expr.children[1], bw)
+                        );
+                    case Expr::Kind::kOr:
+                    case Expr::Kind::kXor:
+                        return std::max(
+                            SignificantBits(*expr.children[0], bw), SignificantBits(*expr.children[1], bw)
+                        );
+                    case Expr::Kind::kShr: {
+                        const uint32_t bits = SignificantBits(*expr.children[0], bw);
+                        return bits > expr.constant_val ? bits - static_cast< uint32_t >(expr.constant_val) : 0;
+                    }
+                    default:
+                        return bw;
+                }
+            }
+
+            bool HasVariable(const Expr &expr) {
+                if (expr.kind == Expr::Kind::kVariable) {
+                    return true;
+                }
+                return llvm::any_of(expr.children, [](const auto &child) { return HasVariable(*child); });
+            }
+
+            // A condition: a comparison, or the top bit of what a logical shift
+            // reads - the sign bit of a value of `amount + 1` bits, which is how
+            // `lshr x, w - 1`, `ashr x, w - 1` and the low bit of `fshl(a, b, 1)`
+            // all read. Either is 0 or 1 on every input. One over constants alone
+            // is the constant it folds to, and is left to the search.
+            bool IsCondition(const Expr &expr, uint32_t bw) {
+                if (!HasVariable(expr)) {
+                    return false;
+                }
+                if (IsComparison(expr.kind)) {
+                    return true;
+                }
+                return expr.kind == Expr::Kind::kShr && expr.constant_val >= 1
+                    && SignificantBits(*expr.children[0], bw) == expr.constant_val + 1;
+            }
+
+            // The outermost conditions of `expr`, each structurally distinct one
+            // once, and where each occurrence stands.
+            void CollectConditions(
+                const Expr &expr, uint32_t bw, std::vector< const Expr * > &conditions,
+                std::unordered_map< const Expr *, uint32_t > &slot_of
+            ) {
+                if (IsCondition(expr, bw)) {
+                    for (uint32_t slot = 0; slot < conditions.size(); ++slot) {
+                        if (ExprStructurallyEqual(*conditions[slot], expr)) {
+                            slot_of[&expr] = slot;
+                            return;
+                        }
+                    }
+                    slot_of[&expr] = static_cast< uint32_t >(conditions.size());
+                    conditions.push_back(&expr);
+                    return;
+                }
+                for (const auto &child : expr.children) {
+                    CollectConditions(*child, bw, conditions, slot_of);
+                }
+            }
+
+            // `expr` with each condition read as the variable of its class: the
+            // variable masked to its one bit, negated where the condition is the
+            // class's negation.
+            std::unique_ptr< Expr > Abstract(
+                const Expr &expr, const std::unordered_map< const Expr *, uint32_t > &slot_of,
+                const std::vector< uint32_t > &representative, const std::vector< bool > &negated,
+                uint32_t first_condition
+            ) {
+                if (const auto found = slot_of.find(&expr); found != slot_of.end()) {
+                    const uint32_t slot = found->second;
+                    auto variable       = Expr::BitwiseAnd(
+                        Expr::Variable(first_condition + representative[slot]), Expr::Constant(1)
+                    );
+                    if (negated[slot]) {
+                        return Expr::BitwiseXor(std::move(variable), Expr::Constant(1));
+                    }
+                    return variable;
+                }
+                auto copy = std::make_unique< Expr >();
+                copy->kind         = expr.kind;
+                copy->constant_val = expr.constant_val;
+                copy->var_index    = expr.var_index;
+                for (const auto &child : expr.children) {
+                    copy->children.push_back(
+                        Abstract(*child, slot_of, representative, negated, first_condition)
+                    );
+                }
+                return copy;
+            }
+
+            void UsedVariables(const Expr &expr, std::vector< bool > &used) {
+                if (expr.kind == Expr::Kind::kVariable) {
+                    used.at(expr.var_index) = true;
+                    return;
+                }
+                for (const auto &child : expr.children) {
+                    UsedVariables(*child, used);
+                }
+            }
+
+            // `expr` with variable `v` replaced by `meaning[v]`.
+            std::unique_ptr< Expr > Substitute(
+                const Expr &expr, const std::vector< std::unique_ptr< Expr > > &meaning
+            ) {
+                if (expr.kind == Expr::Kind::kVariable) {
+                    return CloneExpr(*meaning.at(expr.var_index));
+                }
+                auto copy = std::make_unique< Expr >();
+                copy->kind         = expr.kind;
+                copy->constant_val = expr.constant_val;
+                copy->var_index    = expr.var_index;
+                for (const auto &child : expr.children) {
+                    copy->children.push_back(Substitute(*child, meaning));
+                }
+                return copy;
+            }
+
+            bool IsConstant(const Expr &expr, uint64_t value, uint32_t bw) {
+                return expr.kind == Expr::Kind::kConstant
+                    && (expr.constant_val & Bitmask(bw)) == (value & Bitmask(bw));
+            }
+
+            // `expr` without the identities the IR does not spell: `0 + x`,
+            // `x ^ 0`, `x | 0`, `1 * x`, `-1 * x` as `-x`, and a condition masked
+            // to the one bit it already is. The rebuild reads an existing
+            // instruction only where the rewrite applies the same operator to
+            // the same operands (`IrReuse`), so a condition put back as
+            // `y | (0 + -y)` would be built again beside the `y | -y` the
+            // function holds.
+            std::unique_ptr< Expr > Tidy(std::unique_ptr< Expr > expr, uint32_t bw) {
+                for (auto &child : expr->children) {
+                    child = Tidy(std::move(child), bw);
+                }
+                const auto take = [&](size_t index) { return std::move(expr->children[index]); };
+                switch (expr->kind) {
+                    case Expr::Kind::kAdd:
+                    case Expr::Kind::kOr:
+                    case Expr::Kind::kXor:
+                        for (size_t side = 0; side < 2; ++side) {
+                            if (IsConstant(*expr->children[side], 0, bw)) {
+                                return take(1 - side);
+                            }
+                        }
+                        break;
+                    case Expr::Kind::kMul:
+                        for (size_t side = 0; side < 2; ++side) {
+                            if (IsConstant(*expr->children[side], 1, bw)) {
+                                return take(1 - side);
+                            }
+                            if (IsConstant(*expr->children[side], ~uint64_t{ 0 }, bw)) {
+                                return Expr::Negate(take(1 - side));
+                            }
+                        }
+                        break;
+                    case Expr::Kind::kAnd:
+                        for (size_t side = 0; side < 2; ++side) {
+                            if (IsConstant(*expr->children[side], 1, bw)
+                                && SignificantBits(*expr->children[1 - side], bw) <= 1)
+                            {
+                                return take(1 - side);
+                            }
+                        }
+                        break;
+                    default:
+                        break;
+                }
+                return expr;
+            }
+
+            // A function of conditions alone, from its values on the `2^k`
+            // assignments of them (`sig`, variable `v` at bit `v`): the sum over
+            // the sets of conditions of a coefficient times their conjunction,
+            // the coefficients being the Moebius transform of the values. Exact
+            // on every assignment of 0s and 1s, which is every value conditions
+            // take - so there is nothing to search for.
+            std::unique_ptr< Expr > MultilinearForm(
+                const std::vector< uint64_t > &sig, uint32_t variables, uint32_t bw
+            ) {
+                const uint64_t mask = Bitmask(bw);
+                std::vector< uint64_t > coefficient(sig.begin(), sig.end());
+                for (uint32_t variable = 0; variable < variables; ++variable) {
+                    for (size_t set = 0; set < coefficient.size(); ++set) {
+                        if ((set >> variable) & 1) {
+                            coefficient[set] =
+                                (coefficient[set] - coefficient[set ^ (size_t{ 1 } << variable)]) & mask;
+                        }
+                    }
+                }
+                std::unique_ptr< Expr > sum;
+                for (size_t set = 0; set < coefficient.size(); ++set) {
+                    if (coefficient[set] == 0) {
+                        continue;
+                    }
+                    std::unique_ptr< Expr > term;
+                    for (uint32_t variable = 0; variable < variables; ++variable) {
+                        if ((set >> variable) & 1) {
+                            auto factor = Expr::Variable(variable);
+                            term = term == nullptr ? std::move(factor)
+                                                   : Expr::BitwiseAnd(std::move(term), std::move(factor));
+                        }
+                    }
+                    term = term == nullptr ? Expr::Constant(coefficient[set])
+                                           : Expr::Mul(Expr::Constant(coefficient[set]), std::move(term));
+                    sum = sum == nullptr ? std::move(term) : Expr::Add(std::move(sum), std::move(term));
+                }
+                return Tidy(sum == nullptr ? Expr::Constant(0) : std::move(sum), bw);
+            }
+
+        } // namespace boolean_reading
+
+        // Whether the boolean reading has anything to read in `cand`: a
+        // condition in its tree, or a comparison it reads as a leaf, which the
+        // boolean cut takes in.
+        bool ReadsConditions(const MBACandidate &cand) {
+            if (llvm::any_of(cand.leaf_values, [](const llvm::Value *leaf) {
+                    return llvm::isa< llvm::ICmpInst >(leaf);
+                }))
+            {
+                return true;
+            }
+            if (cand.expr == nullptr) {
+                return false;
+            }
+            std::vector< const Expr * > conditions;
+            std::unordered_map< const Expr *, uint32_t > slot_of;
+            boolean_reading::CollectConditions(*cand.expr, cand.bitwidth, conditions, slot_of);
+            return !conditions.empty();
+        }
+
+        // Search for a rewrite of `cand` with its conditions read as variables
+        // (`CobraPassOptions::boolean_variables`): the search the boolean cut of a
+        // root the ordinary one turned down is given (`BooleanCutMbaCandidate`).
+        //
+        // A comparison, and the sign bit of a value, is 0 or 1 on every input,
+        // and replacing it with a variable masked to one bit changes nothing the
+        // tree computes - only what the search is shown. Over the words, "is any
+        // bit of `x` set" is not a function of the bits of `x` one at a time,
+        // and a shift by `w - 1` does not mean the same at the narrower widths
+        // the search solves in; over a 0/1 variable, `fshl(-c, b, 1)` with the
+        // sign of `b` being `c` is `-c`.
+        //
+        // Two conditions are one variable only where the solver proves them the
+        // same, or one the negation of the other, over the tree's variables; the
+        // probes only choose which pairs it is asked about, and an undecided
+        // answer leaves the two apart. The rewrite is then put back in terms of
+        // the conditions it read, and `VerifyCandidate` proves it against the
+        // tree with the solver alone - the reading and the merges included.
+        OutcomeCache::Entry ProposeBooleanRewrite(
+            const MBACandidate &cand, const CobraPassOptions &options, CobraStatistics &stats
+        ) {
+            using namespace boolean_reading;
+            if (cand.expr == nullptr || !options.z3_verify) {
+                return nullptr;
+            }
+            const uint32_t bw   = cand.bitwidth;
+            const auto base     = static_cast< uint32_t >(cand.var_names.size());
+            std::vector< const Expr * > conditions;
+            std::unordered_map< const Expr *, uint32_t > slot_of;
+            CollectConditions(*cand.expr, bw, conditions, slot_of);
+            // Each condition is a variable the search has to sweep, and a pair is
+            // a question to the solver: past a handful there is neither.
+            constexpr size_t kMaxConditions = 8;
+            if (conditions.empty() || conditions.size() > kMaxConditions) {
+                return nullptr;
+            }
+            ++stats.boolean_trees;
+            stats.boolean_conditions += conditions.size();
+
+            // The same inputs for every condition, so that two are compared on
+            // the values they take together: random words and the boundary
+            // values a comparison or a sign turns on.
+            constexpr int kProbes = 96;
+            static const uint64_t kBoundary[] = { 0, 1, 2, ~uint64_t{ 0 }, ~uint64_t{ 0 } - 1,
+                                                  uint64_t{ 1 } << 63, (uint64_t{ 1 } << 63) - 1 };
+            uint64_t state  = 0x9E3779B97F4A7C15ULL ^ cand.fingerprint.structure;
+            const auto next = [&] {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                return state;
+            };
+            std::vector< std::vector< uint64_t > > probes(kProbes, std::vector< uint64_t >(base));
+            for (int round = 0; round < kProbes; ++round) {
+                for (auto &value : probes[round]) {
+                    value = (round < 16 ? kBoundary[next() % 7] : next()) & Bitmask(bw);
+                }
+            }
+            std::vector< std::vector< uint64_t > > seen(conditions.size());
+            for (size_t slot = 0; slot < conditions.size(); ++slot) {
+                for (const auto &values : probes) {
+                    const uint64_t value = EvalExpr(*conditions[slot], values, bw);
+                    if (value > 1) {
+                        // Not a condition after all; nothing is read as one.
+                        RejectReason() = "boolean reading: a condition evaluated to " + std::to_string(value);
+                        return nullptr;
+                    }
+                    seen[slot].push_back(value);
+                }
+            }
+
+            std::vector< uint32_t > representative(conditions.size());
+            std::vector< bool > negated(conditions.size(), false);
+            for (uint32_t slot = 0; slot < conditions.size(); ++slot) {
+                representative[slot] = slot;
+                for (uint32_t other = 0; other < slot; ++other) {
+                    if (representative[other] != other) {
+                        continue;
+                    }
+                    const bool same     = seen[slot] == seen[other];
+                    const bool opposite = !same && llvm::all_of(llvm::seq< size_t >(0, kProbes), [&](size_t k) {
+                        return seen[slot][k] == (seen[other][k] ^ 1);
+                    });
+                    if (!same && !opposite) {
+                        continue;
+                    }
+                    auto claim = CloneExpr(*conditions[other]);
+                    if (opposite) {
+                        claim = Expr::BitwiseXor(std::move(claim), Expr::Constant(1));
+                    }
+                    auto settings = options.z3_settings;
+                    // An undecided merge is not made, whatever the host takes
+                    // an unknown answer to mean elsewhere.
+                    settings.unknown_result_mode = Z3UnknownResultMode::kFail;
+                    const auto proof =
+                        VerifyExprsWithStrategy(*conditions[slot], *claim, cand.var_names, bw, settings);
+                    ++stats.solver_calls;
+                    if (proof.unknown) {
+                        ++stats.boolean_undecided;
+                        continue;
+                    }
+                    if (proof.equivalent) {
+                        ++stats.boolean_merged;
+                        representative[slot] = other;
+                        negated[slot]        = opposite;
+                        break;
+                    }
+                }
+            }
+
+            // The tree over its variables and one per class of conditions, then
+            // only the variables it still reads, in that order.
+            auto abstracted = Abstract(*cand.expr, slot_of, representative, negated, base);
+            std::vector< bool > used(base + conditions.size(), false);
+            UsedVariables(*abstracted, used);
+            std::vector< uint32_t > compact(used.size(), 0);
+            std::vector< std::string > names;
+            std::vector< std::unique_ptr< Expr > > meaning;
+            bool only_conditions = true;
+            llvm::StringSet<> taken;
+            for (const auto &name : cand.var_names) {
+                taken.insert(name);
+            }
+            for (uint32_t variable = 0; variable < used.size(); ++variable) {
+                if (!used[variable]) {
+                    continue;
+                }
+                compact[variable] = static_cast< uint32_t >(names.size());
+                if (variable < base) {
+                    names.push_back(cand.var_names[variable]);
+                    meaning.push_back(Expr::Variable(variable));
+                    only_conditions = false;
+                    continue;
+                }
+                std::string name = "cond" + std::to_string(variable - base);
+                while (!taken.insert(name).second) {
+                    name += "'";
+                }
+                names.push_back(std::move(name));
+                meaning.push_back(Tidy(CloneExpr(*conditions[variable - base]), bw));
+            }
+            RemapVarIndices(*abstracted, compact);
+            const auto variables = static_cast< uint32_t >(names.size());
+            if (variables > options.max_vars || variables > 20) {
+                RejectReason() = "boolean reading: more variables than max_vars";
+                return nullptr;
+            }
+
+            Options opts{ .bitwidth         = bw,
+                          .max_vars         = options.max_vars,
+                          .spot_check       = true,
+                          .enabled_families = options.enabled_families,
+                          .evaluator        = Evaluator::FromExpr(*abstracted, bw),
+                          .demanded_mask    = cand.demanded_mask };
+            const auto sig = EvaluateBooleanSignature(*abstracted, variables, bw);
+            // A tree that reads nothing but conditions is its table of values;
+            // one that reads words as well goes to the search.
+            Result< SimplifyOutcome > result = only_conditions
+                ? Result< SimplifyOutcome >(Ok(SimplifyOutcome{
+                      .kind = SimplifyOutcome::Kind::kSimplified,
+                      .expr = MultilinearForm(sig, variables, bw) }))
+                : Simplify(sig, names, abstracted.get(), opts);
+            // `COBRA_BOOLEAN_DEBUG=1`: the tree as the search was given it, and what came of it.
+            static const bool debug = std::getenv("COBRA_BOOLEAN_DEBUG") != nullptr;
+            if (debug) {
+                llvm::errs() << "cobra: boolean reading of " << RenderSSA(*cand.expr, cand.var_names) << "\n  "
+                             << conditions.size() << " condition(s), read as "
+                             << RenderSSA(*abstracted, names) << "\n  -> "
+                             << (result.has_value() && result.value().kind == SimplifyOutcome::Kind::kSimplified
+                                     ? RenderSSA(*result.value().expr, result.value().real_vars.empty() ? names : result.value().real_vars)
+                                     : std::string("not simplified: ")
+                                           + (result.has_value() ? result.value().diag.reason : result.error().message))
+                             << "\n";
+                for (uint32_t slot = 0; slot < conditions.size(); ++slot) {
+                    llvm::errs() << "  condition " << slot << ": " << RenderSSA(*conditions[slot], cand.var_names)
+                                 << (representative[slot] != slot
+                                         ? std::string(" = ") + (negated[slot] ? "not " : "") + "condition "
+                                               + std::to_string(representative[slot])
+                                         : std::string())
+                                 << "\n";
+                }
+            }
+            if (!result.has_value() || result.value().kind != SimplifyOutcome::Kind::kSimplified) {
+                RejectReason() = "boolean reading (" + std::to_string(conditions.size())
+                    + " condition(s)): not simplified"
+                    + (result.has_value() ? ": " + result.value().diag.reason : std::string());
+                return nullptr;
+            }
+            auto rewrite = std::move(result.value().expr);
+            if (!result.value().real_vars.empty()) {
+                auto support = TryBuildVarSupport(names, result.value().real_vars);
+                if (!support.has_value()) {
+                    RejectReason() = "boolean reading: the rewrite names a variable it was not given";
+                    return nullptr;
+                }
+                RemapVarIndices(*rewrite, *support);
+            }
+            // Back in terms of the tree's own variables: what `VerifyCandidate`
+            // proves, and what the IR is rebuilt from.
+            auto restored = Tidy(Substitute(*rewrite, meaning), bw);
+            if (std::getenv("COBRA_BOOLEAN_DEBUG") != nullptr) {
+                llvm::errs() << "  restored " << RenderSSA(*restored, cand.var_names) << "\n";
+            }
+            if (!IsBetter(ComputeCost(*restored).cost, ComputeCost(*cand.expr).cost)) {
+                RejectReason() = "boolean reading: not cheaper: " + RenderSSA(*restored, cand.var_names);
+                return nullptr;
+            }
+            ++stats.boolean_found;
+            return std::make_shared< const CandidateOutcome >(CandidateOutcome{
+                .expr               = std::move(restored),
+                .real_vars          = {},
+                .real_var_positions = {},
+                .accepted_unknown   = false,
+                .verified           = false,
+                .boolean_reading    = true });
+        }
+#endif
+
         // Search for a rewrite of one candidate and put it through the cost
         // gate. Returns null when either rejects it, and otherwise a rewrite that
         // still has to be verified (`VerifyCandidate`).
@@ -1436,6 +1920,21 @@ namespace cobra {
             };
             verdict = SolveVerdict::kUnsolved;
             RejectReason().clear();
+            // The boolean cut is collected for the boolean reading alone: its
+            // narrow comparisons are opaque to every other search.
+            if (cand.node_limit == kBooleanCutLimit) {
+#ifdef COBRA_HAS_Z3
+                if (options.boolean_variables) {
+                    auto outcome = ProposeBooleanRewrite(cand, options, stats);
+                    if (outcome != nullptr) {
+                        verdict = SolveVerdict::kSolved;
+                    }
+                    return outcome;
+                }
+#endif
+                RejectReason() = "a boolean cut without the boolean reading";
+                return nullptr;
+            }
             Options opts{ .bitwidth         = cand.bitwidth,
                           .max_vars         = options.max_vars,
                           .spot_check       = true,
@@ -1752,6 +2251,18 @@ namespace cobra {
             const Expr *ast       = cand.expr.get();
             const auto &positions = proposal.real_var_positions;
 
+            // A rewrite the boolean reading found stands on merges of
+            // conditions and on a search over a tree that is not the one it
+            // replaces: the solver proves it against the tree or it is not
+            // taken. Enumeration and the ring normal form may still refute it,
+            // but a proof from either is not the proof asked for, and neither
+            // is an `unknown` answer, whatever the host takes one to mean.
+            const bool solver_only = proposal.boolean_reading;
+            if (solver_only && (!options.z3_verify || ast == nullptr)) {
+                ++NumSkippedUnsupported;
+                return nullptr;
+            }
+
             // Proved outright where the inputs can be walked, on the bits the
             // rewrite was found for. This runs whether or not a solver is asked
             // for: a rewrite it refutes is wrong either way, and one it proves
@@ -1790,13 +2301,13 @@ namespace cobra {
                     );
                     return nullptr;
                 }
-                proved = decided.has_value();
+                proved = decided.has_value() && !solver_only;
 
                 // Then by algebra, before any solver: a normal form over the ring
                 // settles in microseconds what bit-blasting a multiplier cannot in
                 // seconds (see `ProveEqualByRingNormalForm`). It only ever proves,
                 // so what it does not settle goes on to the solver as before.
-                if (!proved && RingProofEnabled()) {
+                if (!proved && !solver_only && RingProofEnabled()) {
                     const auto ring_begin = std::chrono::steady_clock::now();
                     ++stats.ring_attempted;
                     proved = ProveEqualByRingNormalForm(*original, *rewritten, cand.bitwidth);
@@ -1919,6 +2430,14 @@ namespace cobra {
                 if (unknown != nullptr) {
                     *unknown = z3_result.unknown;
                 }
+                if (solver_only && z3_result.unknown) {
+                    ++NumSkippedUnsupported;
+                    LLVM_DEBUG(
+                        llvm::dbgs() << "CoBRA: skipping — a boolean reading needs a proof and the "
+                                        "solver returned unknown\n"
+                    );
+                    return nullptr;
+                }
                 if (declined_comparison) {
                     ++NumSkippedUnsupported;
                     LLVM_DEBUG(
@@ -1952,7 +2471,8 @@ namespace cobra {
                 .real_vars          = proposal.real_vars,
                 .real_var_positions = proposal.real_var_positions,
                 .accepted_unknown   = accepted_unknown,
-                .verified           = true });
+                .verified           = true,
+                .boolean_reading    = proposal.boolean_reading });
         }
 
         // How many widths a root is asked about before the ladder moves on. The
@@ -2341,6 +2861,12 @@ namespace cobra {
                 // the budget it should have had: over one exploration, 63 worker timeouts
                 // (64 s) followed by 63 proofs on the loop (153 s), of which 3 succeeded.
                 task->input.tree_size     = cand.tree_size;
+                // Which reading the candidate is: the boolean cut is searched by the
+                // boolean reading alone (`ProposeRewrite`), and that reading probes its
+                // conditions on inputs seeded by the fingerprint, so a worker given
+                // neither would answer a different question than the loop.
+                task->input.node_limit    = cand.node_limit;
+                task->input.fingerprint   = cand.fingerprint;
                 task->leaf_needs_cast.reserve(cand.leaf_values.size());
                 for (const auto *leaf : cand.leaf_values) {
                     task->leaf_needs_cast.push_back(
@@ -2843,6 +3369,20 @@ namespace cobra {
                 }
                 stats.sum_group_nanoseconds += since(sum_begin);
 
+                // The boolean cut (`boolean_variables`): the root with its
+                // narrow comparisons taken in, so that the reading of its
+                // conditions as variables can prove one of them the same as a
+                // sign computed from the values it compares.
+                std::vector< MBACandidate > boolean;
+#ifdef COBRA_HAS_Z3
+                if (options_.boolean_variables && options_.z3_verify && ReadsConditions(cand)) {
+                    boolean = BooleanCutMbaCandidate(
+                        cand, options_.min_ast_size, options_.max_vars, options_tag,
+                        options_.cost_model, options_.max_tree_nodes, demanded
+                    );
+                }
+#endif
+
                 // The boundary cut: it is the one reading of the root
                 // the ladder below cannot reach, and it costs a single solve.
                 auto boundary = BoundaryCutMbaCandidate(
@@ -2899,6 +3439,14 @@ namespace cobra {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
                         origins.push_back(CandidateOrigin::kSumGroup);
+                        ++stats.requeued;
+                    }
+                }
+                for (auto &cut : boolean) {
+                    if (attempted.insert({ cut.root, cut.node_limit }).second) {
+                        queue_key(cut);
+                        candidates.push_back(std::move(cut));
+                        origins.push_back(CandidateOrigin::kBooleanCut);
                         ++stats.requeued;
                     }
                 }
@@ -3258,7 +3806,7 @@ namespace cobra {
 
             auto *new_val = ReconstructIr(
                 *outcome->expr, cand, builder, var_map, freeze_leaves ? &leaf_supply : nullptr,
-                ReuseInstructions() ? &reuse : nullptr
+                ReuseInstructions() ? &reuse : nullptr, outcome->boolean_reading
             );
 
             // A slice was searched and proved on the low bits of its root, so
@@ -3341,6 +3889,14 @@ namespace cobra {
             const size_t cost = emitted.size() + charged;
 
             if (cost >= budget) {
+                if (DetectDebug() && std::getenv("COBRA_BOOLEAN_DEBUG") != nullptr) {
+                    for (const auto *inst : emitted) {
+                        llvm::errs() << "    built" << *inst << "\n";
+                    }
+                    for (const auto *inst : reuse.reused) {
+                        llvm::errs() << "    read " << *inst << "\n";
+                    }
+                }
                 discard_rewrite();
                 ++NumSkippedCost;
                 LLVM_DEBUG(
@@ -3685,6 +4241,7 @@ namespace cobra {
         switch (origin) {
             case CandidateOrigin::kDetected:    return "detected in the function";
             case CandidateOrigin::kBoundaryCut: return "re-read at a bitwise boundary";
+            case CandidateOrigin::kBooleanCut: return "re-read with narrow comparisons taken in";
             case CandidateOrigin::kSharedCut:   return "re-read over its shared values";
             case CandidateOrigin::kRecut:       return "the same root, cut shorter";
             case CandidateOrigin::kInnerRoot:   return "a root the tree buried";
@@ -3827,6 +4384,13 @@ namespace cobra {
         cost("    of which the searches that found one", stats.search_found_nanoseconds);
         if (stats.leaf_identities != 0) {
             part("    a tree equal to one of its inputs (sweep)", stats.leaf_identities);
+        }
+        if (stats.boolean_trees != 0) {
+            part("    trees read with their conditions as variables", stats.boolean_trees);
+            part("      conditions read", stats.boolean_conditions);
+            part("      pairs proved one condition", stats.boolean_merged);
+            part("      pairs the solver could not decide", stats.boolean_undecided);
+            part("      rewrites found", stats.boolean_found);
         }
         cost("  proving by running every input", stats.enumeration_nanoseconds);
         line("  proving in a ring normal form (attempts)", stats.ring_attempted, stats.ring_nanoseconds);

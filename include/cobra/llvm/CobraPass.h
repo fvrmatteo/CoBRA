@@ -110,6 +110,32 @@ namespace cobra {
         // See `LeafFreezing`.
         LeafFreezing leaf_freezing = LeafFreezing::kSound;
 
+        // Read every condition in a rejected tree as a variable of its own.
+        //
+        // A comparison, and the sign bit of a value (`x >> (w - 1)`, which is
+        // also how `ashr x, w - 1` and the low bit of `fshl(a, b, 1)` read), is
+        // 0 or 1 on every input. Searched as part of the word it stands in, it
+        // is out of reach twice over: whether any bit of a word is set is not a
+        // function of the word's bits one at a time, which is all a mixed
+        // Boolean-arithmetic basis can say, and a shift by `w - 1` is not the
+        // same expression at the narrower widths the search solves in. Read as
+        // a variable that is 0 or 1, the tree above it is an ordinary
+        // expression over those variables, and the search can answer it.
+        //
+        // Two such variables that stand for the same condition - or for one
+        // condition and its negation - are one variable, but only once the
+        // solver has proved it over the values the conditions are computed
+        // from; a merge the solver does not prove is not made.
+        //
+        // A rewrite found this way is put back in terms of the conditions it
+        // read and must then be proved equal to the tree by the solver: no
+        // enumeration, ring normal form or `unknown` answer stands in for that
+        // proof. So the reading is only tried with `z3_verify` on, and only for
+        // a tree the ordinary search has already turned down.
+        //
+        // Off by default.
+        bool boolean_variables = false;
+
         bool z3_verify = false;
         Z3VerificationSettings z3_settings;
         TechniqueFamily enabled_families = TechniqueFamily::kAll;

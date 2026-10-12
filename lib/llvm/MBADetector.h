@@ -237,6 +237,11 @@ namespace cobra {
 
     // Whether `node_limit` names a sum group read at the root's own width,
     // rather than a slice of one.
+    // The `node_limit` the boolean cut carries: below the sum groups' band,
+    // so the driver tells it apart from every other reading of the root and
+    // treats it as the partial view it is.
+    constexpr uint32_t kBooleanCutLimit = kSumGroupLimit - kSumGroupRungs;
+
     constexpr bool IsWholeSumGroupLimit(uint32_t node_limit) {
         return IsSumGroupLimit(node_limit)
             && (kSumGroupLimit - node_limit) % (kMaxSliceWidth + 1) == 0;
@@ -312,6 +317,24 @@ namespace cobra {
     // leave their operands opaque, and once it is holding much more than that it
     // is only converging on the full collection that was already rejected — at a
     // candidate, a signature sweep and a solve per rung.
+    // The same root as `cand`, collected again with the comparisons of values
+    // narrower than the tree taken into it (`CobraPassOptions::boolean_variables`).
+    //
+    // An equality or unsigned comparison of narrow values is exact on the
+    // zero-extended values the tree holds, but the ordinary collection keeps
+    // it a leaf: searched as a word, a comparison is opaque anyway. Read with
+    // the conditions as variables it is not - its operands are what the
+    // solver needs to see that it is the same condition as the sign of a
+    // value computed from them, which as a leaf it cannot. It is the one
+    // candidate the boolean reading searches, so it is built for a full
+    // collection whether or not it takes a comparison in; empty when `cand` is
+    // not a full collection.
+    std::vector< MBACandidate > BooleanCutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
+        uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
+    );
+
     std::vector< MBACandidate > RecutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint32_t max_recut_nodes, uint32_t max_recut_vars, uint64_t options_tag,

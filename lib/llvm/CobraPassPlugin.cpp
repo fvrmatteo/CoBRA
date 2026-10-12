@@ -91,6 +91,26 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
                              fpm.addPass(cobra::CobraPass(options));
                              return true;
                          }
+                         // Conditions read as variables, every rewrite proved
+                         // by the solver (`boolean_variables`).
+                         if (name == "cobra-simplify<verified-boolean>") {
+                             cobra::CobraPassOptions options;
+                             options.z3_verify              = true;
+                             options.boolean_variables      = true;
+                             options.enabled_families       = families(options.enabled_families);
+                             options.z3_settings.timeout_ms = timeout(options.z3_settings.timeout_ms);
+                             fpm.addPass(cobra::CobraPass(options));
+                             return true;
+                         }
+                         // The reading asked for without the solver it needs:
+                         // it must then read nothing.
+                         if (name == "cobra-simplify<boolean>") {
+                             cobra::CobraPassOptions options;
+                             options.boolean_variables = true;
+                             options.enabled_families  = families(options.enabled_families);
+                             fpm.addPass(cobra::CobraPass(options));
+                             return true;
+                         }
                          if (name == "cobra-simplify<dying-cost>") {
                              cobra::CobraPassOptions options;
                              options.cost_model       = cobra::MbaCostModel::kDyingInstructions;
