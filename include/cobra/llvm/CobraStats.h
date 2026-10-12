@@ -51,6 +51,7 @@ namespace cobra {
         kRecut,       // the same root, collected to a shorter tree
         kInnerRoot,   // a root the rejected tree buried
         kSlice,       // the same root, read at the width of an extension it holds
+        kSumGroup,    // one group of the root's sum, read at the width of an extension it holds
         kCount
     };
 
@@ -231,6 +232,15 @@ namespace cobra {
         uint64_t slice_proved         = 0;
         uint64_t slice_refuted        = 0;
         uint64_t slice_unknown        = 0;
+        // The sum-group rung: what splitting a root's sum into groups that
+        // share no leaf cost, how many roots came apart, how many groups the
+        // splits held and how many of those groups turned out to be an
+        // extension of their own low bits. A root whose sum does not come apart
+        // costs the split and nothing else.
+        uint64_t sum_group_nanoseconds = 0;
+        uint64_t sum_group_roots       = 0;
+        uint64_t sum_group_split       = 0;
+        uint64_t sum_group_groups      = 0;
 
         CandidateClass by_consumer[static_cast< unsigned >(CandidateConsumer::kCount)];
         CandidateClass by_origin[static_cast< unsigned >(CandidateOrigin::kCount)];

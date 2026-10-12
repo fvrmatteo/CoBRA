@@ -7,6 +7,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Statistic.h"
@@ -16,6 +17,7 @@
 #include "llvm/Support/KnownBits.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -32,6 +34,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <cstdlib>
 #include <queue>
@@ -795,6 +798,14 @@ namespace cobra {
         //
         // `opaque`, when given, names values to keep as leaves wherever the
         // walk meets them (see `SharedCutMbaCandidate`). The root is never one.
+        //
+        // `reads_as`, when given, names values the caller wants read as
+        // something else - zero, for a summand left out of a sum group (see
+        // `SumGroupSliceMbaCandidates`). The substitution is recorded where a
+        // transparent phi's is, so every later reading of the tree follows it
+        // too: the expression, the probe plan and the fingerprint all consult
+        // that map. What the value stands for is walked in its place, so
+        // nothing below it reaches the tree.
         void CollectTree(
             llvm::Instruction *root, uint32_t bw,
             llvm::SmallVector< llvm::Instruction *, 16 > &tree_insts,
@@ -802,7 +813,8 @@ namespace cobra {
             llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
             bool try_phi_transparency = true, uint32_t max_nodes = 0,
             bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
-            const llvm::DenseSet< const llvm::Value * > *opaque = nullptr
+            const llvm::DenseSet< const llvm::Value * > *opaque = nullptr,
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > *reads_as = nullptr
         ) {
             // A re-cut's budget and the cap on any collection are both
             // budgets on the same walk; the tighter one applies.
@@ -824,6 +836,16 @@ namespace cobra {
                 }
 
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
+
+                // Read as something else, on the caller's word, before any
+                // other reading of the value is considered.
+                if (reads_as != nullptr && v != root) {
+                    if (auto it = reads_as->find(v); it != reads_as->end()) {
+                        phi_redirects[v] = it->second;
+                        work.push({ it->second, from_bitwise });
+                        continue;
+                    }
+                }
 
                 // Out of budget: the node is whatever it computes, not how it
                 // computes it. Constants stay constants — turning one into a
@@ -2104,7 +2126,13 @@ namespace cobra {
             llvm::DenseSet< std::pair< llvm::Value *, llvm::Value * > > proven;
             unsigned budget = 4096;
             for (const auto &[phi_val, chosen] : phi_redirects) {
-                auto *phi = llvm::cast< llvm::PHINode >(phi_val);
+                // The map also carries the readings a sum group asked for
+                // (`CollectTree`'s `reads_as`), which are not phis and have no
+                // arms to agree.
+                auto *phi = llvm::dyn_cast< llvm::PHINode >(phi_val);
+                if (phi == nullptr) {
+                    continue;
+                }
                 for (llvm::Value *incoming : phi->incoming_values()) {
                     if (!SameComputation(incoming, chosen, proven, budget)) {
                         return false;
@@ -2192,7 +2220,10 @@ namespace cobra {
             std::vector< uint64_t > slots;
 
             for (const auto &[phi_val, chosen] : phi_redirects) {
-                auto *phi = llvm::cast< llvm::PHINode >(phi_val);
+                auto *phi = llvm::dyn_cast< llvm::PHINode >(phi_val);
+                if (phi == nullptr) {
+                    continue;
+                }
 
                 for (uint32_t probe = 0; probe < kNumProbes; ++probe) {
                     for (uint64_t &input : inputs) {
@@ -2263,15 +2294,216 @@ namespace cobra {
             SliceExtension extension = SliceExtension::kNone;
         };
 
+        // What a sum group is collected for: the root's other summands, each
+        // with the sign it stands at in the root's sum, and which group of the
+        // split this is (see `SumGroupSliceMbaCandidates`). The collection
+        // reads every one of them as zero, so the candidate is the group's own
+        // sum; the rewrite adds them back.
+        struct SumGroup
+        {
+            std::vector< std::pair< llvm::Value *, bool > > residual;
+            uint32_t index = 0;
+        };
+
+        // Whether `inst` stands for the sum of its two operands, so that a
+        // chain above it may be split there. `or` does only when it is
+        // disjoint - the flag that says its operands share no bit, which is
+        // what makes it an addition; without it a split there would not be the
+        // root's value. A constant operand stops the split: a constant has no
+        // leaf support to be grouped by, and reading it as zero would read
+        // every other occurrence of that same constant as zero with it.
+        bool IsSplittableSum(const llvm::Instruction *inst) {
+            if (inst->getNumOperands() != 2
+                || llvm::isa< llvm::Constant >(inst->getOperand(0))
+                || llvm::isa< llvm::Constant >(inst->getOperand(1)))
+            {
+                return false;
+            }
+            switch (inst->getOpcode()) {
+                case llvm::Instruction::Add:
+                case llvm::Instruction::Sub: return true;
+                case llvm::Instruction::Or:
+                    return llvm::cast< llvm::PossiblyDisjointInst >(inst)->isDisjoint();
+                default: return false;
+            }
+        }
+
+        // The candidate's leaves that `v`'s cone reaches - or nothing, when the
+        // cone holds a value the candidate's own lists do not name.
+        //
+        // A phi the collection read through is in neither list: it is not an
+        // instruction of the tree and it is not a leaf, only a reading recorded
+        // beside them. The leaves beneath such a value are unknown, and a
+        // grouping that put a term holding one apart from another could leave a
+        // summand read as zero inside the group that is kept - which would drop
+        // that summand from the root's value altogether. So an unknown cone
+        // refuses the split rather than guessing at it.
+        std::optional< llvm::SmallBitVector > LeafSupportOf(
+            llvm::Value *v, const llvm::DenseMap< const llvm::Value *, unsigned > &leaf_index,
+            const llvm::DenseSet< const llvm::Value * > &tree,
+            llvm::DenseMap< llvm::Value *, llvm::SmallBitVector > &memo
+        ) {
+            if (auto it = memo.find(v); it != memo.end()) {
+                return it->second;
+            }
+            llvm::SmallBitVector support(leaf_index.size());
+            llvm::SmallVector< llvm::Value *, 32 > work{ v };
+            llvm::DenseSet< llvm::Value * > seen;
+            while (!work.empty()) {
+                llvm::Value *node = work.pop_back_val();
+                if (!seen.insert(node).second) {
+                    continue;
+                }
+                if (auto it = leaf_index.find(node); it != leaf_index.end()) {
+                    support.set(it->second);
+                    continue;
+                }
+                if (llvm::isa< llvm::Constant >(node)) {
+                    continue;
+                }
+                auto *inst = llvm::dyn_cast< llvm::Instruction >(node);
+                if (inst == nullptr || !tree.contains(inst)) {
+                    return std::nullopt;
+                }
+                for (auto &op : inst->operands()) {
+                    work.push_back(op.get());
+                }
+            }
+            memo.try_emplace(v, support);
+            return support;
+        }
+
+        // The root's sum, split into groups no two of which share a leaf.
+        struct SumSplit
+        {
+            // One entry per summand: the value, and whether it stands negated
+            // in the root's sum.
+            std::vector< std::pair< llvm::Value *, bool > > terms;
+            // One entry per summand: which group it belongs to.
+            std::vector< uint32_t > group;
+            uint32_t groups = 0;
+        };
+
+        // How many summands a chain is taken apart into before the split is
+        // given up on. The chain is read only as far as it takes to separate
+        // the groups, so this is a guard and not a budget that shapes the
+        // answer.
+        constexpr size_t kMaxSumTerms = 16;
+
+        // Read `cand`'s root as a sum and group its summands by the leaves they
+        // reach.
+        //
+        // The chain is opened one node at a time and only while the groups have
+        // not come apart: the shallowest reading that separates them is the one
+        // kept, so a base the function already computes as one value stays one
+        // summand and the rewrite reads it back instead of building it again.
+        // The node opened is the one reaching the most leaves, which is the one
+        // most likely to be holding two groups together.
+        std::optional< SumSplit > SplitRootSum(const MBACandidate &cand) {
+            if (cand.root == nullptr || !IsSplittableSum(cand.root)) {
+                return std::nullopt;
+            }
+            llvm::DenseMap< const llvm::Value *, unsigned > leaf_index;
+            for (size_t i = 0; i < cand.leaf_values.size(); ++i) {
+                leaf_index.try_emplace(cand.leaf_values[i], static_cast< unsigned >(i));
+            }
+            const llvm::DenseSet< const llvm::Value * > tree(cand.tree.begin(), cand.tree.end());
+            llvm::DenseMap< llvm::Value *, llvm::SmallBitVector > memo;
+
+            std::vector< std::pair< llvm::Value *, bool > > terms{ { cand.root, false } };
+            for (;;) {
+                std::vector< llvm::SmallBitVector > support;
+                support.reserve(terms.size());
+                for (const auto &[term, negated] : terms) {
+                    auto reached = LeafSupportOf(term, leaf_index, tree, memo);
+                    // A term reaching no leaf at all is a value computed from
+                    // constants: reading it as zero is not the same as leaving
+                    // it out, so there is nothing to group it by either.
+                    if (!reached || reached->none()) {
+                        return std::nullopt;
+                    }
+                    support.push_back(std::move(*reached));
+                }
+
+                // Terms that share a leaf are one group, transitively.
+                std::vector< uint32_t > parent(terms.size());
+                std::iota(parent.begin(), parent.end(), 0U);
+                const auto find = [&](uint32_t x) {
+                    while (parent[x] != x) {
+                        parent[x] = parent[parent[x]];
+                        x         = parent[x];
+                    }
+                    return x;
+                };
+                for (size_t i = 0; i < terms.size(); ++i) {
+                    for (size_t j = i + 1; j < terms.size(); ++j) {
+                        if (support[i].anyCommon(support[j])) {
+                            parent[find(static_cast< uint32_t >(i))] =
+                                find(static_cast< uint32_t >(j));
+                        }
+                    }
+                }
+                llvm::DenseMap< uint32_t, uint32_t > label;
+                SumSplit split;
+                split.group.resize(terms.size());
+                for (size_t i = 0; i < terms.size(); ++i) {
+                    const auto root = find(static_cast< uint32_t >(i));
+                    const auto [it, fresh] = label.try_emplace(root, split.groups);
+                    if (fresh) {
+                        ++split.groups;
+                    }
+                    split.group[i] = it->second;
+                }
+                if (split.groups >= 2) {
+                    split.terms = std::move(terms);
+                    return split;
+                }
+
+                // One group still: open the summand reaching the most leaves.
+                size_t widest     = terms.size();
+                unsigned reaching = 0;
+                for (size_t i = 0; i < terms.size(); ++i) {
+                    auto *inst = llvm::dyn_cast< llvm::Instruction >(terms[i].first);
+                    if (inst == nullptr || !tree.contains(inst) || !IsSplittableSum(inst)) {
+                        continue;
+                    }
+                    const auto count = static_cast< unsigned >(support[i].count());
+                    if (widest == terms.size() || count > reaching) {
+                        widest   = i;
+                        reaching = count;
+                    }
+                }
+                if (widest == terms.size() || terms.size() + 1 > kMaxSumTerms) {
+                    return std::nullopt;
+                }
+                auto *node          = llvm::cast< llvm::Instruction >(terms[widest].first);
+                const bool negated  = terms[widest].second;
+                const bool subtract = node->getOpcode() == llvm::Instruction::Sub;
+                terms[widest]       = { node->getOperand(0), negated };
+                terms.push_back({ node->getOperand(1), negated != subtract });
+            }
+        }
+
         void BuildCandidates(
             llvm::ArrayRef< llvm::Instruction * > roots, uint32_t min_ast_size,
             uint32_t max_vars, MbaCostModel cost_model, uint64_t options_tag,
             std::vector< MBACandidate > &candidates, uint32_t max_nodes = 0,
             bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
             const DemandedMaskFn &demanded = {}, const SharedCut *shared_cut = nullptr,
-            const Slice *slice = nullptr
+            const Slice *slice = nullptr, const SumGroup *sum_group = nullptr
         ) {
             const auto *opaque = shared_cut != nullptr ? &shared_cut->opaque : nullptr;
+            // The summands this group leaves out, read as zero wherever the
+            // collection meets them. Zero is the identity of every operation
+            // the sum chain is built from, and a summand stands in that chain
+            // once, so what the root reads as is the group's own sum.
+            llvm::DenseMap< llvm::Value *, llvm::Value * > zeroed;
+            if (sum_group != nullptr) {
+                for (const auto &[term, negated] : sum_group->residual) {
+                    zeroed[term] = llvm::Constant::getNullValue(term->getType());
+                }
+            }
+            const auto *reads_as = sum_group != nullptr ? &zeroed : nullptr;
             llvm::DenseSet< llvm::Instruction * > already_in_tree;
 
             for (auto *root : roots) {
@@ -2306,7 +2538,7 @@ namespace cobra {
                 CollectTree(
                     &inst, bw, tree_insts, leaves, phi_redirects,
                     /*try_phi_transparency=*/true, max_nodes, cut_arith_under_bitwise,
-                    max_tree_nodes, opaque
+                    max_tree_nodes, opaque, reads_as
                 );
 
                 // The sweep below is 2^leaves, so every leaf doubles the price
@@ -2334,14 +2566,22 @@ namespace cobra {
                 // gate ran first, so a phi read through to a constant arm made a
                 // tree look two nodes small and declined it before the leaf it
                 // really is was ever seen.)
-                if (!phi_redirects.empty() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
+                // Only the transparent phis have arms to agree; a reading a
+                // sum group asked for is in the same map (`CollectTree`) and
+                // is not one.
+                const auto has_phi_redirect = [&] {
+                    return llvm::any_of(phi_redirects, [](const auto &entry) {
+                        return llvm::isa< llvm::PHINode >(entry.first);
+                    });
+                };
+                if (has_phi_redirect() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
                     tree_insts.clear();
                     leaves.clear();
                     phi_redirects.clear();
                     CollectTree(
                         &inst, bw, tree_insts, leaves, phi_redirects,
                         /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
-                        max_tree_nodes, opaque
+                        max_tree_nodes, opaque, reads_as
                     );
                     if (leaves.size() > std::min(max_vars, kPreElimCap)) {
                         continue;
@@ -2433,7 +2673,7 @@ namespace cobra {
                     return choice == nullptr || std::string_view(choice) != "off";
                 }();
                 if (skip_unchanged && max_nodes == 0 && !cut_arith_under_bitwise
-                    && shared_cut == nullptr && slice == nullptr
+                    && shared_cut == nullptr && slice == nullptr && sum_group == nullptr
                     && FingerprintUnchanged(inst, fingerprint, options_tag))
                 {
                     ++NumFingerprintSkips;
@@ -2539,7 +2779,7 @@ namespace cobra {
                     llvm::any_of(tree_insts, [](const llvm::Instruction *ti) {
                         return IsTransparentFreeze(ti);
                     });
-                const bool poison_reaches_root = phi_redirects.empty() && !spans_freeze
+                const bool poison_reaches_root = !has_phi_redirect() && !spans_freeze
                     && llvm::none_of(tree_insts, [](const llvm::Instruction *ti) {
                            return llvm::isa< llvm::SelectInst >(ti);
                        });
@@ -2562,8 +2802,11 @@ namespace cobra {
                                   .tree        = { tree_insts.begin(), tree_insts.end() },
                                   .dying       = { dying.begin(), dying.end() },
                                   .poison_reaches_root = poison_reaches_root,
-                                  .node_limit = slice != nullptr
-                                      ? SliceNodeLimit(slice->width)
+                                  .node_limit = sum_group != nullptr
+                                      ? SumGroupNodeLimit(
+                                            sum_group->index, slice != nullptr ? slice->width : 0
+                                        )
+                                      : slice != nullptr ? SliceNodeLimit(slice->width)
                                       : shared_cut != nullptr ? shared_cut->node_limit
                                       : cut_arith_under_bitwise ? kBoundaryCutLimit
                                                                 : max_nodes,
@@ -2578,7 +2821,9 @@ namespace cobra {
                                       }
                                   ),
                                   .slice_extension = slice != nullptr ? slice->extension
-                                                                     : SliceExtension::kNone }
+                                                                     : SliceExtension::kNone,
+                                  .sum_residual = sum_group != nullptr ? sum_group->residual
+                                      : std::vector< std::pair< llvm::Value *, bool > >{} }
                 );
             }
         }
@@ -2708,8 +2953,12 @@ namespace cobra {
         // own expression crosses widths. A `ptradd` root is an address, whose
         // every bit is live (`BuildCandidates`), so there is no narrower
         // reading of it either.
-        if (cand.root == nullptr || cand.node_limit != 0 || ByteGepOf(cand.root) != nullptr
-            || !cand.root->getType()->isIntegerTy())
+        // Only a full collection, of the root or of one group of its sum: a cut
+        // is a partial view of the root, so the extensions it happens to hold
+        // say nothing about where the root's own expression crosses widths.
+        if (cand.root == nullptr
+            || (cand.node_limit != 0 && !IsWholeSumGroupLimit(cand.node_limit))
+            || ByteGepOf(cand.root) != nullptr || !cand.root->getType()->isIntegerTy())
         {
             return widths;
         }
@@ -2770,6 +3019,75 @@ namespace cobra {
             && !llvm::is_contained(candidates.front().tree, candidates.front().root))
         {
             candidates.clear();
+        }
+        return candidates;
+    }
+
+    std::vector< MBACandidate > SumGroupSliceMbaCandidates(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, const SumGroupExtensionFn &is_extension,
+        MbaCostModel cost_model, uint32_t max_tree_nodes, const DemandedMaskFn &demanded
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr || cand.node_limit != 0 || ByteGepOf(cand.root) != nullptr
+            || !cand.root->getType()->isIntegerTy() || !is_extension)
+        {
+            return candidates;
+        }
+        const uint32_t bw = cand.root->getType()->getIntegerBitWidth();
+        if (bw > 64) {
+            return candidates;
+        }
+        const auto split = SplitRootSum(cand);
+        if (!split || split->groups < 2 || split->groups > kMaxSumGroups) {
+            return candidates;
+        }
+
+        for (uint32_t index = 0; index < split->groups; ++index) {
+            SumGroup group;
+            group.index = index;
+            for (size_t term = 0; term < split->terms.size(); ++term) {
+                if (split->group[term] != index) {
+                    group.residual.push_back(split->terms[term]);
+                }
+            }
+
+            // The group read at the root's own width: the expression the claim
+            // about it is proved over. It is never queued - what the search is
+            // handed is the narrow reading below.
+            std::vector< MBACandidate > whole;
+            BuildCandidates(
+                { cand.root }, min_ast_size, max_vars, cost_model, options_tag, whole, 0,
+                /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded,
+                /*shared_cut=*/nullptr, /*slice=*/nullptr, &group
+            );
+            // The root has no reading with the rest of the sum left out: the
+            // collection kept it as a leaf, so the candidate is the root read
+            // back as itself. (The tree is no smaller than the whole sum's,
+            // and must not be asked to be: a summand left out is often a leaf
+            // of the full reading already, and what the group changes is which
+            // leaves the tree stands on, not how many nodes it holds.)
+            if (whole.empty() || !llvm::is_contained(whole.front().tree, whole.front().root)) {
+                continue;
+            }
+            const auto read = is_extension(whole.front());
+            if (!read || read->second == SliceExtension::kNone || read->first < 2
+                || read->first > kMaxSliceWidth || read->first >= bw)
+            {
+                continue;
+            }
+
+            const Slice cut{ .width = read->first, .extension = read->second };
+            std::vector< MBACandidate > sliced;
+            BuildCandidates(
+                { cand.root }, min_ast_size, max_vars, cost_model, options_tag, sliced, 0,
+                /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded,
+                /*shared_cut=*/nullptr, &cut, &group
+            );
+            if (sliced.empty() || !llvm::is_contained(sliced.front().tree, sliced.front().root)) {
+                continue;
+            }
+            candidates.push_back(std::move(sliced.front()));
         }
         return candidates;
     }

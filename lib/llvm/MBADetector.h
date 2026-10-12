@@ -178,6 +178,13 @@ namespace cobra {
         // rewrite replaces the root with that extension of what the narrow bits
         // were rewritten into, so the replacement has the root's own type.
         SliceExtension slice_extension = SliceExtension::kNone;
+
+        // For a candidate that reads one group of the root's sum: the root's
+        // other summands, each with the sign it stands at in that sum (see
+        // `SumGroupSliceMbaCandidates`). The collection read them as zero, so
+        // the candidate is the group alone; the rewrite adds them back, which
+        // is what makes the root's value again.
+        std::vector< std::pair< llvm::Value *, bool > > sum_residual;
     };
 
     // The `node_limit` a boundary cut carries: past any re-cut ladder, so the
@@ -207,6 +214,32 @@ namespace cobra {
 
     constexpr bool IsSliceCutLimit(uint32_t node_limit) {
         return node_limit < kSliceCutLimit && node_limit >= kSliceCutLimit - kMaxSliceWidth;
+    }
+
+    // The `node_limit`s a sum group carries: a band of its own below the
+    // slices, holding one rung per (group, width) pair, so that the groups of
+    // one root are told apart from each other and from every other reading of
+    // it - `attempted` is keyed on the pair - and so that the driver treats a
+    // group as the partial view of the root it is. Width zero is the group read
+    // at the root's own width, which is what the extension claim is proved
+    // over.
+    constexpr uint32_t kMaxSumGroups  = 8;
+    constexpr uint32_t kSumGroupRungs = kMaxSumGroups * (kMaxSliceWidth + 1);
+    constexpr uint32_t kSumGroupLimit = kSliceCutLimit - kMaxSliceWidth - 1;
+
+    constexpr uint32_t SumGroupNodeLimit(uint32_t index, uint32_t width) {
+        return kSumGroupLimit - (index * (kMaxSliceWidth + 1) + width);
+    }
+
+    constexpr bool IsSumGroupLimit(uint32_t node_limit) {
+        return node_limit <= kSumGroupLimit && node_limit > kSumGroupLimit - kSumGroupRungs;
+    }
+
+    // Whether `node_limit` names a sum group read at the root's own width,
+    // rather than a slice of one.
+    constexpr bool IsWholeSumGroupLimit(uint32_t node_limit) {
+        return IsSumGroupLimit(node_limit)
+            && (kSumGroupLimit - node_limit) % (kMaxSliceWidth + 1) == 0;
     }
 
     // Find MBA candidates across a function.  Blocks are scanned in
@@ -386,6 +419,60 @@ namespace cobra {
     std::vector< MBACandidate > SliceMbaCandidate(
         const MBACandidate &cand, uint32_t width, SliceExtension extension,
         uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
+        MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,
+        const DemandedMaskFn &demanded = {}
+    );
+
+    // The groups of the root's sum that are worth reading on their own, each
+    // already read at the width the caller's claim about it names.
+    //
+    // The slice reading above is the one thing that gets through an identity
+    // written across a width boundary, and it is asked about the root: is the
+    // root the extension of its own low bits? A base added into the sum is
+    // enough to make the answer no. `DllBase + 136 + sext(e)`, which is what an
+    // image walk computes, is written by the obfuscator as
+    // `DllBase + 136 + u - 2*(u & n) - z` over `u = zext(e ^ trunc n)`,
+    // `n = -(e >> 31)` and `z = e >> 31`; the part standing on `e` is a sign
+    // extension and reads as `e` at 32 bits, but the whole sum is no extension
+    // of anything - its high bits are the base's - and the slice is refused on
+    // the root. The expression then stands as written however many of its own
+    // identities would fold, and every pointer built on it reads as an
+    // unrelated value.
+    //
+    // So the sum is split before the question is asked. The root's summands are
+    // read off the `add`/`sub`/disjoint-`or` chain at the top of its tree, each
+    // one is given the set of the candidate's leaves its cone reaches, and the
+    // summands are grouped so that no two groups share a leaf. A group is then
+    // collected as a candidate of its own: the same root, with the other
+    // summands read as zero, which is exactly the group's sum because a summand
+    // stands in the chain once and zero is the identity of every operation
+    // above it. What the rewrite replaces the root with is that group's answer
+    // plus the summands left out, read back from the IR they are already
+    // computed in - so a group that folds to one instruction costs one more.
+    //
+    // Grouping by leaf support is what makes the zeroing exact. A summand whose
+    // cone reaches a leaf of another group is in that group, so no value read as
+    // zero can be reached from inside the group that is kept - and a value that
+    // appeared in both would have had its term silently dropped. Constants have
+    // no support and always join the residual: `136 + sext(e)` is not the
+    // extension of its own low bits either, and leaving the constant out costs
+    // nothing, since the rewrite adds it back as an operand.
+    //
+    // `is_extension` is asked of each group, read at the root's own width, and
+    // answers at what width and as which extension that group may be read -
+    // the same question `SliceToRead` answers about a whole root, over the
+    // group's own expression. A group it declines is dropped; a group it
+    // accepts is returned collected at that width, carrying both the extension
+    // and the residual.
+    //
+    // Returns nothing for a cut, for a `ptradd` root, for a root whose sum does
+    // not split, and for a split with more than `kMaxSumGroups` groups.
+    using SumGroupExtensionFn = std::function<
+        std::optional< std::pair< uint32_t, SliceExtension > >(const MBACandidate &) >;
+
+    std::vector< MBACandidate > SumGroupSliceMbaCandidates(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, const SumGroupExtensionFn &is_extension,
         MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,
         const DemandedMaskFn &demanded = {}
     );

@@ -590,6 +590,10 @@ namespace cobra {
             into.slice_proved += run.slice_proved;
             into.slice_refuted += run.slice_refuted;
             into.slice_unknown += run.slice_unknown;
+            into.sum_group_nanoseconds += run.sum_group_nanoseconds;
+            into.sum_group_roots += run.sum_group_roots;
+            into.sum_group_split += run.sum_group_split;
+            into.sum_group_groups += run.sum_group_groups;
             into.background_submitted += run.background_submitted;
             into.background_solved += run.background_solved;
             into.background_unknown += run.background_unknown;
@@ -1672,7 +1676,9 @@ namespace cobra {
         // every rewrite's output recorded), `dce` (whole-function sweep),
         // `slice` (no root is re-read at an extension's width; with
         // `COBRA_SEXT=leaf` beside it, the two halves of the cross-width
-        // change), `leaf-width` (a leaf identity is offered as a bare variable
+        // change), `sum-group` (a root's sum is never split into groups that
+        // share no leaf, so a width-crossing identity with a base added into it
+        // stays out of reach), `leaf-width` (a leaf identity is offered as a bare variable
         // rather than as the tree reads the leaf, which refuses every tree whose
         // answer is a leaf narrower than it).
         bool Old(std::string_view behaviour) {
@@ -2788,6 +2794,37 @@ namespace cobra {
                     );
                 }
                 stats.slice_nanoseconds += since(slice_begin);
+
+                // Then the same question about one group of the root's sum. A
+                // base added into the sum is enough to refuse the slice above -
+                // the high bits of `DllBase + 136 + sext(e)` are the base's, so
+                // the root is the extension of nothing - while the part
+                // standing on `e` is a sign extension and reads as `e` at 32
+                // bits. The groups that share no leaf come apart, and the
+                // question is asked of each (`SumGroupSliceMbaCandidates`).
+                //
+                // Only when the slice of the whole root found nothing: a root
+                // that *is* an extension of its low bits is already the
+                // smaller problem, and splitting its sum would hand the search
+                // the same identity with a residual to add back.
+                const auto sum_begin = std::chrono::steady_clock::now();
+                std::vector< MBACandidate > groups;
+                if (slices.empty() && !Old("sum-group")) {
+                    ++stats.sum_group_roots;
+                    groups = SumGroupSliceMbaCandidates(
+                        cand, options_.min_ast_size, options_.max_vars, options_tag,
+                        [&](const MBACandidate &group) {
+                            return SliceToRead(group, options_, stats);
+                        },
+                        options_.cost_model, options_.max_tree_nodes, demanded
+                    );
+                    if (!groups.empty()) {
+                        ++stats.sum_group_split;
+                        stats.sum_group_groups += groups.size();
+                    }
+                }
+                stats.sum_group_nanoseconds += since(sum_begin);
+
                 // The boundary cut: it is the one reading of the root
                 // the ladder below cannot reach, and it costs a single solve.
                 auto boundary = BoundaryCutMbaCandidate(
@@ -2836,6 +2873,14 @@ namespace cobra {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
                         origins.push_back(CandidateOrigin::kSlice);
+                        ++stats.requeued;
+                    }
+                }
+                for (auto &cut : groups) {
+                    if (attempted.insert({ cut.root, cut.node_limit }).second) {
+                        queue_key(cut);
+                        candidates.push_back(std::move(cut));
+                        origins.push_back(CandidateOrigin::kSumGroup);
                         ++stats.requeued;
                     }
                 }
@@ -3213,6 +3258,23 @@ namespace cobra {
                 );
             }
 
+            // And the summands the candidate left out of the root's sum
+            // (`SumGroupSliceMbaCandidates`): the group is what the search
+            // answered, the residual is the rest of the root's value, and the
+            // root is the two added. The summands are read from the IR that
+            // already computes them - they are operands of the sum chain, so
+            // they dominate the root - and no flag is carried over: the sum is
+            // re-associated, so the intermediate values are not the ones the
+            // old chain's `nsw` and `nuw` were asserted of. Built here, before
+            // the emitted instructions are gathered, so every one of them is
+            // priced with the rest of the rewrite.
+            if (new_val != nullptr) {
+                for (const auto &[term, negated] : cand.sum_residual) {
+                    new_val = negated ? builder.CreateSub(new_val, term, "cobra.sum")
+                                      : builder.CreateAdd(new_val, term, "cobra.sum");
+                }
+            }
+
             llvm::SmallVector< llvm::Instruction *, 16 > emitted;
             for (auto it = kAtFront ? block->begin() : std::next(kMark); &*it != cand.root;
                  ++it)
@@ -3586,6 +3648,8 @@ namespace cobra {
             case CandidateOrigin::kRecut:       return "the same root, cut shorter";
             case CandidateOrigin::kInnerRoot:   return "a root the tree buried";
             case CandidateOrigin::kSlice:       return "re-read at an extension's width";
+            case CandidateOrigin::kSumGroup:
+                return "one group of its sum, at an extension's width";
             case CandidateOrigin::kCount:       break;
         }
         return "?";
@@ -3809,6 +3873,12 @@ namespace cobra {
             out << "    slices asked " << stats.slice_asked << ", proved " << stats.slice_proved
                 << ", refuted " << stats.slice_refuted << ", unknown " << stats.slice_unknown
                 << "\n";
+        }
+        cost("  ladder: sum groups", stats.sum_group_nanoseconds);
+        if (stats.sum_group_roots != 0) {
+            out << "    sums split " << stats.sum_group_split << " of " << stats.sum_group_roots
+                << " asked, into " << stats.sum_group_groups
+                << " group(s) read at an extension's width\n";
         }
 
         table("by where the candidate came from", "origin", stats.by_origin,
