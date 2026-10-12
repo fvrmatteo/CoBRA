@@ -1670,6 +1670,15 @@ namespace cobra {
             return poisoning;
         }
 
+        // `COBRA_DETECT_DEBUG=1`: whether the per-candidate trace is on. The
+        // detector prints the roots it declined under the same flag
+        // (`DeclinedRoot`); this is for the gates the driver applies after a
+        // candidate has been built.
+        bool DetectDebug() {
+            static const bool enabled = std::getenv("COBRA_DETECT_DEBUG") != nullptr;
+            return enabled;
+        }
+
         // `COBRA_OLD=<a,b,...>` puts individual behaviours back as they were,
         // for measuring what each one changes on a workload: `flags`
         // (readers keep their flags), `fingerprint` (budget rejections and
@@ -3330,6 +3339,17 @@ namespace cobra {
                                  << " instructions and keeps " << charged
                                  << " against a budget of " << budget << "\n"
                 );
+                // The one gate the trace could not name. A candidate the search
+                // answered and the budget turned down reads as "solved" beside
+                // one whose rewrite reached the function, so a rewrite that is
+                // found and then priced out is invisible - which is exactly the
+                // case to act on, because it says the answer is there and the
+                // reconstruction is what is too expensive.
+                if (DetectDebug()) {
+                    llvm::errs() << "cobra: priced out" << *cand.root << "  [cut "
+                                 << cand.node_limit << "] -> built " << emitted.size()
+                                 << ", kept " << charged << ", budget " << budget << "\n";
+                }
                 const uint64_t rebuilding = since(rebuild_begin);
                 stats.rebuild_nanoseconds += rebuilding;
                 stats.rejected_nanoseconds += rebuilding;

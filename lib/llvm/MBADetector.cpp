@@ -277,6 +277,7 @@ namespace cobra {
                 case llvm::Instruction::Xor:
                 case llvm::Instruction::Shl:
                 case llvm::Instruction::LShr:
+                case llvm::Instruction::AShr:
                 case llvm::Instruction::ZExt:
                 case llvm::Instruction::SExt:
                 case llvm::Instruction::Trunc:
@@ -454,6 +455,7 @@ namespace cobra {
                 case llvm::Instruction::Or:
                 case llvm::Instruction::Xor:
                 case llvm::Instruction::LShr:
+                case llvm::Instruction::AShr:
                 case llvm::Instruction::Trunc:
                 case llvm::Instruction::ZExt:
                 case llvm::Instruction::SExt:
@@ -568,6 +570,55 @@ namespace cobra {
                 return 0;
             }
             return uint64_t{ 1 } << (source->getIntegerBitWidth() - 1);
+        }
+
+        // The bit the sign lands on when an arithmetic right shift is read as
+        // the ring expression `(lshr(v, c) ^ H) - H`, as a mask over the
+        // shifted value's own width - or zero when the shift is not modelled
+        // that way and stays a leaf.
+        //
+        // `ashr(v, c)` on a value of `w` bits held zero-extended is the logical
+        // shift with the sign copied into the `c` bits it vacated, and
+        // `H = 2^(w-1-c)` is where that sign bit lands: flipping it adds or
+        // subtracts `H`, and subtracting it back leaves the value where the bit
+        // was clear and the value with every higher bit set where it was set.
+        // The same identity a sign extension is read by
+        // (`SignBitOfExtensionSource`), one shift further down, and exact at
+        // any width in the operators the model already has.
+        //
+        // Left as a leaf, an `ashr` cuts the value it shifts off from every
+        // other reading of that value, which is the whole of an identity the
+        // obfuscator writes across it: `zext(x ^ m) ^ sext(m)` is `sext x` only
+        // when `m` is `ashr(x, 31)`, and with the shift a leaf `m` and `x` are
+        // two independent variables and the identity is not there to find.
+        //
+        // Zero for a variable amount, which has no expression at all; for an
+        // amount at or past the value's own width, which is poison; and for a
+        // value wider than the tree, whose sign bit is not in the tree to begin
+        // with. `COBRA_ASHR=leaf` restores the reading this replaced, so what
+        // modelling it is worth stays a measurement on a workload.
+        //
+        // One answer for the three readings of a tree, for the reason
+        // `SignBitOfExtensionSource` gives.
+        uint64_t AShrSignBit(const llvm::Instruction *inst, uint32_t bw) {
+            static const bool leaf = [] {
+                const char *mode = std::getenv("COBRA_ASHR");
+                return mode != nullptr && std::string_view(mode) == "leaf";
+            }();
+            if (leaf || inst->getOpcode() != llvm::Instruction::AShr
+                || !inst->getType()->isIntegerTy())
+            {
+                return 0;
+            }
+            const uint32_t width = inst->getType()->getIntegerBitWidth();
+            if (width == 0 || width > bw) {
+                return 0;
+            }
+            const auto *amount = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
+            if (amount == nullptr || amount->getValue().uge(width)) {
+                return 0;
+            }
+            return uint64_t{ 1 } << (width - 1 - amount->getZExtValue());
         }
 
         // Whether a node wider than the tree has an exact reading at the tree's
@@ -724,6 +775,15 @@ namespace cobra {
             // mask that keeps a subset of them is exact whatever sits above.
             if (inst->getOpcode() == llvm::Instruction::Trunc) {
                 return inst->getOperand(0)->getType()->isIntegerTy();
+            }
+
+            // An arithmetic right shift is the logical one with the sign copied
+            // into the bits it vacated, which is a ring expression at the
+            // value's own width - asked of the same helper the two readings
+            // below use, so a shift the model has no expression for stays a
+            // leaf rather than being collected and then read as a logical one.
+            if (inst->getOpcode() == llvm::Instruction::AShr) {
+                return AShrSignBit(inst, bw) != 0;
             }
 
             return true;
@@ -1415,6 +1475,20 @@ namespace cobra {
                         return Emit(Op::kXor, lhs, rhs);
                     case llvm::Instruction::LShr:
                         return Emit(Op::kLShr, lhs, rhs);
+                    case llvm::Instruction::AShr: {
+                        // The logical shift with the sign copied in
+                        // (`AShrSignBit`). A shift the model has no expression
+                        // for never reaches here: the collection kept it as a
+                        // leaf.
+                        const uint64_t sign = AShrSignBit(inst, bits_);
+                        if (sign == 0) {
+                            return kZeroSlot;
+                        }
+                        const uint32_t bit = ConstSlot(sign);
+                        return MaskToWidth(
+                            v, Emit(Op::kSub, Emit(Op::kXor, Emit(Op::kLShr, lhs, rhs), bit), bit)
+                        );
+                    }
                     case llvm::Instruction::Shl:
                         return MaskToWidth(v, Emit(Op::kShl, lhs, rhs));
                     default:
@@ -1808,6 +1882,30 @@ namespace cobra {
                     return nullptr;
                 }
                 return Expr::LogicalShr(std::move(child), shift_amt->getZExtValue());
+            }
+
+            // AShr with constant shift amount: the logical shift with the sign
+            // copied into the bits it vacated (`AShrSignBit`), written with the
+            // same two's complement the sign extension above uses.
+            if (inst->getOpcode() == llvm::Instruction::AShr) {
+                const uint64_t sign = AShrSignBit(inst, tree_width);
+                const auto *shift_amt = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
+                if (sign == 0 || shift_amt == nullptr) {
+                    return nullptr;
+                }
+                auto child = BuildExprFromIRImpl(
+                    inst->getOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
+                    budget, leaf_bits
+                );
+                if (child == nullptr) {
+                    return nullptr;
+                }
+                auto shifted =
+                    Expr::LogicalShr(std::move(child), shift_amt->getZExtValue());
+                auto flipped = Expr::BitwiseXor(std::move(shifted), Expr::Constant(sign));
+                return mask_to_width(
+                    Expr::Add(std::move(flipped), Expr::Constant((~sign + 1) & mask))
+                );
             }
 
             // Shl with constant shift amount
