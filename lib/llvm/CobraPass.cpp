@@ -1412,6 +1412,9 @@ namespace cobra {
             return true;
         }
 
+        // `COBRA_OLD` (defined below, declared here because the search needs it).
+        bool Old(std::string_view behaviour);
+
         // Search for a rewrite of one candidate and put it through the cost
         // gate. Returns null when either rejects it, and otherwise a rewrite that
         // still has to be verified (`VerifyCandidate`).
@@ -1474,11 +1477,23 @@ namespace cobra {
             // the borrow no technique of the search above reads them. Random
             // full-width inputs say which input it is; the proof decides, so this
             // is only offered when the sweep makes such proofs affordable.
+            //
+            // The leaf is phrased the way the tree reads it (`LeafExpr`), not as
+            // a bare variable. Where a leaf is narrower than the tree every
+            // reading of the tree masks it to its own width, so a bare variable
+            // is a different function and the probe below fails on an identity
+            // that holds. That hid the whole family wherever the value an
+            // obfuscator rebuilt had been read at a narrower width than the
+            // arithmetic above it - a 32-bit read summed into a 64-bit address,
+            // say - which is most of where this shape is written.
             const bool searched = result.has_value() && result.value().kind == SimplifyOutcome::Kind::kSimplified;
             if (!searched && options.z3_verify && options.z3_settings.sweep && ast != nullptr) {
                 const auto count = static_cast< uint32_t >(cand.var_names.size());
                 for (uint32_t index = 0; index < count; ++index) {
-                    auto leaf = Expr::Variable(index);
+                    auto leaf = Old("leaf-width") ? Expr::Variable(index) : LeafExpr(cand, index);
+                    if (leaf == nullptr) {
+                        continue;
+                    }
                     if (FullWidthCheckEval(cand.evaluator, count, *leaf, cand.bitwidth, 32).passed) {
                         ++stats.leaf_identities;
                         verdict = SolveVerdict::kSolved;
@@ -1657,7 +1672,9 @@ namespace cobra {
         // every rewrite's output recorded), `dce` (whole-function sweep),
         // `slice` (no root is re-read at an extension's width; with
         // `COBRA_SEXT=leaf` beside it, the two halves of the cross-width
-        // change).
+        // change), `leaf-width` (a leaf identity is offered as a bare variable
+        // rather than as the tree reads the leaf, which refuses every tree whose
+        // answer is a leaf narrower than it).
         bool Old(std::string_view behaviour) {
             static const std::string chosen = [] {
                 const char *value = std::getenv("COBRA_OLD");
@@ -2297,6 +2314,12 @@ namespace cobra {
                 task->input.expr          = cand.expr ? CloneExpr(*cand.expr) : nullptr;
                 task->input.evaluator     = cand.evaluator;
                 task->input.demanded_mask = cand.demanded_mask;
+                // How the tree reads each leaf. Facts, not IR: a candidate the
+                // search phrases over a leaf has to be phrased the same way
+                // here as on the loop (`LeafExpr`), or the worker answers a
+                // different question and its answer is the one the cache keeps.
+                task->input.leaf_bits     = cand.leaf_bits;
+                task->input.leaf_widths   = cand.leaf_widths;
                 // The proof's budget is scaled by it (`ProofBudgetScale`). Without it a
                 // worker proved every rewrite at the unscaled budget, ran out of time on
                 // the larger trees, and left the loop to ask the same question again at
@@ -3018,7 +3041,11 @@ namespace cobra {
                                  << ", tree " << cand.tree.size() << ", vars "
                                  << cand.var_names.size() << "] -> "
                                  << (outcome == nullptr ? "rejected" : "solved")
-                                 << (served_from_cache ? " (cached)" : "") << "\n";
+                                 << (served_from_cache ? " (cached)" : "")
+                                 << (outcome == nullptr && !RejectReason().empty()
+                                         ? ": " + RejectReason()
+                                         : std::string())
+                                 << "\n";
                 }
             }
             const uint64_t solve_ms = spent / 1000000;

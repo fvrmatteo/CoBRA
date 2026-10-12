@@ -15,14 +15,33 @@ message(STATUS "LLVM pass tests: opt=${OPT_BIN} FileCheck=${FILECHECK_BIN}")
 
 # A test named `test_*_verified.ll` holds a comparison, which the pass only
 # rewrites under a proof: it runs with `cobra-simplify<verified>` and needs the
-# solver backend. One named `test_*_dying_cost.ll` is about what a rewrite
-# removes, and runs with `cobra-simplify<dying-cost>`.
+# solver backend. One named `test_*_verified_sweep.ll` also wants the word-level
+# sweep, which is what makes the proofs of a tree equal to one of its own inputs
+# affordable. One named `test_*_dying_cost.ll` is about what a rewrite removes,
+# and runs with `cobra-simplify<dying-cost>`.
+#
+# A test may also pin the environment the pass runs in, next to the test itself:
+#
+#     ; COBRA_ENV: COBRA_FAMILIES=semilinear COBRA_TIMEOUT_MS=10000
+#
+# Two things are worth pinning there. The technique families, because a consumer
+# enables its own set (the LLVM-IR pass is configured per project) and with every
+# family on one of them may answer the question a test about what the *search*
+# cannot do is asking - so the test would pass for a reason the consumer never
+# sees. And the proof budget, because a rewrite that needs a proof is otherwise
+# accepted or declined by how fast the machine happened to be, which makes the
+# test flaky under load rather than wrong.
 function(cobra_add_ll_test TEST_FILE)
     get_filename_component(TEST_NAME "${TEST_FILE}" NAME_WE)
     set(FULL_NAME "LLVMPass.${TEST_NAME}")
     set(FULL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/${TEST_FILE}")
     set(PIPELINE "cobra-simplify")
-    if(TEST_NAME MATCHES "_verified$")
+    if(TEST_NAME MATCHES "_verified_sweep$")
+        if(NOT COBRA_VERIFY_BACKEND)
+            return()
+        endif()
+        set(PIPELINE "cobra-simplify<verified-sweep>")
+    elseif(TEST_NAME MATCHES "_verified$")
         if(NOT COBRA_VERIFY_BACKEND)
             return()
         endif()
@@ -31,11 +50,23 @@ function(cobra_add_ll_test TEST_FILE)
         set(PIPELINE "cobra-simplify<dying-cost>")
     endif()
 
+    file(STRINGS "${FULL_PATH}" ENV_LINES REGEX "^; COBRA_ENV:")
+    set(TEST_ENV "")
+    if(ENV_LINES)
+        list(GET ENV_LINES 0 ENV_LINE)
+        string(REGEX REPLACE "^; COBRA_ENV:[ \t]*" "" ENV_TEXT "${ENV_LINE}")
+        string(STRIP "${ENV_TEXT}" ENV_TEXT)
+        string(REPLACE " " ";" TEST_ENV "${ENV_TEXT}")
+    endif()
+
     add_test(
         NAME "${FULL_NAME}"
         COMMAND sh -c "${OPT_BIN} -load-pass-plugin=$<TARGET_FILE:CobraPass> -passes='${PIPELINE}' -S '${FULL_PATH}' | ${FILECHECK_BIN} '${FULL_PATH}'"
     )
     set_tests_properties("${FULL_NAME}" PROPERTIES LABELS "llvm")
+    if(TEST_ENV)
+        set_tests_properties("${FULL_NAME}" PROPERTIES ENVIRONMENT "${TEST_ENV}")
+    endif()
 endfunction()
 
 file(GLOB LL_TEST_FILES "*.ll")

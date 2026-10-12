@@ -251,8 +251,20 @@ namespace cobra {
                     const auto &bits     = candidate.leaf_bits[leaf_idx];
                     const uint64_t width = candidate.bitwidth >= 64 ? ~uint64_t{ 0 }
                                                                     : (uint64_t{ 1 } << candidate.bitwidth) - 1;
+                    // The bits above a narrow leaf's own width are known zero
+                    // too - `NarrowWidth` masks them wherever the leaf is read,
+                    // which is why `LeafBitsOf` leaves them out as "not news" -
+                    // so a mask that only keeps those bits clear says nothing
+                    // either, and emitting it would price the answer one
+                    // instruction higher than it is.
+                    uint64_t zero = bits.zero;
+                    if (leaf_idx < candidate.leaf_widths.size()) {
+                        if (const auto own = candidate.leaf_widths[leaf_idx]; own != 0) {
+                            zero |= ~((own >= 64 ? ~uint64_t{ 0 } : (uint64_t{ 1 } << own) - 1)) & width;
+                        }
+                    }
                     const bool redundant = expr.kind == Expr::Kind::kAnd
-                        ? ((~bits.zero & width) & ~mask.constant_val) == 0
+                        ? ((~zero & width) & ~mask.constant_val) == 0
                         : (mask.constant_val & width & ~bits.one) == 0;
                     return redundant ? child(variable) : nullptr;
                 };

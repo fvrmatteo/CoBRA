@@ -42,11 +42,13 @@ define i32 @halves_sign(i16 %x) {
 ; And with the high half taken from a zero extension. This one needs no slice
 ; and does not get one: a zero extension's high bits are zero at the root's own
 ; width too, so the halves do present a common root there and the ordinary
-; reading folds it to a mask of the low half, which is what a zero extension is.
-; The shape is here because it is the other half of the family, and to pin that
-; it stays a one-instruction answer.
+; reading folds it to the low half, which is what a zero extension is. The shape
+; is here because it is the other half of the family, and to pin that the answer
+; is a value the function already held: the mask that reading writes says only
+; what the leaf's own width already says, so it is not emitted (`LeafBits`, and
+; the narrow-leaf half of it in `IRReconstructor`).
 ; CHECK-LABEL: @halves_zero(
-; CHECK: %[[Z:.*]] = and i32 %lo, 65535
+; CHECK: %[[Z:.*]] = zext i16 %x to i32
 ; CHECK-NEXT: ret i32 %[[Z]]
 define i32 @halves_zero(i16 %x) {
   %zx = zext i16 %x to i32

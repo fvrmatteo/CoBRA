@@ -95,6 +95,16 @@ namespace cobra {
         std::vector< llvm::Value * > leaf_values;
         // One entry per leaf; what the reconstruction may drop a mask against.
         std::vector< LeafBits > leaf_bits;
+        // One entry per leaf: the leaf's own integer width when that is
+        // narrower than the tree, and zero when the leaf is as wide as the tree
+        // reads it (`NarrowWidth`).
+        //
+        // Kept beside `leaf_bits` rather than read off `leaf_values` because a
+        // worker thread is handed the candidate without its IR, and the leaf's
+        // width is part of how the tree reads the leaf - so a reading that needs
+        // it has to find it here or answer differently on a worker than on the
+        // loop, which is how a leaf identity came to depend on `COBRA_THREADS`.
+        std::vector< uint32_t > leaf_widths;
         std::vector< std::string > var_names;
         std::vector< uint64_t > sig;
         uint32_t bitwidth;
@@ -379,6 +389,27 @@ namespace cobra {
         MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,
         const DemandedMaskFn &demanded = {}
     );
+
+    // The leaf widths of `leaves` as a tree of width `bw` reads them: the
+    // leaf's own width where that is narrower, zero where it is not.
+    std::vector< uint32_t >
+    LeafWidthsOf(const std::vector< llvm::Value * > &leaves, uint32_t bw);
+
+    // The expression the tree reads leaf `index` as: the variable, masked to
+    // the leaf's own width where that is narrower than the tree, and then by
+    // what is known of its bits (`LeafBits`).
+    //
+    // Every reading of a tree agrees on this - `BuildExprFromIR` builds the
+    // leaf this way inside the expression, and the probe plan hands the
+    // evaluator the same masked value (`MaskToWidth`, `ApplyLeafBits`) - so a
+    // candidate phrased over a leaf has to be phrased this way too. A bare
+    // `Expr::Variable` is a *different function* wherever the leaf is narrower
+    // than the tree, and a check that probes the one against the other fails on
+    // an identity that holds: the probe hands the leaf a full-width value, the
+    // tree masks it and the bare variable does not.
+    //
+    // Returns nothing for an index the candidate has no leaf for.
+    std::unique_ptr< Expr > LeafExpr(const MBACandidate &cand, uint32_t index);
 
     // Record `fp` on `inst` so a later run can skip the tree rooted there.
     void RecordMbaFingerprint(

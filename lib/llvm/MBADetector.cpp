@@ -2544,10 +2544,13 @@ namespace cobra {
                            return llvm::isa< llvm::SelectInst >(ti);
                        });
 
+                // Before `leaves` is moved into the candidate.
+                auto leaves_copy = leaves;
                 candidates.push_back(
                     MBACandidate{ .root        = &inst,
                                   .leaf_values = std::move(leaves),
                                   .leaf_bits   = leaf_bits,
+                                  .leaf_widths = LeafWidthsOf(leaves_copy, bw),
                                   .var_names   = std::move(var_names),
                                   .sig         = std::move(sig),
                                   .bitwidth    = bw,
@@ -2873,6 +2876,36 @@ namespace cobra {
             fp.structure = MixFingerprint(fp.structure, mask);
         }
         return fp;
+    }
+
+    std::vector< uint32_t >
+    LeafWidthsOf(const std::vector< llvm::Value * > &leaves, const uint32_t bw) {
+        std::vector< uint32_t > widths(leaves.size());
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            widths[i] = NarrowWidth(leaves[i], bw);
+        }
+        return widths;
+    }
+
+    std::unique_ptr< Expr > LeafExpr(const MBACandidate &cand, const uint32_t index) {
+        if (index >= cand.leaf_widths.size()) {
+            return nullptr;
+        }
+        const uint64_t mask = Bitmask(cand.bitwidth);
+        auto leaf           = Expr::Variable(index);
+        if (const uint32_t width = cand.leaf_widths[index]; width != 0) {
+            leaf = Expr::BitwiseAnd(std::move(leaf), Expr::Constant(Bitmask(width)));
+        }
+        if (index < cand.leaf_bits.size()) {
+            const auto &bits = cand.leaf_bits[index];
+            if (bits.zero != 0) {
+                leaf = Expr::BitwiseAnd(std::move(leaf), Expr::Constant(~bits.zero & mask));
+            }
+            if (bits.one != 0) {
+                leaf = Expr::BitwiseOr(std::move(leaf), Expr::Constant(bits.one & mask));
+            }
+        }
+        return leaf;
     }
 
     void RecordMbaFingerprint(
