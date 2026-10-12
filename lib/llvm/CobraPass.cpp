@@ -45,6 +45,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -1906,7 +1907,7 @@ namespace cobra {
         // Search for a rewrite of one candidate and put it through the cost
         // gate. Returns null when either rejects it, and otherwise a rewrite that
         // still has to be verified (`VerifyCandidate`).
-        OutcomeCache::Entry ProposeRewrite(
+        OutcomeCache::Entry ProposeOrdinaryRewrite(
             const MBACandidate &cand, const CobraPassOptions &options, SolveVerdict &verdict,
             CobraStatistics &stats
         ) {
@@ -1920,21 +1921,6 @@ namespace cobra {
             };
             verdict = SolveVerdict::kUnsolved;
             RejectReason().clear();
-            // The boolean cut is collected for the boolean reading alone: its
-            // narrow comparisons are opaque to every other search.
-            if (cand.node_limit == kBooleanCutLimit) {
-#ifdef COBRA_HAS_Z3
-                if (options.boolean_variables) {
-                    auto outcome = ProposeBooleanRewrite(cand, options, stats);
-                    if (outcome != nullptr) {
-                        verdict = SolveVerdict::kSolved;
-                    }
-                    return outcome;
-                }
-#endif
-                RejectReason() = "a boolean cut without the boolean reading";
-                return nullptr;
-            }
             Options opts{ .bitwidth         = cand.bitwidth,
                           .max_vars         = options.max_vars,
                           .spot_check       = true,
@@ -2084,6 +2070,72 @@ namespace cobra {
                 .verified           = false });
         }
 
+        // Search for a rewrite of one candidate and put it through the cost gate
+        // (`ProposeOrdinaryRewrite`), and with `boolean_variables` read its
+        // conditions as variables (`ProposeBooleanRewrite`) - first for a tree that
+        // compares, and otherwise where the search finds nothing:
+        // on every reading of a root - the full collection, its re-cuts and the
+        // cuts that keep a shared value whole, where the operand of a sign bit is a
+        // leaf and the rewrite is the shift the function already holds - and alone
+        // on the boolean cut, whose narrow comparisons every other search reads as
+        // opaque.
+        OutcomeCache::Entry ProposeRewrite(
+            const MBACandidate &cand, const CobraPassOptions &options, SolveVerdict &verdict,
+            CobraStatistics &stats
+        ) {
+            if (cand.node_limit == kBooleanCutLimit) {
+                verdict = SolveVerdict::kUnsolved;
+                RejectReason().clear();
+#ifdef COBRA_HAS_Z3
+                if (options.boolean_variables) {
+                    auto outcome = ProposeBooleanRewrite(cand, options, stats);
+                    if (outcome != nullptr) {
+                        verdict = SolveVerdict::kSolved;
+                    }
+                    return outcome;
+                }
+#endif
+                RejectReason() = "a boolean cut without the boolean reading";
+                return nullptr;
+            }
+#ifdef COBRA_HAS_Z3
+            const bool reads_conditions =
+                options.boolean_variables && options.z3_verify && cand.expr != nullptr;
+            // A tree that compares goes to the reading of its conditions first. The
+            // search fits a comparison to probes that almost never land where it
+            // turns (`ProposeOrdinaryRewrite` says why), so what it proposes for
+            // such a tree is mostly a guess the proof then refutes - and a refuted
+            // proposal is the candidate's last word: the reading would never be
+            // asked.
+            if (reads_conditions && ContainsComparison(*cand.expr)) {
+                verdict = SolveVerdict::kUnsolved;
+                RejectReason().clear();
+                if (auto outcome = ProposeBooleanRewrite(cand, options, stats)) {
+                    verdict = SolveVerdict::kSolved;
+                    return outcome;
+                }
+                const std::string reason = RejectReason();
+                auto ordinary = ProposeOrdinaryRewrite(cand, options, verdict, stats);
+                if (ordinary == nullptr && !reason.empty()) {
+                    RejectReason() += "; " + reason;
+                }
+                return ordinary;
+            }
+#endif
+            auto ordinary = ProposeOrdinaryRewrite(cand, options, verdict, stats);
+#ifdef COBRA_HAS_Z3
+            if (ordinary == nullptr && reads_conditions) {
+                const std::string reason = RejectReason();
+                if (auto outcome = ProposeBooleanRewrite(cand, options, stats)) {
+                    verdict = SolveVerdict::kSolved;
+                    return outcome;
+                }
+                RejectReason() = reason + (RejectReason().empty() ? "" : "; " + RejectReason());
+            }
+#endif
+            return ordinary;
+        }
+
         // `COBRA_RING_PROOF=0` sends every question past the enumeration to the
         // solver, as before the ring normal form existed.
         bool RingProofEnabled() {
@@ -2135,7 +2187,22 @@ namespace cobra {
         // `freeze`'s operand (it stops poison) and a phi's (only one arm is
         // read). The root is poison wherever such a leaf is, so a rewrite that
         // reads one adds no poison and the leaf needs no freeze for it.
-        llvm::DenseSet< const llvm::Value * > LeavesPoisoningTheRoot(const MBACandidate &cand) {
+        //
+        // `through_both_arms` (a rewrite of the boolean reading) also follows a
+        // `select` into its arms for the leaves both of them carry: such a leaf
+        // is poison in the arm taken whichever it is, so the `select` is poison
+        // with it. A condition the reading puts back over a value chosen by a
+        // `select` reads what both arms are computed from - a hash and its
+        // negation, say - and frozen for the arm it could have skipped, that leaf
+        // matches nothing the function holds.
+        llvm::DenseSet< const llvm::Value * > LeavesPoisoningBothArms(const MBACandidate &cand);
+
+        llvm::DenseSet< const llvm::Value * > LeavesPoisoningTheRoot(
+            const MBACandidate &cand, bool through_both_arms = false
+        ) {
+            if (through_both_arms) {
+                return LeavesPoisoningBothArms(cand);
+            }
             const llvm::DenseSet< const llvm::Value * > tree(cand.tree.begin(), cand.tree.end());
             const llvm::DenseSet< const llvm::Value * > leaves(
                 cand.leaf_values.begin(), cand.leaf_values.end()
@@ -2167,6 +2234,51 @@ namespace cobra {
                 }
             }
             return poisoning;
+        }
+
+        llvm::DenseSet< const llvm::Value * > LeavesPoisoningBothArms(const MBACandidate &cand) {
+            const llvm::DenseSet< const llvm::Value * > tree(cand.tree.begin(), cand.tree.end());
+            const llvm::DenseSet< const llvm::Value * > leaves(
+                cand.leaf_values.begin(), cand.leaf_values.end()
+            );
+            // The leaves whose poison makes each value poison, memoised: the tree is
+            // a DAG, and a value read twice is asked about once.
+            llvm::DenseMap< const llvm::Value *, llvm::DenseSet< const llvm::Value * > > poisons;
+            const std::function< const llvm::DenseSet< const llvm::Value * > &(const llvm::Value *) >
+                of = [&](const llvm::Value *value) -> const llvm::DenseSet< const llvm::Value * > & {
+                if (auto found = poisons.find(value); found != poisons.end()) {
+                    return found->second;
+                }
+                // Placed first, so a value met again on its own path (a phi the
+                // collection looked through) reads as poisoning nothing.
+                poisons[value];
+                llvm::DenseSet< const llvm::Value * > result;
+                const auto *inst = llvm::dyn_cast< llvm::Instruction >(value);
+                if (leaves.contains(value)) {
+                    result.insert(value);
+                } else if (inst == nullptr || !tree.contains(inst) || llvm::isa< llvm::FreezeInst >(inst)
+                           || llvm::isa< llvm::PHINode >(inst))
+                {
+                    // Stops poison, or is not part of the tree.
+                } else if (const auto *select = llvm::dyn_cast< llvm::SelectInst >(inst)) {
+                    const auto cond = of(select->getCondition());
+                    result.insert(cond.begin(), cond.end());
+                    const auto then_poisons = of(select->getTrueValue());
+                    const auto &else_poisons = of(select->getFalseValue());
+                    for (const auto *leaf : then_poisons) {
+                        if (else_poisons.contains(leaf)) {
+                            result.insert(leaf);
+                        }
+                    }
+                } else {
+                    for (const llvm::Value *operand : inst->operands()) {
+                        const auto operand_poisons = of(operand);
+                        result.insert(operand_poisons.begin(), operand_poisons.end());
+                    }
+                }
+                return poisons[value] = std::move(result);
+            };
+            return of(cand.root);
         }
 
         // `COBRA_DETECT_DEBUG=1`: whether the per-candidate trace is on. The
@@ -3753,7 +3865,48 @@ namespace cobra {
             // marks `!noundef` and `noundef` arguments are known not to be
             // `undef`, so this rarely costs anything.
             std::vector< uint32_t > reads(cand.leaf_values.size(), 0);
-            {
+            if (outcome->boolean_reading) {
+                // Built with each distinct sub-expression once (`ReconstructIr`'s
+                // `condition_forms`), so a leaf is read once per distinct reader:
+                // the reading of a `select` spells its else arm twice and a
+                // condition put back over its values repeats what they share,
+                // and counted per occurrence such a leaf would be frozen for
+                // reads the IR never makes - and, frozen, match no instruction
+                // the function already holds.
+                std::vector< const Expr * > distinct;
+                std::unordered_multimap< size_t, const Expr * > seen;
+                llvm::SmallVector< const Expr *, 32 > pending{ outcome->expr.get() };
+                while (!pending.empty()) {
+                    const Expr *node = pending.pop_back_val();
+                    const size_t hash = std::hash< Expr >{}(*node);
+                    const auto range  = seen.equal_range(hash);
+                    if (std::any_of(range.first, range.second, [&](const auto &entry) {
+                            return ExprStructurallyEqual(*entry.second, *node);
+                        }))
+                    {
+                        continue;
+                    }
+                    seen.emplace(hash, node);
+                    distinct.push_back(node);
+                    for (const auto &child : node->children) {
+                        pending.push_back(child.get());
+                    }
+                }
+                const auto read = [&](const Expr &node) {
+                    if (node.kind == Expr::Kind::kVariable) {
+                        const uint32_t leaf = var_map.empty() ? node.var_index : var_map[node.var_index];
+                        if (leaf < reads.size()) {
+                            ++reads[leaf];
+                        }
+                    }
+                };
+                read(*outcome->expr);
+                for (const Expr *node : distinct) {
+                    for (const auto &child : node->children) {
+                        read(*child);
+                    }
+                }
+            } else {
                 llvm::SmallVector< const Expr *, 32 > pending{ outcome->expr.get() };
                 while (!pending.empty()) {
                     const Expr *node = pending.pop_back_val();
@@ -3770,7 +3923,7 @@ namespace cobra {
             }
             LeafSupply leaf_supply;
             const bool poison_owed = cand.spans_freeze || cand.spans_select;
-            const auto poisoning   = poison_owed ? LeavesPoisoningTheRoot(cand)
+            const auto poisoning   = poison_owed ? LeavesPoisoningTheRoot(cand, outcome->boolean_reading)
                                                  : llvm::DenseSet< const llvm::Value * >{};
             leaf_supply.values     = cand.leaf_values;
             leaf_supply.freeze_on_use.reserve(cand.leaf_values.size());

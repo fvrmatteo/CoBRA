@@ -11,6 +11,7 @@
 #include "llvm/IR/Value.h"
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace cobra {
@@ -198,10 +199,64 @@ namespace cobra {
 
     } // namespace
 
+    namespace {
+        // Under `condition_forms`, each structurally distinct sub-expression of the
+        // rewrite is built once and read wherever it repeats. The reading of a
+        // `select` spells its else arm twice, and a condition put back over the
+        // values it was computed from repeats what they share; built once, a leaf
+        // beneath them is read once, which is what lets the caller count its reads
+        // over distinct sub-expressions when it decides what to freeze
+        // (`LeafReadsOverDistinctSubtrees`) - without depending on `IrReuse`
+        // finding the copy among a leaf's first readers.
+        struct SubtreeMemo
+        {
+            std::unordered_multimap< size_t, std::pair< const Expr *, llvm::Value * > > built;
+        };
+
+        llvm::Value *ReconstructNode(
+            const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
+            const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse,
+            bool condition_forms, SubtreeMemo *memo
+        );
+
+        llvm::Value *Reconstruct(
+            const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
+            const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse,
+            bool condition_forms, SubtreeMemo *memo
+        ) {
+            if (memo == nullptr || expr.kind == Expr::Kind::kConstant) {
+                return ReconstructNode(expr, candidate, builder, var_map, leaves, reuse, condition_forms, memo);
+            }
+            const size_t hash = std::hash< Expr >{}(expr);
+            const auto range  = memo->built.equal_range(hash);
+            for (auto it = range.first; it != range.second; ++it) {
+                if (ExprStructurallyEqual(*it->second.first, expr)) {
+                    return it->second.second;
+                }
+            }
+            auto *value = ReconstructNode(expr, candidate, builder, var_map, leaves, reuse, condition_forms, memo);
+            memo->built.emplace(hash, std::make_pair(&expr, value));
+            return value;
+        }
+    } // namespace
+
     llvm::Value *ReconstructIr(
         const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
         const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse,
         bool condition_forms
+    ) {
+        SubtreeMemo memo;
+        return Reconstruct(
+            expr, candidate, builder, var_map, leaves, reuse, condition_forms,
+            condition_forms ? &memo : nullptr
+        );
+    }
+
+    namespace {
+    llvm::Value *ReconstructNode(
+        const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
+        const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse,
+        bool condition_forms, SubtreeMemo *memo
     ) {
         auto *int_ty = builder.getIntNTy(candidate.bitwidth);
         const auto leaf_value = [&](uint32_t index) -> llvm::Value * {
@@ -221,12 +276,12 @@ namespace cobra {
             return leaves->values[index];
         };
         const auto child = [&](unsigned index) {
-            return ReconstructIr(
-                *expr.children[index], candidate, builder, var_map, leaves, reuse, condition_forms
+            return Reconstruct(
+                *expr.children[index], candidate, builder, var_map, leaves, reuse, condition_forms, memo
             );
         };
         const auto build = [&](const Expr &node) {
-            return ReconstructIr(node, candidate, builder, var_map, leaves, reuse, condition_forms);
+            return Reconstruct(node, candidate, builder, var_map, leaves, reuse, condition_forms, memo);
         };
         // A comparison as the `i1` it is, its predicate inverted when `^ 1`
         // flips it; null for anything else.
@@ -436,5 +491,6 @@ namespace cobra {
         }
         return nullptr; // unreachable
     }
+    } // namespace
 
 } // namespace cobra
