@@ -397,3 +397,18 @@ TEST(SemilinearNormalizerTest, StructuralHashDedup) {
     // Verify structural hash is populated
     EXPECT_NE(result.value().atom_table[0].structural_hash, 0ULL);
 }
+
+// `(a * 2^k) & c` reads the mask `c` as a constant. A mask spelled with
+// arithmetic - `-8` as `Neg(8)`, as a parser writes it before folding - is a
+// constant all the same, and must be read as one rather than as zero.
+TEST(NormalizerTest, ScaledMaskReadsAnArithmeticConstant) {
+    auto e = Expr::BitwiseAnd(
+        Expr::Mul(Expr::Variable(0), Expr::Constant(8)), Expr::Negate(Expr::Constant(8))
+    );
+    auto ir = NormalizeToSemilinear(*e, { "x" }, 64);
+    ASSERT_TRUE(ir.has_value());
+    // `(8x) & -8` is `8x`: one term, not the constant zero.
+    EXPECT_EQ(ir.value().constant, 0u);
+    ASSERT_EQ(ir.value().terms.size(), 1u);
+    EXPECT_EQ(ir.value().terms[0].coeff, 8u);
+}

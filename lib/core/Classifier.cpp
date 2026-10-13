@@ -362,6 +362,29 @@ namespace cobra {
                     return info;
                 }
 
+                case Expr::Kind::kCmpEq:
+                case Expr::Kind::kCmpUlt:
+                case Expr::Kind::kCmpSlt: {
+                    // Opaque (see `IsComparison`): a 0/1 value that depends on
+                    // its operands through no ring or bitwise law, so it reads
+                    // as an arithmetic atom over their variables - never as the
+                    // constant it would be if it depended on none.
+                    auto lhs = ClassifyNode(*expr.children[0]);
+                    auto rhs = ClassifyNode(*expr.children[1]);
+
+                    NodeInfo info;
+                    info.has_var_dep          = lhs.has_var_dep || rhs.has_var_dep;
+                    info.is_polynomial        = lhs.is_polynomial || rhs.is_polynomial;
+                    info.has_arith_var_dep    = info.has_var_dep;
+                    info.has_const_in_bitwise = lhs.has_const_in_bitwise || rhs.has_const_in_bitwise;
+                    info.flags                = lhs.flags | rhs.flags;
+                    info.has_non_leaf_bitwise =
+                        lhs.has_non_leaf_bitwise || rhs.has_non_leaf_bitwise;
+                    info.var_mask       = 0;
+                    info.max_var_degree = 0;
+                    return info;
+                }
+
                 default:
                     return {};
             }

@@ -50,92 +50,6 @@ namespace cobra {
             });
         }
 
-        uint64_t EvalConstantBitwise(const Expr &expr, uint64_t mask) {
-            switch (expr.kind) {
-                case Expr::Kind::kConstant:
-                    return expr.constant_val & mask;
-                case Expr::Kind::kAnd:
-                    return EvalConstantBitwise(*expr.children[0], mask)
-                        & EvalConstantBitwise(*expr.children[1], mask);
-                case Expr::Kind::kOr:
-                    return EvalConstantBitwise(*expr.children[0], mask)
-                        | EvalConstantBitwise(*expr.children[1], mask);
-                case Expr::Kind::kXor:
-                    return EvalConstantBitwise(*expr.children[0], mask)
-                        ^ EvalConstantBitwise(*expr.children[1], mask);
-                case Expr::Kind::kNot:
-                    return (~EvalConstantBitwise(*expr.children[0], mask)) & mask;
-                case Expr::Kind::kShr: {
-                    const uint64_t kVal = EvalConstantBitwise(*expr.children[0], mask);
-                    return ModShr(kVal, expr.constant_val, 64) & mask;
-                }
-                case Expr::Kind::kVariable:
-                case Expr::Kind::kAdd:
-                case Expr::Kind::kMul:
-                case Expr::Kind::kNeg:
-                // Comparisons are not bitwise, so IsPurelyBitwise keeps them
-                // away from this function; EvalConstantArith evaluates them.
-                case Expr::Kind::kCmpEq:
-                case Expr::Kind::kCmpUlt:
-                case Expr::Kind::kCmpSlt:
-                    break;
-            }
-            return 0;
-        }
-
-        uint64_t EvalConstantArith(const Expr &expr, uint64_t mask, uint32_t bitwidth) {
-            switch (expr.kind) {
-                case Expr::Kind::kConstant:
-                    return expr.constant_val & mask;
-                case Expr::Kind::kNeg: {
-                    const uint64_t kVal = EvalConstantArith(*expr.children[0], mask, bitwidth);
-                    return ModNeg(kVal, bitwidth);
-                }
-                case Expr::Kind::kAdd: {
-                    const uint64_t kLhs = EvalConstantArith(*expr.children[0], mask, bitwidth);
-                    const uint64_t kRhs = EvalConstantArith(*expr.children[1], mask, bitwidth);
-                    return (kLhs + kRhs) & mask;
-                }
-                case Expr::Kind::kMul: {
-                    const uint64_t kLhs = EvalConstantArith(*expr.children[0], mask, bitwidth);
-                    const uint64_t kRhs = EvalConstantArith(*expr.children[1], mask, bitwidth);
-                    return (kLhs * kRhs) & mask;
-                }
-                case Expr::Kind::kShr: {
-                    const uint64_t kVal = EvalConstantArith(*expr.children[0], mask, bitwidth);
-                    // ModShr guards shift count >= 64 by returning 0;
-                    // sibling EvalConstantBitwise above already routes
-                    // shifts through ModShr — keep the convention uniform.
-                    return ModShr(kVal, expr.constant_val, bitwidth);
-                }
-                case Expr::Kind::kAnd:
-                case Expr::Kind::kOr:
-                case Expr::Kind::kXor:
-                case Expr::Kind::kNot:
-                    return EvalConstantBitwise(expr, mask);
-                // A variable-free comparison folds to 0 or 1 exactly, and this
-                // function is reached for every variable-free subtree.
-                case Expr::Kind::kCmpEq:
-                    return ModCmpEq(
-                        EvalConstantArith(*expr.children[0], mask, bitwidth),
-                        EvalConstantArith(*expr.children[1], mask, bitwidth), bitwidth
-                    );
-                case Expr::Kind::kCmpUlt:
-                    return ModCmpUlt(
-                        EvalConstantArith(*expr.children[0], mask, bitwidth),
-                        EvalConstantArith(*expr.children[1], mask, bitwidth), bitwidth
-                    );
-                case Expr::Kind::kCmpSlt:
-                    return ModCmpSlt(
-                        EvalConstantArith(*expr.children[0], mask, bitwidth),
-                        EvalConstantArith(*expr.children[1], mask, bitwidth), bitwidth
-                    );
-                case Expr::Kind::kVariable:
-                    break;
-            }
-            return 0;
-        }
-
         bool HasConstant(const Expr &expr) {
             if (expr.kind == Expr::Kind::kConstant) { return true; }
             return std::ranges::any_of(expr.children, [](const auto &child) {
@@ -269,7 +183,7 @@ namespace cobra {
                     const auto &const_child = kLhsConst ? *expr.children[0] : *expr.children[1];
                     const auto &var_child   = kLhsConst ? *expr.children[1] : *expr.children[0];
 
-                    const uint64_t kC = EvalConstantBitwise(const_child, ctx.mask);
+                    const uint64_t kC = EvalConstantExpr(const_child, ctx.bitwidth);
 
                     // +a with current coefficient
                     auto var_result = CollectTerms(ctx, var_child, coeff);
@@ -306,7 +220,7 @@ namespace cobra {
                     if (!HasVariable(lhs) || HasVariable(rhs)) { continue; }
                     // lhs = ~a, rhs = c (constant)
                     const auto &inner  = *lhs.children[0];
-                    const uint64_t kC  = EvalConstantBitwise(rhs, ctx.mask);
+                    const uint64_t kC  = EvalConstantExpr(rhs, ctx.bitwidth);
                     auto and_expr      = Expr::BitwiseAnd(CloneExpr(inner), Expr::Constant(kC));
                     AtomId and_aid     = RegisterAtom(ctx, *and_expr);
                     uint64_t and_coeff = ModNeg(coeff, ctx.bitwidth);
@@ -324,7 +238,7 @@ namespace cobra {
 
             // No variables: fold to constant
             if (!HasVariable(expr)) {
-                const uint64_t kVal = EvalConstantArith(expr, ctx.mask, ctx.bitwidth);
+                const uint64_t kVal = EvalConstantExpr(expr, ctx.bitwidth);
                 return { .constant = (coeff * kVal) & ctx.mask, .terms = {} };
             }
 
@@ -349,7 +263,7 @@ namespace cobra {
                         const auto &candidate_factor = *product.children[which];
                         const auto &candidate_value  = *product.children[1 - which];
                         if (HasVariable(candidate_factor) || !HasVariable(candidate_value)) { continue; }
-                        const uint64_t f = EvalConstantArith(candidate_factor, ctx.mask, ctx.bitwidth);
+                        const uint64_t f = EvalConstantExpr(candidate_factor, ctx.bitwidth);
                         if (f != 0 && (f & (f - 1)) == 0) {
                             scaled = &candidate_value;
                             factor = f;
@@ -358,7 +272,7 @@ namespace cobra {
                     if (scaled == nullptr) { continue; }
                     unsigned shift = 0;
                     while ((factor >> shift) != 1) { ++shift; }
-                    const uint64_t kC = EvalConstantBitwise(mask, ctx.mask);
+                    const uint64_t kC = EvalConstantExpr(mask, ctx.bitwidth);
                     auto masked = Expr::BitwiseAnd(CloneExpr(*scaled), Expr::Constant((kC >> shift) & ctx.mask));
                     return CollectTerms(ctx, *masked, (coeff * factor) & ctx.mask);
                 }
@@ -385,13 +299,13 @@ namespace cobra {
 
                     if (kLhsConst) {
                         const uint64_t kC =
-                            EvalConstantArith(*expr.children[0], ctx.mask, ctx.bitwidth);
+                            EvalConstantExpr(*expr.children[0], ctx.bitwidth);
                         const uint64_t kNewCoeff = (coeff * kC) & ctx.mask;
                         return CollectTerms(ctx, *expr.children[1], kNewCoeff);
                     }
                     if (kRhsConst) {
                         const uint64_t kC =
-                            EvalConstantArith(*expr.children[1], ctx.mask, ctx.bitwidth);
+                            EvalConstantExpr(*expr.children[1], ctx.bitwidth);
                         const uint64_t kNewCoeff = (coeff * kC) & ctx.mask;
                         return CollectTerms(ctx, *expr.children[0], kNewCoeff);
                     }
@@ -407,7 +321,7 @@ namespace cobra {
                                  .terms    = { { .coeff = coeff, .atom_id = aid } } };
                     }
                     if (!HasVariable(expr)) {
-                        const uint64_t kVal = EvalConstantArith(expr, ctx.mask, ctx.bitwidth);
+                        const uint64_t kVal = EvalConstantExpr(expr, ctx.bitwidth);
                         return { .constant = (coeff * kVal) & ctx.mask, .terms = {} };
                     }
                     ctx.encountered_nonlinear = true;

@@ -10,6 +10,7 @@
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/PatternMatcher.h"
 #include "cobra/core/Profile.h"
+#include "cobra/core/RingProof.h"
 #include "cobra/core/ShiftLifting.h"
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/core/SignatureEval.h"
@@ -1251,6 +1252,77 @@ namespace cobra {
             }
             return bound;
         }
+
+        // `outcome.expr` in the index space of `vars`, or null when its
+        // variables cannot be placed there.
+        std::unique_ptr< Expr > InInputSpace(
+            const SimplifyOutcome &outcome, const std::vector< std::string > &vars
+        ) {
+            auto answer = CloneExpr(*outcome.expr);
+            if (outcome.real_vars.empty() || outcome.real_vars.size() == vars.size()) {
+                return answer;
+            }
+            const auto support = TryBuildVarSupport(vars, outcome.real_vars);
+            if (!support.has_value()) { return nullptr; }
+            RemapVarIndices(*answer, *support);
+            return answer;
+        }
+
+        // Whether the answer `Simplify` is about to give agrees with its input
+        // on the demanded bits, at full width. The orchestrator checks the
+        // candidate it picks, but several paths return before it - the
+        // demanded-mask and dynamic-mask solves, the seeds - and the one it
+        // checks is rewritten once more (`CleanupFinalExpr`) after the check;
+        // this is the one check every answer passes through.
+        bool AgreesWithInput(
+            const SimplifyOutcome &outcome, const std::vector< std::string > &vars,
+            const Expr *input_expr, const Options &opts
+        ) {
+            if (input_expr == nullptr && !opts.evaluator) { return true; }
+            auto answer = InInputSpace(outcome, vars);
+            if (answer == nullptr) { return false; }
+            const uint64_t mask = opts.demanded_mask & Bitmask(opts.bitwidth);
+            const Evaluator truth =
+                opts.evaluator ? opts.evaluator : Evaluator::FromExpr(*input_expr, opts.bitwidth);
+            const auto kArity = static_cast< uint32_t >(vars.size());
+            if (mask == Bitmask(opts.bitwidth)) {
+                return FullWidthCheckEval(
+                           truth, kArity, *answer, opts.bitwidth, kFinalAnswerProbeCount
+                )
+                    .passed;
+            }
+            const Evaluator masked(
+                [truth, mask](const std::vector< uint64_t > &values) {
+                    return truth(values) & mask;
+                },
+                kArity, EvaluatorTraceKind::kNone
+            );
+            auto masked_answer = Expr::BitwiseAnd(std::move(answer), Expr::Constant(mask));
+            return FullWidthCheckEval(
+                       masked, kArity, *masked_answer, opts.bitwidth, kFinalAnswerProbeCount
+            )
+                .passed;
+        }
+
+        // Whether an answer for an input holding a comparison is proved. A
+        // comparison is true on a vanishing fraction of its inputs, so no
+        // probe - the orchestrator's evidence - is evidence about it; only the
+        // ring normal form proves such an answer without a solver.
+        bool ProvedOverComparisons(
+            const SimplifyOutcome &outcome, const std::vector< std::string > &vars,
+            const Expr &input_expr, const Options &opts
+        ) {
+            auto answer = InInputSpace(outcome, vars);
+            if (answer == nullptr) { return false; }
+            const uint64_t mask = opts.demanded_mask & Bitmask(opts.bitwidth);
+            if (mask == Bitmask(opts.bitwidth)) {
+                return ProveEqualByRingNormalForm(input_expr, *answer, opts.bitwidth);
+            }
+            const auto masked_input =
+                Expr::BitwiseAnd(CloneExpr(input_expr), Expr::Constant(mask));
+            const auto masked_answer = Expr::BitwiseAnd(std::move(answer), Expr::Constant(mask));
+            return ProveEqualByRingNormalForm(*masked_input, *masked_answer, opts.bitwidth);
+        }
     } // namespace
 
     // A result has to be a function of the inputs. The lifting passes stand a
@@ -1272,22 +1344,31 @@ namespace cobra {
             return result;
         }
         auto &outcome      = result.value();
+        const auto refuse  = [&](const char *reason) {
+            outcome.kind     = SimplifyOutcome::Kind::kUnchangedUnsupported;
+            outcome.expr     = input_expr != nullptr ? CloneExpr(*input_expr) : nullptr;
+            outcome.real_vars.clear();
+            outcome.verified = false;
+            outcome.diag.reason_code =
+                ReasonCode{ ReasonCategory::kGuardFailed, ReasonDomain::kOrchestrator, 0 };
+            outcome.diag.reason = reason;
+            return std::move(result);
+        };
         const auto &names  = outcome.real_vars.empty() ? vars : outcome.real_vars;
         const bool foreign = std::any_of(
             outcome.real_vars.begin(), outcome.real_vars.end(), [&](const std::string &name) {
                 return std::find(vars.begin(), vars.end(), name) == vars.end();
             }
         );
-        if (!foreign && VariableBound(*outcome.expr) <= names.size()) {
-            return result;
+        if (foreign || VariableBound(*outcome.expr) > names.size()) {
+            return refuse("the result reads a variable that is not an input");
         }
-        outcome.kind     = SimplifyOutcome::Kind::kUnchangedUnsupported;
-        outcome.expr     = input_expr != nullptr ? CloneExpr(*input_expr) : nullptr;
-        outcome.real_vars.clear();
-        outcome.verified = false;
-        outcome.diag.reason_code =
-            ReasonCode{ ReasonCategory::kGuardFailed, ReasonDomain::kOrchestrator, 0 };
-        outcome.diag.reason = "the result reads a variable that is not an input";
+        if (!AgreesWithInput(outcome, vars, input_expr, opts)) {
+            return refuse("the result disagrees with the input");
+        }
+        if (input_expr != nullptr && outcome.verified && ContainsComparison(*input_expr)) {
+            outcome.verified = ProvedOverComparisons(outcome, vars, *input_expr, opts);
+        }
         return result;
     }
 
@@ -1344,24 +1425,32 @@ namespace cobra {
         // no right shifts, try solving g under bitwidth=m. Modular
         // arithmetic for {+, -, *, &, |, ^, ~} is homomorphic, so
         // (2^m - 1) & f(x)|_{bw=64} = f(x)|_{bw=m}.
+        // A comparison is not: narrowed, it compares the low bits alone
+        // (`x <u 300` would read as `x <u 44` at 8 bits), so a `g` holding
+        // one is solved at full width.
         // The recursion is bounded because each accepted mask has
         // effective_width < current bitwidth, so a 64-bit root can
         // recurse only a handful of times before reaching 1 bit.
         if (input_expr != nullptr) {
             auto mask = DetectRootLowBitMask(*input_expr, opts.bitwidth);
+            if (mask.has_value() && ContainsComparison(*mask->inner)) {
+                mask.reset();
+            }
             if (mask.has_value() && !ContainsType(*mask->inner, Expr::Kind::kShr)) {
                 auto inner      = CloneExpr(*mask->inner);
                 uint32_t eff_bw = mask->effective_width;
                 auto inner_sig  = EvaluateBooleanSignature(
                     *inner, static_cast< uint32_t >(vars.size()), eff_bw
                 );
-                Options inner_opts   = opts;
-                inner_opts.bitwidth  = eff_bw;
+                Options inner_opts       = opts;
+                inner_opts.bitwidth      = eff_bw;
+                // The narrower ring is the mask: every bit of it is read.
+                inner_opts.demanded_mask = UINT64_MAX;
                 // Clear so the recursive Simplify builds a fresh
                 // evaluator from the inner expression at reduced
                 // bitwidth.  Evaluator{} evaluates to false via
                 // explicit operator bool().
-                inner_opts.evaluator = Evaluator{};
+                inner_opts.evaluator     = Evaluator{};
                 auto result          = Simplify(inner_sig, vars, inner.get(), inner_opts);
                 if (result.has_value() && result->kind == SimplifyOutcome::Kind::kSimplified) {
                     auto wrapped = Expr::BitwiseAnd(
