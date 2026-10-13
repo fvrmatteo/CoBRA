@@ -671,6 +671,16 @@ namespace cobra {
             return reason;
         }
 
+        // Whether the last search this thread ran turned something down on a
+        // proof that did not finish - two conditions the boolean reading could
+        // not prove the same, say. A search that then finds nothing has not
+        // shown there is nothing to find, so its "nothing" is neither cached
+        // nor written on the root: both would make one timeout permanent.
+        bool &RestedOnUnknown() {
+            static thread_local bool unknown = false;
+            return unknown;
+        }
+
         // With `COBRA_SLOW_REPORT` set to a directory, every candidate whose
         // solve costs at least `COBRA_SLOW_MS` milliseconds (default 100) is
         // recorded there - what went in, what came out, what it cost, and the
@@ -1008,6 +1018,16 @@ namespace cobra {
         // shape is rediscovered on different SSA values. Keying on them made
         // each rediscovery a miss, which is precisely the case the cache
         // exists to catch.
+        // FNV-1a: unlike `std::hash`, the same in every build, for what a key
+        // or a tag outlives the process in (a saved memo, the IR).
+        uint64_t StableHash(std::string_view text) {
+            uint64_t hash = 0xCBF29CE484222325ULL;
+            for (const unsigned char c : text) {
+                hash = (hash ^ c) * 0x100000001B3ULL;
+            }
+            return hash;
+        }
+
         std::string CandidateKey(const MBACandidate &cand, const CobraPassOptions &options) {
             std::string key;
             key += std::to_string(cand.bitwidth);
@@ -1015,20 +1035,25 @@ namespace cobra {
             key += std::to_string(cand.demanded_mask);
             key += '|';
             key += std::to_string(options.max_vars);
+            // Every number is followed by a separator, so no two settings
+            // spell the same key: a key is also what a saved memo of unknown
+            // proofs (`SaveUnknownMemo`) is matched by in a later process.
             key += options.z3_verify ? "|z" : "|-";
             key += std::to_string(options.z3_settings.timeout_ms);
+            key += ',';
             key += std::to_string(static_cast< int >(options.z3_settings.unknown_result_mode));
-            key += ':';
+            key += ',';
             key += std::to_string(options.z3_settings.rewrite_level);
+            key += ',';
             key += std::to_string(static_cast< int >(options.z3_settings.strategy));
-            key += options.z3_settings.sweep ? "s" : "";
+            key += options.z3_settings.sweep ? ",s," : ",,";
             key += std::to_string(static_cast< uint64_t >(options.enabled_families));
-            key += options.boolean_variables ? "|b" : "";
+            key += options.boolean_variables ? "|b" : "|";
             // The boolean cut is searched by the boolean reading alone, so its
             // verdict is not the one an identical tree read the ordinary way has.
             key += cand.node_limit == kBooleanCutLimit ? "B" : "";
             key += ':';
-            key += std::to_string(std::hash< std::string >{}(options.z3_settings.llvm_passes));
+            key += std::to_string(StableHash(options.z3_settings.llvm_passes));
             key += '|';
             key += std::to_string(cand.var_names.size());
             key += '|';
@@ -1110,11 +1135,15 @@ namespace cobra {
                 // time out. Letting the second overwrite the first threw away
                 // a proved rewrite and replaced it with a refusal that every
                 // later encounter was then served.
-                if (entry == nullptr) {
-                    if (auto it = young_.find(key); it != young_.end() && it->second != nullptr) {
-                        return it->second;
-                    }
-                    if (auto it = old_.find(key); it != old_.end() && it->second != nullptr) {
+                //
+                // The same holds one step up: a rewrite proved is worth more
+                // than one only proposed, which the next encounter has to prove
+                // again - and, if that proof runs out of time where the first
+                // did not, loses. So an entry is only ever replaced by one that
+                // knows more: proved over proposed over refused.
+                const auto rank = [](const Entry &e) { return e == nullptr ? 0 : e->verified ? 2 : 1; };
+                for (auto *table : { &young_, &old_ }) {
+                    if (auto it = table->find(key); it != table->end() && rank(it->second) > rank(entry)) {
                         return it->second;
                     }
                 }
@@ -1315,7 +1344,7 @@ namespace cobra {
             tag = mix(tag, options.z3_settings.sweep ? 1 : 0);
             tag = mix(tag, static_cast< uint64_t >(options.enabled_families));
             tag = mix(tag, static_cast< uint64_t >(options.cost_model));
-            tag = mix(tag, std::hash< std::string >{}(options.z3_settings.llvm_passes));
+            tag = mix(tag, StableHash(options.z3_settings.llvm_passes));
             tag = mix(tag, static_cast< uint64_t >(options.leaf_freezing));
             tag = mix(tag, options.boolean_variables ? 1 : 0);
             // What the records mean changes with the pass itself as well as
@@ -1790,6 +1819,7 @@ namespace cobra {
                     ++stats.solver_calls;
                     if (proof.unknown) {
                         ++stats.boolean_undecided;
+                        RestedOnUnknown() = true;
                         continue;
                     }
                     if (proof.equivalent) {
@@ -2506,6 +2536,7 @@ namespace cobra {
             const MBACandidate &cand, const CobraPassOptions &options, SolveVerdict &verdict,
             CobraStatistics &stats
         ) {
+            RestedOnUnknown() = false;
             auto outcome = ProposeRewriteAsRead(cand, options, verdict, stats);
             if (outcome != nullptr || verdict != SolveVerdict::kUnsolved
                 || cand.node_limit == kBooleanCutLimit)
@@ -3344,13 +3375,24 @@ namespace cobra {
 
             bool Enabled() const { return !workers_.empty(); }
 
+            // A run of the pass, for telling its tasks from another run's: the
+            // pass can run on several functions at once, and every run shares
+            // the workers.
+            uint64_t BeginRun() {
+                const std::lock_guard< std::mutex > lock(mutex_);
+                const uint64_t run = ++last_run_;
+                running_by_run_[run] = 0;
+                return run;
+            }
+
             // False when `key` is being solved already.
             bool Submit(
                 const std::string &key, const MBACandidate &cand, const CobraPassOptions &options,
-                uint32_t budget
+                uint32_t budget, uint64_t run
             ) {
                 auto task      = std::make_shared< Task >();
                 task->key      = key;
+                task->run      = run;
                 task->options  = options;
                 task->budget   = budget;
                 // Only what the search and the proof read: no IR. The evaluator
@@ -3437,20 +3479,27 @@ namespace cobra {
                 ++stats.background_withdrawn_unneeded;
             }
 
-            // Withdraws everything not started and waits for what is running,
-            // so that no work outlives the run that queued it and no worker is
-            // ever busy when the process exits.
-            void Drain(CobraStatistics &stats) {
+            // Withdraws everything `run` queued that has not started and waits
+            // for what of it is running, so that no work outlives the run that
+            // queued it and no worker is busy when the process exits. Another
+            // run's tasks are its own: withdrawn here, they were lost to a run
+            // still counting on them, and waited for, they kept this one
+            // waiting on work that was not its own.
+            void Drain(uint64_t run, CobraStatistics &stats) {
                 std::unique_lock< std::mutex > lock(mutex_);
-                for (auto &task : queue_) {
+                std::erase_if(queue_, [&](const std::shared_ptr< Task > &task) {
+                    if (task->run != run) {
+                        return false;
+                    }
                     if (task->state == Task::kPending) {
                         task->state = Task::kWithdrawn;
                     }
-                }
-                queue_.clear();
-                by_key_.clear();
+                    return true;
+                });
+                std::erase_if(by_key_, [&](const auto &entry) { return entry.second->run == run; });
                 const auto begin = std::chrono::steady_clock::now();
-                done_.wait(lock, [&] { return running_ == 0; });
+                done_.wait(lock, [&] { return running_by_run_[run] == 0; });
+                running_by_run_.erase(run);
                 stats.background_drain_nanoseconds += Since(begin);
             }
 
@@ -3460,6 +3509,7 @@ namespace cobra {
                 enum State : uint8_t { kPending, kRunning, kDone, kWithdrawn };
 
                 std::string key;
+                uint64_t run = 0;
                 MBACandidate input{};
                 CobraPassOptions options;
                 uint32_t budget = 0;
@@ -3562,6 +3612,7 @@ namespace cobra {
                         }
                         task->state = Task::kRunning;
                         ++running_;
+                        ++running_by_run_[task->run];
                     }
                     // A failure is the loop's to meet, where it would have met
                     // it without the workers: nothing is recorded for the key,
@@ -3574,6 +3625,7 @@ namespace cobra {
                         const std::lock_guard< std::mutex > lock(mutex_);
                         task->state = Task::kDone;
                         --running_;
+                        --running_by_run_[task->run];
                     }
                     done_.notify_all();
                 }
@@ -3584,6 +3636,14 @@ namespace cobra {
                 CobraStatistics stats;
                 auto verdict  = SolveVerdict::kUnsolved;
                 auto proposal = ProposeRewrite(task.input, task.options, verdict, stats);
+                // Nothing found on an unfinished proof is no answer: the loop
+                // asks for itself rather than being served a refusal.
+                if (proposal == nullptr && RestedOnUnknown()) {
+                    ++stats.background_solved;
+                    stats.background_nanoseconds += Since(begin);
+                    MergeStatistics(stats);
+                    return;
+                }
                 OutcomeCache::Entry entry = proposal;
                 if (proposal != nullptr) {
                     bool reads_variable = false;
@@ -3640,6 +3700,8 @@ namespace cobra {
             std::unordered_map< std::string, std::shared_ptr< Task > > by_key_;
             std::vector< pthread_t > workers_;
             unsigned running_ = 0;
+            uint64_t last_run_ = 0;
+            std::unordered_map< uint64_t, unsigned > running_by_run_;
         };
 
     } // namespace
@@ -3689,7 +3751,8 @@ namespace cobra {
 
         // Every queued candidate's key, parallel to `candidates`, and the
         // candidates handed to the workers as they are queued (`Speculation`).
-        auto &speculation = Speculation::Instance();
+        auto &speculation    = Speculation::Instance();
+        const uint64_t run_id = speculation.Enabled() ? speculation.BeginRun() : 0;
         std::vector< std::string > keys;
         const auto queue_key = [&](const MBACandidate &queued) {
             keys.push_back(CandidateKey(queued, options_));
@@ -3697,7 +3760,7 @@ namespace cobra {
                 const uint32_t budget = options_.cost_model == MbaCostModel::kTreeInstructions
                     ? queued.tree_size
                     : queued.dying_count;
-                if (speculation.Submit(keys.back(), queued, options_, budget)) {
+                if (speculation.Submit(keys.back(), queued, options_, budget, run_id)) {
                     ++stats.background_submitted;
                 }
             }
@@ -3827,8 +3890,9 @@ namespace cobra {
             // Only a full collection speaks for the tree rooted at an
             // instruction; a re-cut saw part of it, so recording its verdict
             // would tell the next run the whole tree was examined.
+            bool undecided_refusal = false;
             const auto record_rejection = [&] {
-                if (cand.node_limit == 0) {
+                if (cand.node_limit == 0 && !undecided_refusal) {
                     RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
                 }
             };
@@ -4130,13 +4194,14 @@ namespace cobra {
             } else {
                 const bool evicted = cache.WasEvicted(key);
                 auto proposal = ProposeRewrite(cand, options_, verdict, stats);
+                undecided_refusal = proposal == nullptr && RestedOnUnknown();
                 if (VerifyBeforeBudget() && proposal != nullptr) {
                     proposal = VerifyCandidate(cand, *proposal, options_, stats);
                     if (proposal == nullptr) {
                         verdict = SolveVerdict::kUnsolved;
                     }
                 }
-                outcome = cache.Insert(key, std::move(proposal));
+                outcome = undecided_refusal ? nullptr : cache.Insert(key, std::move(proposal));
                 if (evicted) {
                     ++stats.resolved_after_eviction;
                     stats.resolved_after_eviction_nanoseconds += since(solve_begin);
@@ -4800,7 +4865,7 @@ namespace cobra {
         }
 
         if (speculation.Enabled()) {
-            speculation.Drain(stats);
+            speculation.Drain(run_id, stats);
         }
 
         stats.nanoseconds = since(run_begin);
