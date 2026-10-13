@@ -447,6 +447,13 @@ if(TARGET cobra-llvm)
     target_link_libraries(test_candidate_demand PRIVATE cobra-llvm GTest::gtest_main)
     target_include_directories(test_candidate_demand PRIVATE ${PROJECT_SOURCE_DIR}/lib/llvm)
     gtest_discover_tests(test_candidate_demand)
+    if(COBRA_VERIFY_BACKEND)
+        add_executable(test_unknown_memo llvm/test_unknown_memo.cpp)
+        target_link_libraries(test_unknown_memo PRIVATE cobra-llvm cobra-verify GTest::gtest_main)
+        target_include_directories(test_unknown_memo PRIVATE
+            ${PROJECT_SOURCE_DIR}/lib/llvm ${PROJECT_SOURCE_DIR}/lib)
+        gtest_discover_tests(test_unknown_memo)
+    endif()
 endif()
 
 # ExprParser test needs access to tools/cobra-cli headers

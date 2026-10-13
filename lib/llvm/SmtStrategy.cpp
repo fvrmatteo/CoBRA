@@ -21,6 +21,7 @@ namespace cobra {
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/verify/Sweep.h"
+#include "../verify/VerifyCache.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -526,6 +527,12 @@ namespace cobra {
             bool &timed_out
         ) {
             last_check_folded = false;
+            // The budget runs from the asking, not from the solver: building and
+            // optimizing the question is part of what it costs.
+            using Clock      = std::chrono::steady_clock;
+            const auto begin = Clock::now();
+            const auto deadline =
+                settings.timeout_ms > 0 ? begin + std::chrono::milliseconds(settings.timeout_ms) : Clock::time_point::max();
             auto &compiler = ThreadCompiler();
             if (optimize && !compiler.Configure(settings.llvm_passes)) {
                 return Answer::kUntranslatable;
@@ -564,8 +571,13 @@ namespace cobra {
                 compiler.Optimize(*function);
             }
 
-            const auto *returned =
-                llvm::cast< llvm::ReturnInst >(function->getEntryBlock().getTerminator())->getReturnValue();
+            // A pipeline of the host's choosing may have built control flow,
+            // which is not a question this translation reads.
+            const auto *ret = llvm::dyn_cast< llvm::ReturnInst >(function->getEntryBlock().getTerminator());
+            if (ret == nullptr || ret->getReturnValue() == nullptr) {
+                return Answer::kUntranslatable;
+            }
+            const auto *returned = ret->getReturnValue();
             if (const auto *constant = llvm::dyn_cast< llvm::ConstantInt >(returned)) {
                 if (optimize) {
                     Stats().folded.fetch_add(1, std::memory_order_relaxed);
@@ -595,10 +607,6 @@ namespace cobra {
                 Stats().compiled.fetch_add(1, std::memory_order_relaxed);
             }
 
-            using Clock      = std::chrono::steady_clock;
-            const auto begin = Clock::now();
-            const auto deadline =
-                settings.timeout_ms > 0 ? begin + std::chrono::milliseconds(settings.timeout_ms) : Clock::time_point::max();
             const auto ask = [&](const Term &formula, Clock::time_point until) {
                 bitwuzla::Options options;
                 if (settings.timeout_ms > 0) {
@@ -624,7 +632,7 @@ namespace cobra {
             // can take apart the very intermediate a sweep needs, so each side
             // proves some of what the other cannot.
             if (settings.sweep) {
-                result = ask(question, std::min(deadline, begin + kSweepHeadStart));
+                result = ask(question, std::min(deadline, Clock::now() + kSweepHeadStart));
                 if (result == bitwuzla::Result::UNKNOWN && !stop.load(std::memory_order_relaxed)
                     && Clock::now() < deadline)
                 {
@@ -842,6 +850,11 @@ namespace cobra {
             return Answer::kEqual;
         }
 
+        Z3VerifyResult AskByStrategy(
+            const Expr &lhs, const Expr &rhs, const std::vector< std::string > &var_names,
+            uint32_t bitwidth, const Z3VerificationSettings &settings
+        );
+
     } // namespace
 
     Z3VerifyResult VerifyExprsWithStrategy(
@@ -851,18 +864,61 @@ namespace cobra {
         if (settings.strategy == SmtStrategy::kDirect) {
             return Z3VerifyExprs(lhs, rhs, var_names, bitwidth, settings);
         }
+        // Remembered like a direct question is (`Z3VerifyExprs`), and for the
+        // same reason: an unknown asked again can come out differently, so the
+        // first answer is the one every later asker gets - and the one a saved
+        // memo (`SaveUnknownMemo`) carries into a resumed run.
+        auto key = verify_detail::StrategyQueryKey(lhs, rhs, var_names, bitwidth, settings);
+        if (auto cached = verify_detail::Cache().Find(key, settings.unknown_result_mode)) {
+            return *cached;
+        }
+        // A question the solver or the optimizer threw on - out of memory, a
+        // term it does not support - is unanswered, as it would be on a pool
+        // thread, which catches the same; and, being no answer about the
+        // question, it is not remembered.
+        try {
+            return verify_detail::Cache().Insert(
+                std::move(key), AskByStrategy(lhs, rhs, var_names, bitwidth, settings)
+            );
+        } catch (...) {
+            return Result(Answer::kUnknown, /*timed_out=*/false, settings);
+        }
+    }
 
+    namespace {
+    Z3VerifyResult AskByStrategy(
+        const Expr &lhs, const Expr &rhs, const std::vector< std::string > &var_names,
+        uint32_t bitwidth, const Z3VerificationSettings &settings
+    ) {
         const std::atomic< bool > never{ false };
+        // One budget for the whole question, whichever ways it is asked: the
+        // caller (a worker thread above all) plans on `timeout_ms`, and the
+        // confirmation of a folded answer and the fallback for an
+        // untranslatable one each used to start a budget of their own.
+        const auto asked_at = std::chrono::steady_clock::now();
+        const auto deadline = settings.timeout_ms > 0
+            ? asked_at + std::chrono::milliseconds(settings.timeout_ms)
+            : std::chrono::steady_clock::time_point::max();
+        // What is left of it; at least a millisecond, so a check past the
+        // deadline is asked briefly rather than without any limit.
+        const auto remaining = [&] {
+            auto left = RemainingBudget(settings, deadline);
+            if (!left.has_value()) {
+                left             = settings;
+                left->timeout_ms = 1;
+            }
+            return *left;
+        };
         if (settings.strategy == SmtStrategy::kLLVM || !RacePool::Instance().Enabled()) {
             bool timed_out = false;
             Answer answer =
                 Check(lhs, rhs, var_names.size(), bitwidth, settings, /*optimize=*/true, never, timed_out);
             if (answer == Answer::kEqual) {
-                answer = ConfirmCompiledEqual(lhs, rhs, var_names, bitwidth, settings, last_check_folded);
+                answer = ConfirmCompiledEqual(lhs, rhs, var_names, bitwidth, remaining(), last_check_folded);
             }
             if (answer == Answer::kUntranslatable) {
                 Stats().fallbacks.fetch_add(1, std::memory_order_relaxed);
-                return Z3VerifyExprs(lhs, rhs, var_names, bitwidth, settings);
+                return Z3VerifyExprs(lhs, rhs, var_names, bitwidth, remaining());
             }
             return Result(answer, timed_out, settings);
         }
@@ -875,7 +931,7 @@ namespace cobra {
         job->bitwidth = bitwidth;
         job->settings = settings;
         if (settings.timeout_ms > 0) {
-            job->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(settings.timeout_ms);
+            job->deadline = deadline;
         }
         RacePool::Instance().Submit(job);
 
@@ -883,7 +939,7 @@ namespace cobra {
         Answer mine =
             Check(lhs, rhs, var_names.size(), bitwidth, settings, /*optimize=*/true, job->answered, timed_out);
         if (mine == Answer::kEqual) {
-            mine = ConfirmCompiledEqual(lhs, rhs, var_names, bitwidth, settings, last_check_folded);
+            mine = ConfirmCompiledEqual(lhs, rhs, var_names, bitwidth, remaining(), last_check_folded);
         }
 
         std::unique_lock< std::mutex > lock(job->mutex);
@@ -924,11 +980,12 @@ namespace cobra {
         }
         if (mine == Answer::kUntranslatable && theirs == Answer::kUntranslatable) {
             Stats().fallbacks.fetch_add(1, std::memory_order_relaxed);
-            return Z3VerifyExprs(lhs, rhs, var_names, bitwidth, settings);
+            return Z3VerifyExprs(lhs, rhs, var_names, bitwidth, remaining());
         }
         Stats().race_both_unknown.fetch_add(1, std::memory_order_relaxed);
         return Result(Answer::kUnknown, timed_out || theirs_timed_out, settings);
     }
+    } // namespace
 
     SmtStrategyCounters SmtStrategyStatistics() {
         auto &stats = Stats();

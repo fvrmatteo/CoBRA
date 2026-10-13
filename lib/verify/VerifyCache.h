@@ -53,12 +53,13 @@ namespace cobra::verify_detail {
         out += std::to_string(static_cast< int >(settings.unknown_result_mode));
         out += ':';
         out += std::to_string(settings.rewrite_level);
-        // The names never reach the solver, but they are read back into the
-        // counterexample a hit would replay.
-        for (const auto &name : var_names) {
-            out += ':';
-            out += name;
-        }
+        // How many variables, not what they are called: the names never reach
+        // the solver, and a host names its leaves afresh every time it finds
+        // them, so a key holding them missed every question asked again. They
+        // only appear in a counterexample's text, which a hit replays from
+        // whichever asker was first.
+        out += ':';
+        out += std::to_string(var_names.size());
     }
 
     inline std::string ExprQueryKey(
@@ -71,6 +72,22 @@ namespace cobra::verify_detail {
         key += '=';
         AppendExpr(key, simplified);
         AppendSettings(key, bitwidth, var_names, settings);
+        return key;
+    }
+
+    // The key of a question asked through `VerifyExprsWithStrategy`: a definite
+    // answer is the same whoever gave it, but whether a question comes back
+    // unknown depends on how it was asked as well.
+    inline std::string StrategyQueryKey(
+        const Expr &original, const Expr &simplified,
+        const std::vector< std::string > &var_names, uint32_t bitwidth,
+        const Z3VerificationSettings &settings
+    ) {
+        std::string key = ExprQueryKey(original, simplified, var_names, bitwidth, settings);
+        key += '|';
+        key += std::to_string(static_cast< int >(settings.strategy));
+        key += settings.sweep ? ":sweep:" : ":";
+        key += settings.llvm_passes;
         return key;
     }
 
@@ -104,13 +121,23 @@ namespace cobra::verify_detail {
     class QueryCache
     {
       public:
-        std::optional< Z3VerifyResult > Find(const std::string &key) const {
+        // An unknown is answered as the caller's policy says it is to be
+        // taken, as it would be had the solver been asked again: the key holds
+        // that policy too, but an unknown restored from a saved memo
+        // (`RestoreUnknownMemo`) knows only that it was unknown.
+        std::optional< Z3VerifyResult >
+        Find(const std::string &key, Z3UnknownResultMode unknown_mode) const {
             const std::lock_guard< std::mutex > lock(mutex_);
-            const auto kEntry = entries_.find(key);
-            if (kEntry == entries_.end()) {
+            if (const auto kEntry = entries_.find(key); kEntry != entries_.end()) {
+                return kEntry->second;
+            }
+            const auto kUnknown = unknowns_.find(key);
+            if (kUnknown == unknowns_.end()) {
                 return std::nullopt;
             }
-            return kEntry->second;
+            Z3VerifyResult result = kUnknown->second;
+            result.equivalent     = unknown_mode == Z3UnknownResultMode::kTreatAsEquivalent;
+            return result;
         }
 
         // The questions answered "unknown", for a host that saves its analysis and
@@ -118,29 +145,31 @@ namespace cobra::verify_detail {
         // differently, so a resumed run has to remember the same ones.
         std::vector< std::pair< std::string, Z3VerifyResult > > Unknowns() const {
             const std::lock_guard< std::mutex > lock(mutex_);
-            std::vector< std::pair< std::string, Z3VerifyResult > > unknowns;
-            for (const auto &[key, result] : entries_) {
-                if (result.unknown) {
-                    unknowns.emplace_back(key, result);
-                }
-            }
-            return unknowns;
+            return { unknowns_.begin(), unknowns_.end() };
         }
 
         Z3VerifyResult Insert(std::string key, const Z3VerifyResult &result) {
             const std::lock_guard< std::mutex > lock(mutex_);
             // Bounded because a run keeps producing new expressions; dropping
-            // the table costs re-solving, not correctness.
-            if (entries_.size() >= kMaxEntries) {
-                entries_.clear();
+            // a definite answer costs re-solving, not correctness.
+            //
+            // The unknowns are kept apart and only dropped past a much larger
+            // bound: asked again, an unknown is the one answer that can come
+            // out differently, so dropping one - a restored one above all -
+            // is how a resumed run stops deciding what the first one decided.
+            auto &table = result.unknown ? unknowns_ : entries_;
+            if (table.size() >= (result.unknown ? kMaxUnknowns : kMaxEntries)) {
+                table.clear();
             }
-            return entries_.emplace(std::move(key), result).first->second;
+            return table.emplace(std::move(key), result).first->second;
         }
 
       private:
-        static constexpr size_t kMaxEntries = size_t{ 1 } << 16;
+        static constexpr size_t kMaxEntries  = size_t{ 1 } << 16;
+        static constexpr size_t kMaxUnknowns = size_t{ 1 } << 18;
         mutable std::mutex mutex_;
         std::unordered_map< std::string, Z3VerifyResult > entries_;
+        std::unordered_map< std::string, Z3VerifyResult > unknowns_;
     };
 
     inline QueryCache &Cache() {
