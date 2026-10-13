@@ -1945,7 +1945,9 @@ namespace cobra {
             // compare, and the guess folds a loop's exit test to a constant.
             // Only a proof can accept such a rewrite, so without one the
             // candidate is declined.
-            if (!options.z3_verify && ast != nullptr && ContainsComparison(*ast)) {
+            if (!options.z3_verify
+                && (cand.holds_comparison || (ast != nullptr && ContainsComparison(*ast))))
+            {
                 ++NumSkippedUnsupported;
                 RejectReason() = "a comparison needs solver verification";
                 LLVM_DEBUG(
@@ -2447,6 +2449,7 @@ namespace cobra {
                 keyed.demanded_mask = cand.demanded_mask;
                 keyed.leaf_bits     = cand.leaf_bits;
                 keyed.leaf_widths   = cand.leaf_widths;
+                keyed.holds_comparison = cand.holds_comparison;
                 for (uint32_t variable = 0; variable < variables; ++variable) {
                     if (!key[variable]) {
                         continue;
@@ -3366,6 +3369,7 @@ namespace cobra {
                 // different question and its answer is the one the cache keeps.
                 task->input.leaf_bits     = cand.leaf_bits;
                 task->input.leaf_widths   = cand.leaf_widths;
+                task->input.holds_comparison = cand.holds_comparison;
                 // The proof's budget is scaled by it (`ProofBudgetScale`). Without it a
                 // worker proved every rewrite at the unscaled budget, ran out of time on
                 // the larger trees, and left the loop to ask the same question again at

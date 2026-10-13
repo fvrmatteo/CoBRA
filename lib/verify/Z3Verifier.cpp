@@ -91,6 +91,12 @@ namespace cobra {
                     return Z3_mk_bvneg(ctx, o);
                 }
                 case Expr::Kind::kShr: {
+                    // A shift by the width or more is 0, as everywhere else an
+                    // Expr is read (`ModShr`); the amount as a `bitwidth`-bit
+                    // numeral would wrap round past 2^bitwidth instead.
+                    if (expr.constant_val >= bitwidth) {
+                        return Z3_mk_unsigned_int64(ctx, 0, Z3_mk_bv_sort(ctx, bitwidth));
+                    }
                     auto *o = BuildZ3Expr(ctx, *expr.children[0], var_asts, bitwidth);
                     auto *k = Z3_mk_unsigned_int64(
                         ctx, expr.constant_val, Z3_mk_bv_sort(ctx, bitwidth)

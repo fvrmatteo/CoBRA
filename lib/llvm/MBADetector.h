@@ -187,6 +187,12 @@ namespace cobra {
         // not. The rewrite owes those leaves a freeze just as for `spans_freeze`.
         bool spans_select = false;
 
+        // Whether the collected tree holds a comparison - an `icmp`, or the
+        // `select` that reads one. The expression says so too, but a tree past
+        // the expression budget has none, and a worker thread is handed no IR:
+        // the fact is what tells both that only a proof may accept a rewrite.
+        bool holds_comparison = false;
+
         // For a slice: how the root is recovered from the `bitwidth` bits this
         // candidate reads of it, proved before the candidate was built. A
         // rewrite replaces the root with that extension of what the narrow bits

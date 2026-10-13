@@ -3067,6 +3067,13 @@ namespace cobra {
                                           return llvm::isa< llvm::SelectInst >(ti);
                                       }
                                   ),
+                                  .holds_comparison = llvm::any_of(
+                                      tree_insts,
+                                      [](const llvm::Instruction *ti) {
+                                          return llvm::isa< llvm::ICmpInst >(ti)
+                                              || llvm::isa< llvm::SelectInst >(ti);
+                                      }
+                                  ),
                                   .slice_extension = slice != nullptr ? slice->extension
                                                                      : SliceExtension::kNone,
                                   .sum_residual = sum_group != nullptr ? sum_group->residual

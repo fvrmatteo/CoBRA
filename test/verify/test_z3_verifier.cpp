@@ -173,3 +173,18 @@ TEST(Z3VerifierTest, FourVarAffine) {
     auto result = Z3Verify(cob_coeffs, *expr, vars, 4, 64);
     EXPECT_TRUE(result.equivalent);
 }
+
+// A shift by the width or more is 0 in every reading of an Expr (`ModShr`), and
+// the backends have to agree: an amount written as a `bitwidth`-bit numeral
+// would wrap round, and `x >> 17` at four bits would be read as `x >> 1`.
+TEST(Z3VerifierTest, ShiftByWidthOrMoreIsZero) {
+    auto shifted = Expr::LogicalShr(Expr::Variable(0), 17);
+    auto zero    = Expr::Constant(0);
+    auto result  = Z3VerifyExprs(
+        *shifted, *zero, { "x" }, 4,
+        Z3VerificationSettings{ .timeout_ms          = 1000,
+                                .unknown_result_mode = Z3UnknownResultMode::kFail }
+    );
+    EXPECT_TRUE(result.equivalent);
+    EXPECT_FALSE(result.unknown);
+}
