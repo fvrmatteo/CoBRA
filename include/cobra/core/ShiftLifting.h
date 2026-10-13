@@ -53,7 +53,15 @@ namespace cobra {
     // `expr / 2^shift` when every term carries the factor structurally -
     // constants and coefficients divisible by `2^shift`, under sums and
     // negations. Null otherwise.
-    std::unique_ptr< Expr >
-    DivideByPowerOfTwo(const Expr &expr, uint32_t shift, uint32_t bitwidth);
+    //
+    // `exact_width` is how many low bits of `expr` are meant, when fewer than
+    // `bitwidth`: an answer found in that narrower ring spells `-2` as
+    // `2^exact_width - 2`, which divides to the large coefficient
+    // `2^(exact_width - 1) - 1` rather than to `-1`. Read as signed at that
+    // width, which changes nothing below it, it divides to `-1`. The quotient
+    // is then right on the low `exact_width - shift` bits.
+    std::unique_ptr< Expr > DivideByPowerOfTwo(
+        const Expr &expr, uint32_t shift, uint32_t bitwidth, uint32_t exact_width = 0
+    );
 
 } // namespace cobra

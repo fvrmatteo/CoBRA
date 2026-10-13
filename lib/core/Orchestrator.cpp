@@ -1223,7 +1223,8 @@ namespace cobra {
                     if (!support.has_value()) { return std::nullopt; }
                     RemapVarIndices(*solved, *support);
                 }
-                auto quotient = DivideByPowerOfTwo(*solved, lifted->shift, bitwidth);
+                auto quotient =
+                    DivideByPowerOfTwo(*solved, lifted->shift, bitwidth, width + lifted->shift);
                 if (!quotient) { return std::nullopt; }
                 candidate = RevealHidden(*quotient, num_vars, hidden);
                 real_vars = CompressToSupport(*candidate, vars);

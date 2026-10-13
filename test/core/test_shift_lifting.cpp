@@ -142,6 +142,21 @@ TEST(ShiftLiftingTest, DivideByPowerOfTwoIsStructural) {
     EXPECT_TRUE(DivideByPowerOfTwo(*Expr::Add(std::move(doubled), Var(0)), 1, 32) == nullptr);
 }
 
+// An answer found in a narrower ring spells `-2` as `2^width - 2`. Read as
+// signed at that width it divides to `-1`, not to the large coefficient the
+// full width makes of it - the same value on the bits that are meant.
+TEST(ShiftLiftingTest, DivideByPowerOfTwoReadsTheExactWidthAsSigned) {
+    auto narrow = Expr::Mul(Const(0xFE), Var(0));
+    auto q      = DivideByPowerOfTwo(*narrow, 1, 64, 8);
+    ASSERT_TRUE(q != nullptr);
+    EXPECT_EQ(Render(*q, { "a" }, 64), "-a");
+    std::mt19937_64 rng(7);
+    for (int sample = 0; sample < 64; ++sample) {
+        const auto inputs = RandomInputs(rng, 1, 64);
+        EXPECT_EQ(Eval(*q, inputs, 64) & 0x7F, ModNeg(inputs[0], 64) & 0x7F);
+    }
+}
+
 TEST(ShiftLiftingTest, DemandedMaskRecoversTheAndIdentity) {
     const std::vector< std::string > vars = { "x", "y" };
     auto expr = AndIdentity(Var(0), Var(1));

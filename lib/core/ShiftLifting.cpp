@@ -225,17 +225,19 @@ namespace cobra {
         return LiftedShifts{ .scaled = std::move(scaled), .shift = shift };
     }
 
-    std::unique_ptr< Expr >
-    DivideByPowerOfTwo(const Expr &expr, uint32_t shift, uint32_t bitwidth) {
+    std::unique_ptr< Expr > DivideByPowerOfTwo(
+        const Expr &expr, uint32_t shift, uint32_t bitwidth, uint32_t exact_width
+    ) {
         if (shift == 0) { return CloneExpr(expr); }
         if (shift >= bitwidth) { return nullptr; }
-        const uint64_t low = Bitmask(shift);
+        const uint64_t low   = Bitmask(shift);
+        const uint32_t width = exact_width == 0 || exact_width > bitwidth ? bitwidth : exact_width;
 
         // Exact as a signed quotient, so `-2 * a` divides to `-a` rather than
         // to a large positive coefficient.
         const auto quotient = [&](uint64_t value) -> std::optional< uint64_t > {
             if ((value & low) != 0) { return std::nullopt; }
-            return static_cast< uint64_t >(SignExtend(value, bitwidth) >> shift)
+            return static_cast< uint64_t >(SignExtend(value & Bitmask(width), width) >> shift)
                 & Bitmask(bitwidth);
         };
 
@@ -245,13 +247,13 @@ namespace cobra {
                 return q ? Expr::Constant(*q) : nullptr;
             }
             case Expr::Kind::kAdd: {
-                auto lhs = DivideByPowerOfTwo(*expr.children[0], shift, bitwidth);
-                auto rhs = DivideByPowerOfTwo(*expr.children[1], shift, bitwidth);
+                auto lhs = DivideByPowerOfTwo(*expr.children[0], shift, bitwidth, width);
+                auto rhs = DivideByPowerOfTwo(*expr.children[1], shift, bitwidth, width);
                 if (!lhs || !rhs) { return nullptr; }
                 return Expr::Add(std::move(lhs), std::move(rhs));
             }
             case Expr::Kind::kNeg: {
-                auto operand = DivideByPowerOfTwo(*expr.children[0], shift, bitwidth);
+                auto operand = DivideByPowerOfTwo(*expr.children[0], shift, bitwidth, width);
                 return operand ? Expr::Negate(std::move(operand)) : nullptr;
             }
             case Expr::Kind::kMul: {
