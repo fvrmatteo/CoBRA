@@ -165,6 +165,9 @@ namespace cobra {
         // a root replaced earlier in the run, no expression to prove against
         // (with the solver on); and worker tasks withdrawn for them.
         uint64_t unreachable_roots              = 0;
+        // Queued candidates passed by because a value the rewrite reads does not
+        // dominate the root (a leaf reached through a transparent phi's arm).
+        uint64_t unavailable_leaves             = 0;
         uint64_t stale_trees                    = 0;
         uint64_t declined_no_expression         = 0;
         uint64_t background_withdrawn_unneeded  = 0;

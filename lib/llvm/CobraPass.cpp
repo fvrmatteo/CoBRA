@@ -576,6 +576,7 @@ namespace cobra {
             into.reader_flags_dropped += run.reader_flags_dropped;
             into.demanded_grew += run.demanded_grew;
             into.unreachable_roots += run.unreachable_roots;
+            into.unavailable_leaves += run.unavailable_leaves;
             into.stale_trees += run.stale_trees;
             into.declined_no_expression += run.declined_no_expression;
             into.background_withdrawn_unneeded += run.background_withdrawn_unneeded;
@@ -3808,7 +3809,10 @@ namespace cobra {
             if (rewrites_this_run != 0 && cand.root->getType()->isIntegerTy()
                 && cand.root->getType()->getIntegerBitWidth() <= 64)
             {
-                const uint64_t now = demanded_bits.MaskOf(cand.root) & Bitmask(cand.bitwidth);
+                const uint64_t now = CandidateDemand(
+                    demanded_bits.MaskOf(cand.root), cand.bitwidth, cand.slice_extension,
+                    !cand.sum_residual.empty()
+                );
                 if ((now & ~cand.demanded_mask) != 0) {
                     ++stats.demanded_grew;
                     pass_by();
@@ -4319,6 +4323,33 @@ namespace cobra {
                     }
                 }
             }
+            // The rewrite is built at the root and reads its leaves there, so
+            // each one it reads has to be available at the root. A tree read
+            // through a transparent phi follows one arm, and a leaf inside that
+            // arm - `lshr %x, %s` in the predecessor, as opaque as any other
+            // variable shift - is defined on that path only, however surely the
+            // other arms compute the same thing. A rewrite that does not read
+            // such a leaf is a function of the others, which every arm agrees
+            // on, so only the leaves read are asked about.
+            {
+                const auto available = [&](const llvm::Value *value) {
+                    const auto *inst = llvm::dyn_cast< llvm::Instruction >(value);
+                    return inst == nullptr || dominators->dominates(inst, cand.root);
+                };
+                bool reads_unavailable = !llvm::all_of(cand.sum_residual, [&](const auto &summand) {
+                    return available(summand.first);
+                });
+                for (size_t index = 0; !reads_unavailable && index < reads.size(); ++index) {
+                    reads_unavailable = reads[index] != 0 && !available(cand.leaf_values[index]);
+                }
+                if (reads_unavailable) {
+                    ++stats.unavailable_leaves;
+                    account(false);
+                    requeue_retries();
+                    continue;
+                }
+            }
+
             LeafSupply leaf_supply;
             const bool poison_owed = cand.spans_freeze || cand.spans_select;
             const auto poisoning   = poison_owed ? LeavesPoisoningTheRoot(cand, outcome->boolean_reading)
@@ -4957,6 +4988,7 @@ namespace cobra {
         part("  readers' poison flags dropped after a partial-bits rewrite", stats.reader_flags_dropped);
         part("  queued candidates whose root's readers grew", stats.demanded_grew);
         part("  queued candidates on an unreachable root", stats.unreachable_roots);
+        part("  queued candidates reading a leaf the root does not see", stats.unavailable_leaves);
         part("  queued candidates over a root replaced this run", stats.stale_trees);
         part("  candidates without an expression to prove", stats.declined_no_expression);
         part("  worker tasks withdrawn for candidates passed by", stats.background_withdrawn_unneeded);
@@ -4967,6 +4999,7 @@ namespace cobra {
                 part("  transparent phi sets checked", phis.checked);
                 part("    other arms the same computation", phis.exact_accept);
                 part("    accepted by probes alone (not exact)", phis.probes_only);
+                part("    read as leaves: a leaf of the arm unavailable at the root", phis.leaf_unavailable);
             }
         }
         line("  proving with the solver", stats.solver_calls, stats.solver_nanoseconds);

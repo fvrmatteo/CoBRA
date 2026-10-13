@@ -89,6 +89,20 @@ namespace cobra {
         kSign,
     };
 
+    // The bits of a candidate's own reading a rewrite of it has to agree on,
+    // from `root_demand`, the bits of the root its readers look at (over the
+    // root's type). A candidate that reads the root whole needs no more than
+    // those. Two readings need more:
+    //
+    // - A slice reads the low `width` bits and puts the rest back as their
+    //   extension, so under `SliceExtension::kSign` every bit above is a copy
+    //   of bit `width - 1`: a reader of any of them reads that bit.
+    // - A sum group is added back to the rest of the root's sum, and a
+    //   difference in a bit nobody reads carries into every bit above it: the
+    //   group has to agree on every bit up to the highest one read.
+    uint64_t
+    CandidateDemand(uint64_t root_demand, uint32_t width, SliceExtension extension, bool sum_group);
+
     struct MBACandidate
     {
         llvm::Instruction *root;
@@ -541,6 +555,9 @@ namespace cobra {
         uint64_t probes_accept  = 0;
         uint64_t exact_accept   = 0;
         uint64_t probes_only    = 0;
+        // Arms that agree, but the followed one reads a leaf the root does not
+        // see, so the phi was read as a leaf.
+        uint64_t leaf_unavailable = 0;
     };
     PhiArmCounters PhiArmStatistics();
 

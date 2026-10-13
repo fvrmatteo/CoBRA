@@ -441,6 +441,14 @@ if(COBRA_BUILD_LLVM_PASS)
     add_subdirectory(llvm)
 endif()
 
+# Unit tests of the LLVM library's IR-free helpers.
+if(TARGET cobra-llvm)
+    add_executable(test_candidate_demand llvm/test_candidate_demand.cpp)
+    target_link_libraries(test_candidate_demand PRIVATE cobra-llvm GTest::gtest_main)
+    target_include_directories(test_candidate_demand PRIVATE ${PROJECT_SOURCE_DIR}/lib/llvm)
+    gtest_discover_tests(test_candidate_demand)
+endif()
+
 # ExprParser test needs access to tools/cobra-cli headers
 add_executable(test_expr_parser core/test_expr_parser.cpp
                ${PROJECT_SOURCE_DIR}/tools/cobra-cli/ExprParser.cpp)

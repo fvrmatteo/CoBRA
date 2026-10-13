@@ -2193,6 +2193,7 @@ namespace cobra {
         std::atomic< uint64_t > phi_arms_probes_accept{ 0 };
         std::atomic< uint64_t > phi_arms_exact_accept{ 0 };
         std::atomic< uint64_t > phi_arms_probes_only{ 0 };
+        std::atomic< uint64_t > phi_arms_leaf_unavailable{ 0 };
 
         // Whether `a` and `b` compute the same value: the very same value, or
         // the same operation - opcode, types, predicate, callee and attributes,
@@ -2204,11 +2205,21 @@ namespace cobra {
         // A phi is only ever the same as itself, and nothing that touches
         // memory is followed, since the same load on two paths can read two
         // different things. Bounded: past `budget` pairs the answer is no.
+        // For one transparent phi: per value of the followed arm, the arms whose
+        // computation reaches it as the very same value (see `SameComputation`).
+        using ArmIdentity = llvm::DenseMap< llvm::Value *, llvm::SmallBitVector >;
+
         bool SameComputation(
             llvm::Value *a, llvm::Value *b,
-            llvm::DenseSet< std::pair< llvm::Value *, llvm::Value * > > &proven, unsigned &budget
+            llvm::DenseSet< std::pair< llvm::Value *, llvm::Value * > > &proven, unsigned &budget,
+            ArmIdentity &identity, unsigned arm, unsigned arms
         ) {
             if (a == b) {
+                auto &bits = identity[b];
+                if (bits.size() != arms) {
+                    bits.resize(arms);
+                }
+                bits.set(arm);
                 return true;
             }
             if (a->getType() != b->getType()) {
@@ -2230,17 +2241,109 @@ namespace cobra {
                 return true;
             }
             for (unsigned i = 0; i < ia->getNumOperands(); ++i) {
-                if (!SameComputation(ia->getOperand(i), ib->getOperand(i), proven, budget)) {
+                if (!SameComputation(
+                        ia->getOperand(i), ib->getOperand(i), proven, budget, identity, arm, arms
+                    ))
+                {
                     return false;
                 }
             }
             return true;
         }
 
+        // Whether every value the tree reads as a leaf is available at the
+        // root, which is where the rewrite reads it.
+        //
+        // A tree read through a transparent phi follows one arm, and that arm
+        // is computed in a predecessor: a leaf inside it - a variable shift, a
+        // load, anything the walk stops at - is defined on that path only,
+        // however surely the other arms compute the same thing from their own
+        // copies of it. A value dominates the phi, and so the root, when every
+        // arm's computation reaches it as the very same value, at it or at a
+        // value above it in the followed arm (each arm's value is available at
+        // the end of its own predecessor, and so is everything it is computed
+        // from). So the walk from the root marks what it reaches as available,
+        // and at a transparent phi carries on only into the part of the
+        // followed arm every arm shares.
+        bool LeavesAvailableAtRoot(
+            llvm::Instruction *root,
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+            const llvm::DenseMap< const llvm::PHINode *, ArmIdentity > &identities,
+            llvm::ArrayRef< llvm::Instruction * > tree_insts, const std::vector< llvm::Value * > &leaves
+        ) {
+            const llvm::DenseSet< const llvm::Value * > tree(tree_insts.begin(), tree_insts.end());
+            const llvm::DenseSet< const llvm::Value * > leaf_set(leaves.begin(), leaves.end());
+            llvm::DenseSet< llvm::Value * > available;
+            llvm::SmallVector< llvm::Value *, 32 > work{ root };
+            while (!work.empty()) {
+                llvm::Value *value = work.pop_back_val();
+                if (!available.insert(value).second || leaf_set.contains(value)) {
+                    continue;
+                }
+                auto *inst = llvm::dyn_cast< llvm::Instruction >(value);
+                if (inst == nullptr) {
+                    continue;
+                }
+                if (auto redirect = phi_redirects.find(value); redirect != phi_redirects.end()) {
+                    // A reading a sum group asked for stands for a constant.
+                    const auto *phi = llvm::dyn_cast< llvm::PHINode >(value);
+                    if (phi == nullptr) {
+                        continue;
+                    }
+                    const auto found = identities.find(phi);
+                    if (found == identities.end()) {
+                        continue;
+                    }
+                    const ArmIdentity &identity = found->second;
+                    const unsigned arms         = phi->getNumIncomingValues();
+                    // The arms reaching each value of the followed arm as itself,
+                    // at it or above it.
+                    llvm::DenseMap< llvm::Value *, llvm::SmallBitVector > covered;
+                    llvm::SmallVector< std::pair< llvm::Value *, llvm::SmallBitVector >, 32 > down;
+                    down.push_back({ redirect->second, llvm::SmallBitVector(arms) });
+                    while (!down.empty()) {
+                        auto [node, from_above] = down.pop_back_val();
+                        if (auto it = identity.find(node); it != identity.end()) {
+                            from_above |= it->second;
+                        }
+                        auto [entry, inserted] = covered.try_emplace(node, arms);
+                        const llvm::SmallBitVector before = entry->second;
+                        entry->second |= from_above;
+                        if (!inserted && entry->second == before) {
+                            continue;
+                        }
+                        if (entry->second.all()) {
+                            work.push_back(node);
+                            continue;
+                        }
+                        auto *below = llvm::dyn_cast< llvm::Instruction >(node);
+                        if (below == nullptr || !tree.contains(below) || llvm::isa< llvm::PHINode >(below)) {
+                            continue;
+                        }
+                        for (llvm::Value *operand : below->operands()) {
+                            down.push_back({ operand, entry->second });
+                        }
+                    }
+                    continue;
+                }
+                if (!tree.contains(inst)) {
+                    continue;
+                }
+                for (llvm::Value *operand : inst->operands()) {
+                    work.push_back(operand);
+                }
+            }
+            return llvm::all_of(leaves, [&](llvm::Value *leaf) {
+                return !llvm::isa< llvm::Instruction >(leaf) || available.contains(leaf);
+            });
+        }
+
         // Whether every arm of every transparent phi is the same computation
-        // as the arm the collection followed.
+        // as the arm the collection followed, recording for each phi which
+        // values every arm reaches as themselves (`LeavesAvailableAtRoot`).
         bool PhiArmsAreTheSameComputation(
-            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects
+            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+            llvm::DenseMap< const llvm::PHINode *, ArmIdentity > &identities
         ) {
             llvm::DenseSet< std::pair< llvm::Value *, llvm::Value * > > proven;
             unsigned budget = 4096;
@@ -2252,8 +2355,16 @@ namespace cobra {
                 if (phi == nullptr) {
                     continue;
                 }
-                for (llvm::Value *incoming : phi->incoming_values()) {
-                    if (!SameComputation(incoming, chosen, proven, budget)) {
+                auto &identity      = identities[phi];
+                const unsigned arms = phi->getNumIncomingValues();
+                for (unsigned arm = 0; arm < arms; ++arm) {
+                    // Per arm: a pair already proved for another arm says
+                    // nothing about which values this one shares.
+                    proven.clear();
+                    if (!SameComputation(
+                            phi->getIncomingValue(arm), chosen, proven, budget, identity, arm, arms
+                        ))
+                    {
                         return false;
                     }
                 }
@@ -2279,8 +2390,14 @@ namespace cobra {
         // Now every other arm has to be the same computation, which is exact.
         // `COBRA_PHI_ARMS=probes` puts the probes back, for measuring what the
         // exact check costs in rewrites.
+        //
+        // The arms agreeing is not all: the tree reads its leaves at the root,
+        // so each has to be available there (`LeavesAvailableAtRoot`), and a
+        // phi whose followed arm reads one that is not is a leaf too.
         bool VerifyPhiArms(
+            llvm::Instruction *root,
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
+            llvm::ArrayRef< llvm::Instruction * > tree_insts,
             const std::vector< llvm::Value * > &leaves, uint32_t bitwidth
         ) {
             if (phi_redirects.empty()) {
@@ -2290,7 +2407,12 @@ namespace cobra {
                 const char *choice = std::getenv("COBRA_PHI_ARMS");
                 return choice != nullptr && std::string_view(choice) == "probes";
             }();
-            const bool exact = PhiArmsAreTheSameComputation(phi_redirects);
+            llvm::DenseMap< const llvm::PHINode *, ArmIdentity > identities;
+            const bool exact = PhiArmsAreTheSameComputation(phi_redirects, identities);
+            if (exact && !LeavesAvailableAtRoot(root, phi_redirects, identities, tree_insts, leaves)) {
+                phi_arms_leaf_unavailable.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
             phi_arms_checked.fetch_add(1, std::memory_order_relaxed);
             phi_arms_exact_accept.fetch_add(exact ? 1 : 0, std::memory_order_relaxed);
             if (!probes) {
@@ -2649,7 +2771,11 @@ namespace cobra {
                 // A `ptradd`'s readers are pointers: every bit of the index is
                 // live, so there is no narrower mask to read it under.
                 const uint64_t demanded_mask = (!ptradd && demanded)
-                    ? (demanded(&inst) & Bitmask(bw))
+                    ? CandidateDemand(
+                          demanded(&inst), bw,
+                          slice != nullptr ? slice->extension : SliceExtension::kNone,
+                          sum_group != nullptr
+                      )
                     : Bitmask(bw);
 
                 llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
@@ -2694,7 +2820,7 @@ namespace cobra {
                         return llvm::isa< llvm::PHINode >(entry.first);
                     });
                 };
-                if (has_phi_redirect() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
+                if (has_phi_redirect() && !VerifyPhiArms(&inst, phi_redirects, tree_insts, leaves, bw)) {
                     tree_insts.clear();
                     leaves.clear();
                     phi_redirects.clear();
@@ -3115,6 +3241,19 @@ namespace cobra {
         return widths;
     }
 
+    uint64_t
+    CandidateDemand(uint64_t root_demand, uint32_t width, SliceExtension extension, bool sum_group) {
+        uint64_t demand = root_demand;
+        if (sum_group && demand != 0) {
+            const auto top = static_cast< uint32_t >(std::bit_width(demand));
+            demand         = Bitmask(top);
+        }
+        if (extension == SliceExtension::kSign && width < 64 && (demand & ~Bitmask(width)) != 0) {
+            demand |= uint64_t{ 1 } << (width - 1);
+        }
+        return demand & Bitmask(width);
+    }
+
     std::vector< MBACandidate > SliceMbaCandidate(
         const MBACandidate &cand, uint32_t width, SliceExtension extension,
         uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
@@ -3164,6 +3303,19 @@ namespace cobra {
             return candidates;
         }
 
+        // The split is a fact about the root's own collection: no summand left
+        // out is reached from inside a group kept, because two summands that
+        // reach a common leaf are one group. A group's collection must read the
+        // root no further than that one did, or it can reach a summand it
+        // reads as zero from where it is not a summand - a phi that was a leaf
+        // there turns transparent once the summand holding the other phi is
+        // left out, or a node the budget cut off is now within it. So the
+        // collection's leaves stay leaves.
+        SharedCut as_collected{ .opaque = {}, .node_limit = 0 };
+        for (auto *leaf : cand.leaf_values) {
+            as_collected.opaque.insert(leaf);
+        }
+
         for (uint32_t index = 0; index < split->groups; ++index) {
             SumGroup group;
             group.index = index;
@@ -3179,8 +3331,8 @@ namespace cobra {
             std::vector< MBACandidate > whole;
             BuildCandidates(
                 { cand.root }, min_ast_size, max_vars, cost_model, options_tag, whole, 0,
-                /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded,
-                /*shared_cut=*/nullptr, /*slice=*/nullptr, &group
+                /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded, &as_collected,
+                /*slice=*/nullptr, &group
             );
             // The root has no reading with the rest of the sum left out: the
             // collection kept it as a leaf, so the candidate is the root read
@@ -3202,8 +3354,8 @@ namespace cobra {
             std::vector< MBACandidate > sliced;
             BuildCandidates(
                 { cand.root }, min_ast_size, max_vars, cost_model, options_tag, sliced, 0,
-                /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded,
-                /*shared_cut=*/nullptr, &cut, &group
+                /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded, &as_collected, &cut,
+                &group
             );
             if (sliced.empty() || !llvm::is_contained(sliced.front().tree, sliced.front().root)) {
                 continue;
@@ -3394,7 +3546,8 @@ namespace cobra {
         return PhiArmCounters{ .checked       = phi_arms_checked.load(),
                                .probes_accept = phi_arms_probes_accept.load(),
                                .exact_accept  = phi_arms_exact_accept.load(),
-                               .probes_only   = phi_arms_probes_only.load() };
+                               .probes_only   = phi_arms_probes_only.load(),
+                               .leaf_unavailable = phi_arms_leaf_unavailable.load() };
     }
 
     std::optional< MbaFingerprint >
@@ -3416,7 +3569,7 @@ namespace cobra {
         // As the detector collects it: a phi only read through when its arms
         // are the same computation, or the fingerprint would describe a tree
         // the detector never builds and never match.
-        if (!phi_redirects.empty() && !VerifyPhiArms(phi_redirects, leaves, bw)) {
+        if (!phi_redirects.empty() && !VerifyPhiArms(inst, phi_redirects, tree_insts, leaves, bw)) {
             tree_insts.clear();
             leaves.clear();
             phi_redirects.clear();
