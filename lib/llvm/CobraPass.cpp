@@ -567,6 +567,8 @@ namespace cobra {
             into.boolean_found += run.boolean_found;
             into.free_leaf_trees += run.free_leaf_trees;
             into.free_leaf_found += run.free_leaf_found;
+            into.keyed_leaf_trees += run.keyed_leaf_trees;
+            into.keyed_leaf_found += run.keyed_leaf_found;
             into.enumeration_nanoseconds += run.enumeration_nanoseconds;
             into.ring_attempted += run.ring_attempted;
             into.ring_proved += run.ring_proved;
@@ -1320,7 +1322,7 @@ namespace cobra {
             // and loads again must not read a verdict an older build wrote
             // under another fingerprint or another set of techniques. Bumped
             // whenever either changes.
-            constexpr uint64_t kRecordVersion = 3;
+            constexpr uint64_t kRecordVersion = 4;
             tag = mix(tag, kRecordVersion);
             return tag;
         }
@@ -2299,25 +2301,234 @@ namespace cobra {
             return ordinary;
         }
 
+        namespace keyed_leaf_reading {
+
+            // The variable and the constant of `expr` when it is `v ^ c`, either way
+            // round, with `c` not zero.
+            std::optional< std::pair< uint32_t, uint64_t > > KeyedLeaf(const Expr &expr, uint32_t bw) {
+                if (expr.kind != Expr::Kind::kXor) {
+                    return std::nullopt;
+                }
+                for (size_t side = 0; side < 2; ++side) {
+                    const Expr &leaf = *expr.children[side];
+                    const Expr &key  = *expr.children[1 - side];
+                    if (leaf.kind == Expr::Kind::kVariable && key.kind == Expr::Kind::kConstant
+                        && (key.constant_val & Bitmask(bw)) != 0)
+                    {
+                        return std::make_pair(leaf.var_index, key.constant_val & Bitmask(bw));
+                    }
+                }
+                return std::nullopt;
+            }
+
+            // The constants the tree xors each variable with, in the order met.
+            void CollectKeys(const Expr &expr, uint32_t bw, std::vector< std::vector< uint64_t > > &keys) {
+                if (const auto keyed = KeyedLeaf(expr, bw); keyed && keyed->first < keys.size()) {
+                    auto &found = keys[keyed->first];
+                    if (llvm::find(found, keyed->second) == found.end()) {
+                        found.push_back(keyed->second);
+                    }
+                }
+                for (const auto &child : expr.children) {
+                    CollectKeys(*child, bw, keys);
+                }
+            }
+
+            // `expr` with each variable `v` that has a key read as `v ^ key[v]`.
+            // Where the tree itself xors `v` with a constant, or compares it with
+            // one, the key goes into that constant: `(v ^ k) ^ c` is `v ^ (k ^ c)`
+            // and `(v ^ k) == c` is `v == (k ^ c)`. Xor being its own inverse, the
+            // same call reads the tree over the keyed variables and puts a rewrite
+            // found over them back over the tree's own.
+            std::unique_ptr< Expr > Rekey(
+                const Expr &expr, const std::vector< std::optional< uint64_t > > &key, uint32_t bw
+            ) {
+                const auto key_of = [&](const Expr &node) -> std::optional< uint64_t > {
+                    if (node.kind != Expr::Kind::kVariable || node.var_index >= key.size()) {
+                        return std::nullopt;
+                    }
+                    return key[node.var_index];
+                };
+                if (expr.kind == Expr::Kind::kXor || expr.kind == Expr::Kind::kCmpEq) {
+                    for (size_t side = 0; side < 2; ++side) {
+                        const Expr &leaf     = *expr.children[side];
+                        const Expr &constant = *expr.children[1 - side];
+                        const auto leaf_key  = key_of(leaf);
+                        if (!leaf_key || constant.kind != Expr::Kind::kConstant) {
+                            continue;
+                        }
+                        const uint64_t folded = (constant.constant_val ^ *leaf_key) & Bitmask(bw);
+                        if (expr.kind == Expr::Kind::kXor) {
+                            if (folded == 0) {
+                                return Expr::Variable(leaf.var_index);
+                            }
+                            return Expr::BitwiseXor(Expr::Variable(leaf.var_index), Expr::Constant(folded));
+                        }
+                        return Expr::CmpEq(Expr::Variable(leaf.var_index), Expr::Constant(folded));
+                    }
+                }
+                if (const auto leaf_key = key_of(expr)) {
+                    return Expr::BitwiseXor(Expr::Variable(expr.var_index), Expr::Constant(*leaf_key));
+                }
+                auto copy          = std::make_unique< Expr >();
+                copy->kind         = expr.kind;
+                copy->constant_val = expr.constant_val;
+                copy->var_index    = expr.var_index;
+                for (const auto &child : expr.children) {
+                    copy->children.push_back(Rekey(*child, key, bw));
+                }
+                return copy;
+            }
+
+        } // namespace keyed_leaf_reading
+
+        // A tree the search turned down, read again over the keyed values of its
+        // leaves.
+        //
+        // An obfuscator that stores a value encrypted with a constant key reads it
+        // back as `v ^ k` and computes on that, and once part of such a tree has
+        // been rewritten, or a comparison stands in for the borrow of `(v ^ k) - 1`,
+        // the tree reads `v` both through the key and bare: `v == k`, `v >> 1`,
+        // `v & k`. The search probes its variables at structured points - the
+        // Boolean ones, single bits, the boundaries a comparison turns on - and
+        // over `v` those land on points of `v ^ k` with no structure at all. The
+        // same tree read over `y = v ^ k` puts the probes where the tree's own
+        // arithmetic turns: `select(v == k, -2, 2^63 - 2) + ((v ^ k) - 1 >> 1) -
+        // (v >> 1 ^ ~(k >> 1) & (2^63 - 1))` is `(v ^ k) - 2`, out of every
+        // technique's reach over `v` and found at once over `y`.
+        //
+        // `y` is `v` under a bijection, so the tree over `y` is the same function
+        // and a rewrite of it holds for every `y`, which is every `v`. Each
+        // variable the tree xors with a constant is read through that key, the
+        // reading goes through the search and the reading of conditions as it
+        // would for the tree itself (`ProposeRewriteAsRead`), and the answer is
+        // put back with the key around each such variable - the tree's own
+        // function, which `VerifyCandidate` then checks against the tree as it
+        // checks any rewrite. A variable xored with several constants is read
+        // through each in turn, a bounded number of times.
+        OutcomeCache::Entry ProposeKeyedLeafRewrite(
+            const MBACandidate &cand, const CobraPassOptions &options, CobraStatistics &stats
+        ) {
+            using namespace keyed_leaf_reading;
+            if (cand.expr == nullptr) {
+                return nullptr;
+            }
+            const uint32_t bw    = cand.bitwidth;
+            const auto variables = static_cast< uint32_t >(cand.var_names.size());
+            std::vector< std::vector< uint64_t > > keys(variables);
+            CollectKeys(*cand.expr, bw, keys);
+            size_t readings = 0;
+            for (const auto &found : keys) {
+                readings = std::max(readings, found.size());
+            }
+            // Each reading is a search and the proofs behind it.
+            constexpr size_t kMaxReadings = 2;
+            readings = std::min(readings, kMaxReadings);
+
+            std::string reasons;
+            for (size_t reading = 0; reading < readings; ++reading) {
+                std::vector< std::optional< uint64_t > > key(variables);
+                for (uint32_t variable = 0; variable < variables; ++variable) {
+                    if (reading < keys[variable].size()) {
+                        key[variable] = keys[variable][reading];
+                    }
+                }
+                // What the search and the proof read of a candidate (the copy a
+                // worker is handed), over the keyed variables. A keyed variable
+                // keeps nothing known of the leaf: those are facts about `v`.
+                MBACandidate keyed;
+                keyed.root          = nullptr;
+                keyed.var_names     = cand.var_names;
+                keyed.bitwidth      = bw;
+                keyed.expr          = Rekey(*cand.expr, key, bw);
+                keyed.evaluator     = Evaluator::FromExpr(*keyed.expr, bw);
+                keyed.sig           = EvaluateBooleanSignature(*keyed.expr, variables, bw);
+                keyed.demanded_mask = cand.demanded_mask;
+                keyed.leaf_bits     = cand.leaf_bits;
+                keyed.leaf_widths   = cand.leaf_widths;
+                for (uint32_t variable = 0; variable < variables; ++variable) {
+                    if (!key[variable]) {
+                        continue;
+                    }
+                    if (variable < keyed.leaf_bits.size()) {
+                        keyed.leaf_bits[variable] = LeafBits{};
+                    }
+                    if (variable < keyed.leaf_widths.size()) {
+                        keyed.leaf_widths[variable] = 0;
+                    }
+                }
+                keyed.tree_size   = cand.tree_size;
+                keyed.node_limit  = cand.node_limit;
+                keyed.fingerprint = cand.fingerprint;
+                ++stats.keyed_leaf_trees;
+
+                SolveVerdict verdict = SolveVerdict::kUnsolved;
+                const auto found     = ProposeRewriteAsRead(keyed, options, verdict, stats);
+                if (found == nullptr) {
+                    reasons += (reasons.empty() ? "" : "; ") + RejectReason();
+                    continue;
+                }
+                auto rewrite = CloneExpr(*found->expr);
+                if (!found->real_var_positions.empty()) {
+                    RemapVarIndices(*rewrite, found->real_var_positions);
+                }
+                auto restored = Rekey(*rewrite, key, bw);
+                if (!IsBetter(ComputeCost(*restored).cost, ComputeCost(*cand.expr).cost)) {
+                    reasons += (reasons.empty() ? "" : "; ") + std::string("not cheaper: ")
+                        + RenderSSA(*restored, cand.var_names);
+                    continue;
+                }
+                ++stats.keyed_leaf_found;
+                return std::make_shared< const CandidateOutcome >(CandidateOutcome{
+                    .expr               = std::move(restored),
+                    .real_vars          = {},
+                    .real_var_positions = {},
+                    .accepted_unknown   = false,
+                    .verified           = false,
+                    .boolean_reading    = found->boolean_reading });
+            }
+            if (readings != 0) {
+                RejectReason() = "keyed-leaf reading: " + reasons;
+            }
+            return nullptr;
+        }
+
         // `ProposeRewriteAsRead`, and where it finds nothing at all, the tree with
-        // its masked leaves free (`ProposeFreeLeafRewrite`). A rewrite found but
-        // not cheaper is not asked about again: freeing a leaf only drops a mask.
+        // its masked leaves free (`ProposeFreeLeafRewrite`) and over the keyed
+        // values of its leaves (`ProposeKeyedLeafRewrite`). A rewrite found but
+        // not cheaper is not asked about again: freeing a leaf only drops a mask,
+        // and keying one only moves the constants.
         OutcomeCache::Entry ProposeRewrite(
             const MBACandidate &cand, const CobraPassOptions &options, SolveVerdict &verdict,
             CobraStatistics &stats
         ) {
             auto outcome = ProposeRewriteAsRead(cand, options, verdict, stats);
             if (outcome != nullptr || verdict != SolveVerdict::kUnsolved
-                || cand.node_limit == kBooleanCutLimit || Old("free-leaf"))
+                || cand.node_limit == kBooleanCutLimit)
             {
                 return outcome;
             }
             const std::string reason = RejectReason();
-            if (auto freed = ProposeFreeLeafRewrite(cand, options, stats)) {
-                verdict = SolveVerdict::kSolved;
-                return freed;
+            const auto append = [&] {
+                RejectReason() = reason
+                    + (RejectReason().empty() || RejectReason() == reason ? "" : "; " + RejectReason());
+            };
+            if (!Old("free-leaf")) {
+                if (auto freed = ProposeFreeLeafRewrite(cand, options, stats)) {
+                    verdict = SolveVerdict::kSolved;
+                    return freed;
+                }
+                append();
             }
-            RejectReason() = reason + (RejectReason().empty() || RejectReason() == reason ? "" : "; " + RejectReason());
+            if (!Old("keyed-leaf")) {
+                const std::string so_far = RejectReason();
+                if (auto keyed = ProposeKeyedLeafRewrite(cand, options, stats)) {
+                    verdict = SolveVerdict::kSolved;
+                    return keyed;
+                }
+                RejectReason() = so_far
+                    + (RejectReason().empty() || RejectReason() == so_far ? "" : "; " + RejectReason());
+            }
             return nullptr;
         }
 
@@ -2486,7 +2697,8 @@ namespace cobra {
         // stays out of reach), `leaf-width` (a leaf identity is offered as a bare variable
         // rather than as the tree reads the leaf, which refuses every tree whose
         // answer is a leaf narrower than it), `free-leaf` (a tree the search turns
-        // down is not read again with its masked leaves free).
+        // down is not read again with its masked leaves free), `keyed-leaf` (nor
+        // over the keyed values of its leaves).
         bool Old(std::string_view behaviour) {
             static const std::string chosen = [] {
                 const char *value = std::getenv("COBRA_OLD");
@@ -4734,6 +4946,10 @@ namespace cobra {
         if (stats.free_leaf_trees != 0) {
             part("    trees read again with their masked leaves free", stats.free_leaf_trees);
             part("      rewrites found", stats.free_leaf_found);
+        }
+        if (stats.keyed_leaf_trees != 0) {
+            part("    trees read again over the keyed values of their leaves", stats.keyed_leaf_trees);
+            part("      rewrites found", stats.keyed_leaf_found);
         }
         cost("  proving by running every input", stats.enumeration_nanoseconds);
         line("  proving in a ring normal form (attempts)", stats.ring_attempted, stats.ring_nanoseconds);

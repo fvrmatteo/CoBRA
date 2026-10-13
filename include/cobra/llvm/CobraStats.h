@@ -145,6 +145,10 @@ namespace cobra {
         // that reading found.
         uint64_t free_leaf_trees = 0;
         uint64_t free_leaf_found = 0;
+        // Readings of a turned-down tree over the keyed values of its leaves
+        // (`ProposeKeyedLeafRewrite`), and the rewrites they found.
+        uint64_t keyed_leaf_trees = 0;
+        uint64_t keyed_leaf_found = 0;
         uint64_t enumeration_nanoseconds    = 0;
         // Proofs settled by `ProveEqualByRingNormalForm` before any solver is
         // asked, how many were attempted, and the time all the attempts took.
