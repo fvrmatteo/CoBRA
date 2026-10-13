@@ -140,6 +140,11 @@ namespace cobra {
         uint64_t boolean_merged     = 0;
         uint64_t boolean_undecided  = 0;
         uint64_t boolean_found      = 0;
+        // Trees the search turned down that were read again with their masked
+        // leaves as free variables (`ProposeFreeLeafRewrite`), and the rewrites
+        // that reading found.
+        uint64_t free_leaf_trees = 0;
+        uint64_t free_leaf_found = 0;
         uint64_t enumeration_nanoseconds    = 0;
         // Proofs settled by `ProveEqualByRingNormalForm` before any solver is
         // asked, how many were attempted, and the time all the attempts took.

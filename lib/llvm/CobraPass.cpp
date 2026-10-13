@@ -565,6 +565,8 @@ namespace cobra {
             into.boolean_merged += run.boolean_merged;
             into.boolean_undecided += run.boolean_undecided;
             into.boolean_found += run.boolean_found;
+            into.free_leaf_trees += run.free_leaf_trees;
+            into.free_leaf_found += run.free_leaf_found;
             into.enumeration_nanoseconds += run.enumeration_nanoseconds;
             into.ring_attempted += run.ring_attempted;
             into.ring_proved += run.ring_proved;
@@ -1318,7 +1320,7 @@ namespace cobra {
             // and loads again must not read a verdict an older build wrote
             // under another fingerprint or another set of techniques. Bumped
             // whenever either changes.
-            constexpr uint64_t kRecordVersion = 2;
+            constexpr uint64_t kRecordVersion = 3;
             tag = mix(tag, kRecordVersion);
             return tag;
         }
@@ -2070,6 +2072,167 @@ namespace cobra {
                 .verified           = false });
         }
 
+        namespace free_leaf_reading {
+
+            // The variable `expr` is, read through the mask of `meaning`, when
+            // it is one of the freed leaves; and `count` otherwise.
+            uint32_t FreedLeaf(
+                const Expr &expr, const std::vector< std::unique_ptr< Expr > > &meaning,
+                const std::vector< bool > &freed
+            ) {
+                if (expr.kind != Expr::Kind::kAnd && expr.kind != Expr::Kind::kOr) {
+                    return static_cast< uint32_t >(meaning.size());
+                }
+                for (uint32_t variable = 0; variable < meaning.size(); ++variable) {
+                    if (freed[variable] && ExprStructurallyEqual(expr, *meaning[variable])) {
+                        return variable;
+                    }
+                }
+                return static_cast< uint32_t >(meaning.size());
+            }
+
+            // Which of the `freed` variables `expr` reads outside their masks.
+            void MarkBare(
+                const Expr &expr, const std::vector< std::unique_ptr< Expr > > &meaning,
+                const std::vector< bool > &freed, std::vector< bool > &bare
+            ) {
+                if (FreedLeaf(expr, meaning, freed) < meaning.size()) {
+                    return;
+                }
+                if (expr.kind == Expr::Kind::kVariable) {
+                    if (expr.var_index < bare.size()) {
+                        bare[expr.var_index] = true;
+                    }
+                    return;
+                }
+                for (const auto &child : expr.children) {
+                    MarkBare(*child, meaning, freed, bare);
+                }
+            }
+
+            // `expr` with every freed leaf's mask taken off.
+            std::unique_ptr< Expr > Free(
+                const Expr &expr, const std::vector< std::unique_ptr< Expr > > &meaning,
+                const std::vector< bool > &freed
+            ) {
+                if (const uint32_t variable = FreedLeaf(expr, meaning, freed); variable < meaning.size()) {
+                    return Expr::Variable(variable);
+                }
+                auto copy = std::make_unique< Expr >();
+                copy->kind         = expr.kind;
+                copy->constant_val = expr.constant_val;
+                copy->var_index    = expr.var_index;
+                for (const auto &child : expr.children) {
+                    copy->children.push_back(Free(*child, meaning, freed));
+                }
+                return copy;
+            }
+
+            // `expr` with every freed variable read through its mask again.
+            std::unique_ptr< Expr > Mask(
+                const Expr &expr, const std::vector< std::unique_ptr< Expr > > &meaning,
+                const std::vector< bool > &freed
+            ) {
+                if (expr.kind == Expr::Kind::kVariable && expr.var_index < freed.size()
+                    && freed[expr.var_index])
+                {
+                    return CloneExpr(*meaning[expr.var_index]);
+                }
+                auto copy = std::make_unique< Expr >();
+                copy->kind         = expr.kind;
+                copy->constant_val = expr.constant_val;
+                copy->var_index    = expr.var_index;
+                for (const auto &child : expr.children) {
+                    copy->children.push_back(Mask(*child, meaning, freed));
+                }
+                return copy;
+            }
+
+        } // namespace free_leaf_reading
+
+        // A tree the search turned down, read again with its masked leaves free.
+        //
+        // A leaf narrower than the tree, or one with bits known, is read through
+        // a mask (`LeafExpr`): a 32-bit read summed into a 64-bit word is
+        // `v & 0xffffffff` wherever the tree reads it. The search takes that mask
+        // for an operator applied to a variable, and an identity of the masked
+        // value can then be one no technique of it reads: a base plus an offset
+        // spelled `((a + b | 1) - (a ^ b) & -2) + (a ^ b)` is `a + b`, found at
+        // once with `b` free and not at all with `b` a 32-bit read.
+        //
+        // A rewrite that holds for every value of a variable holds for the values
+        // its mask lets through, so each leaf the tree reads only through its
+        // mask is made a free variable, the search is asked again, and its answer
+        // is read back with the mask around each such variable - the tree's own
+        // function, which `VerifyCandidate` then checks as it checks any rewrite.
+        // A leaf also read bare somewhere keeps its mask: freeing it in one place
+        // and not the other would hand the search another function.
+        OutcomeCache::Entry ProposeFreeLeafRewrite(
+            const MBACandidate &cand, const CobraPassOptions &options, CobraStatistics &stats
+        ) {
+            using namespace free_leaf_reading;
+            if (cand.expr == nullptr) {
+                return nullptr;
+            }
+            const uint32_t bw    = cand.bitwidth;
+            const auto variables = static_cast< uint32_t >(cand.var_names.size());
+            std::vector< std::unique_ptr< Expr > > meaning;
+            std::vector< bool > freed(variables, false);
+            for (uint32_t variable = 0; variable < variables; ++variable) {
+                auto leaf       = LeafExpr(cand, variable);
+                freed[variable] = leaf != nullptr && leaf->kind != Expr::Kind::kVariable;
+                meaning.push_back(freed[variable] ? std::move(leaf) : Expr::Variable(variable));
+            }
+            std::vector< bool > bare(variables, false);
+            MarkBare(*cand.expr, meaning, freed, bare);
+            for (uint32_t variable = 0; variable < variables; ++variable) {
+                freed[variable] = freed[variable] && !bare[variable];
+            }
+            if (llvm::none_of(freed, [](bool free) { return free; })) {
+                return nullptr;
+            }
+            auto read = Free(*cand.expr, meaning, freed);
+            if (!options.z3_verify && ContainsComparison(*read)) {
+                return nullptr;
+            }
+            ++stats.free_leaf_trees;
+
+            Options opts{ .bitwidth         = bw,
+                          .max_vars         = options.max_vars,
+                          .spot_check       = true,
+                          .enabled_families = options.enabled_families,
+                          .evaluator        = Evaluator::FromExpr(*read, bw),
+                          .demanded_mask    = cand.demanded_mask };
+            const auto sig = EvaluateBooleanSignature(*read, variables, bw);
+            auto result    = Simplify(sig, cand.var_names, read.get(), opts);
+            if (!result.has_value() || result.value().kind != SimplifyOutcome::Kind::kSimplified) {
+                RejectReason() = "free-leaf reading: not simplified"
+                    + (result.has_value() ? ": " + result.value().diag.reason : std::string());
+                return nullptr;
+            }
+            auto rewrite = std::move(result.value().expr);
+            if (!result.value().real_vars.empty()) {
+                auto support = TryBuildVarSupport(cand.var_names, result.value().real_vars);
+                if (!support.has_value()) {
+                    RejectReason() = "free-leaf reading: the rewrite names a variable it was not given";
+                    return nullptr;
+                }
+                RemapVarIndices(*rewrite, *support);
+            }
+            auto restored = Mask(*rewrite, meaning, freed);
+            if (!IsBetter(ComputeCost(*restored).cost, ComputeCost(*cand.expr).cost)) {
+                RejectReason() = "free-leaf reading: not cheaper: " + RenderSSA(*restored, cand.var_names);
+                return nullptr;
+            }
+            ++stats.free_leaf_found;
+            return std::make_shared< const CandidateOutcome >(CandidateOutcome{
+                .expr               = std::move(restored),
+                .real_vars          = {},
+                .real_var_positions = {},
+                .accepted_unknown   = false,
+                .verified           = false });
+        }
+
         // Search for a rewrite of one candidate and put it through the cost gate
         // (`ProposeOrdinaryRewrite`), and with `boolean_variables` read its
         // conditions as variables (`ProposeBooleanRewrite`) - first for a tree that
@@ -2079,7 +2242,7 @@ namespace cobra {
         // leaf and the rewrite is the shift the function already holds - and alone
         // on the boolean cut, whose narrow comparisons every other search reads as
         // opaque.
-        OutcomeCache::Entry ProposeRewrite(
+        OutcomeCache::Entry ProposeRewriteAsRead(
             const MBACandidate &cand, const CobraPassOptions &options, SolveVerdict &verdict,
             CobraStatistics &stats
         ) {
@@ -2134,6 +2297,28 @@ namespace cobra {
             }
 #endif
             return ordinary;
+        }
+
+        // `ProposeRewriteAsRead`, and where it finds nothing at all, the tree with
+        // its masked leaves free (`ProposeFreeLeafRewrite`). A rewrite found but
+        // not cheaper is not asked about again: freeing a leaf only drops a mask.
+        OutcomeCache::Entry ProposeRewrite(
+            const MBACandidate &cand, const CobraPassOptions &options, SolveVerdict &verdict,
+            CobraStatistics &stats
+        ) {
+            auto outcome = ProposeRewriteAsRead(cand, options, verdict, stats);
+            if (outcome != nullptr || verdict != SolveVerdict::kUnsolved
+                || cand.node_limit == kBooleanCutLimit || Old("free-leaf"))
+            {
+                return outcome;
+            }
+            const std::string reason = RejectReason();
+            if (auto freed = ProposeFreeLeafRewrite(cand, options, stats)) {
+                verdict = SolveVerdict::kSolved;
+                return freed;
+            }
+            RejectReason() = reason + (RejectReason().empty() || RejectReason() == reason ? "" : "; " + RejectReason());
+            return nullptr;
         }
 
         // `COBRA_RING_PROOF=0` sends every question past the enumeration to the
@@ -2300,7 +2485,8 @@ namespace cobra {
         // share no leaf, so a width-crossing identity with a base added into it
         // stays out of reach), `leaf-width` (a leaf identity is offered as a bare variable
         // rather than as the tree reads the leaf, which refuses every tree whose
-        // answer is a leaf narrower than it).
+        // answer is a leaf narrower than it), `free-leaf` (a tree the search turns
+        // down is not read again with its masked leaves free).
         bool Old(std::string_view behaviour) {
             static const std::string chosen = [] {
                 const char *value = std::getenv("COBRA_OLD");
@@ -4544,6 +4730,10 @@ namespace cobra {
             part("      pairs proved one condition", stats.boolean_merged);
             part("      pairs the solver could not decide", stats.boolean_undecided);
             part("      rewrites found", stats.boolean_found);
+        }
+        if (stats.free_leaf_trees != 0) {
+            part("    trees read again with their masked leaves free", stats.free_leaf_trees);
+            part("      rewrites found", stats.free_leaf_found);
         }
         cost("  proving by running every input", stats.enumeration_nanoseconds);
         line("  proving in a ring normal form (attempts)", stats.ring_attempted, stats.ring_nanoseconds);
