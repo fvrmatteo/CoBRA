@@ -635,7 +635,17 @@ namespace cobra {
             {
                 std::vector< Term > atoms;
                 bool fits = true;
+                // The terms already walked, as read under a bitwise operator
+                // and as read under an arithmetic one. Terms are shared, so a
+                // walk that does not remember them is exponential in the depth
+                // of a chain such as `t + t`.
+                std::unordered_set< uint64_t > walked_bitwise;
+                std::unordered_set< uint64_t > walked_arithmetic;
             };
+
+            // A term's value at one assignment of the atoms, per term, for the
+            // same reason; one per way of reading a term.
+            using TermValues = std::unordered_map< uint64_t, uint64_t >;
 
             static int AtomIndex(const LinearShape &shape, const Term &term) {
                 for (size_t index = 0; index < shape.atoms.size(); ++index) {
@@ -647,7 +657,9 @@ namespace cobra {
             }
 
             static void AtomsOf(const Term &term, bool bitwise, LinearShape &shape) {
-                if (!shape.fits) {
+                if (!shape.fits
+                    || !(bitwise ? shape.walked_bitwise : shape.walked_arithmetic).insert(term.id()).second)
+                {
                     return;
                 }
                 if (term.is_value()) {
@@ -698,7 +710,18 @@ namespace cobra {
             }
 
             // The bitwise part at one-bit inputs: 0 or 1.
-            static uint64_t EvaluateBit(const Term &term, const LinearShape &shape, size_t bits) {
+            static uint64_t
+            EvaluateBit(const Term &term, const LinearShape &shape, size_t bits, TermValues &memo) {
+                if (const auto found = memo.find(term.id()); found != memo.end()) {
+                    return found->second;
+                }
+                const uint64_t value = EvaluateBitUncached(term, shape, bits, memo);
+                memo.emplace(term.id(), value);
+                return value;
+            }
+
+            static uint64_t
+            EvaluateBitUncached(const Term &term, const LinearShape &shape, size_t bits, TermValues &memo) {
                 if (term.is_value()) {
                     return ValueOf(term, static_cast< unsigned >(term.sort().bv_size())) != 0 ? 1 : 0;
                 }
@@ -708,7 +731,7 @@ namespace cobra {
                 const auto children = term.children();
                 uint64_t result     = term.kind() == Kind::BV_AND ? 1 : 0;
                 for (const auto &child : children) {
-                    const uint64_t value = EvaluateBit(child, shape, bits);
+                    const uint64_t value = EvaluateBit(child, shape, bits, memo);
                     switch (term.kind()) {
                         case Kind::BV_NOT:
                             return value ^ 1;
@@ -729,7 +752,26 @@ namespace cobra {
             // The linear MBA signature: integers modulo the width, the bitwise
             // parts at one-bit inputs, and a constant c as -c times the
             // all-ones function.
-            static uint64_t EvaluateLinear(const Term &term, const LinearShape &shape, size_t bits, uint64_t mask) {
+            struct LinearValues
+            {
+                TermValues linear;
+                TermValues bit;
+            };
+
+            static uint64_t EvaluateLinear(
+                const Term &term, const LinearShape &shape, size_t bits, uint64_t mask, LinearValues &memo
+            ) {
+                if (const auto found = memo.linear.find(term.id()); found != memo.linear.end()) {
+                    return found->second;
+                }
+                const uint64_t value = EvaluateLinearUncached(term, shape, bits, mask, memo);
+                memo.linear.emplace(term.id(), value);
+                return value;
+            }
+
+            static uint64_t EvaluateLinearUncached(
+                const Term &term, const LinearShape &shape, size_t bits, uint64_t mask, LinearValues &memo
+            ) {
                 if (term.is_value()) {
                     return (0 - ValueOf(term, static_cast< unsigned >(term.sort().bv_size()))) & mask;
                 }
@@ -741,25 +783,25 @@ namespace cobra {
                     case Kind::BV_ADD: {
                         uint64_t sum = 0;
                         for (const auto &child : children) {
-                            sum += EvaluateLinear(child, shape, bits, mask);
+                            sum += EvaluateLinear(child, shape, bits, mask, memo);
                         }
                         return sum & mask;
                     }
                     case Kind::BV_SUB:
-                        return (EvaluateLinear(children[0], shape, bits, mask)
-                                - EvaluateLinear(children[1], shape, bits, mask))
+                        return (EvaluateLinear(children[0], shape, bits, mask, memo)
+                                - EvaluateLinear(children[1], shape, bits, mask, memo))
                             & mask;
                     case Kind::BV_NEG:
-                        return (0 - EvaluateLinear(children[0], shape, bits, mask)) & mask;
+                        return (0 - EvaluateLinear(children[0], shape, bits, mask, memo)) & mask;
                     case Kind::BV_MUL: {
                         const Term &factor = children[0].is_value() ? children[0] : children[1];
                         const Term &other  = children[0].is_value() ? children[1] : children[0];
                         return (ValueOf(factor, static_cast< unsigned >(factor.sort().bv_size()))
-                                * EvaluateLinear(other, shape, bits, mask))
+                                * EvaluateLinear(other, shape, bits, mask, memo))
                             & mask;
                     }
                     default:
-                        return EvaluateBit(term, shape, bits);
+                        return EvaluateBit(term, shape, bits, memo.bit);
                 }
             }
 
@@ -862,7 +904,8 @@ namespace cobra {
                 const size_t count  = shape.atoms.size();
                 std::vector< uint64_t > coefficients(size_t{ 1 } << count);
                 for (size_t bits = 0; bits < coefficients.size(); ++bits) {
-                    coefficients[bits] = EvaluateLinear(rebuilt, shape, bits, mask);
+                    LinearValues values;
+                    coefficients[bits] = EvaluateLinear(rebuilt, shape, bits, mask, values);
                 }
                 for (size_t bit = 0; bit < count; ++bit) {
                     for (size_t bits = 0; bits < coefficients.size(); ++bits) {
@@ -1105,11 +1148,19 @@ namespace cobra {
             bitwuzla::Result Ask(
                 const Term &formula, Clock::time_point deadline, bool models, bitwuzla::Bitwuzla **kept
             ) {
-                const auto left = std::chrono::duration_cast< std::chrono::milliseconds >(deadline - Clock::now());
                 bitwuzla::Options options;
-                options.set(
-                    bitwuzla::Option::TIME_LIMIT_PER, static_cast< uint64_t >(std::max< int64_t >(1, left.count()))
-                );
+                // No deadline is no time limit. Given as the milliseconds left
+                // until the end of time, the limit is added to the clock and
+                // overflows it where the clock counts nanoseconds, so every
+                // check would end before it began.
+                if (deadline != Clock::time_point::max()) {
+                    const auto left =
+                        std::chrono::duration_cast< std::chrono::milliseconds >(deadline - Clock::now());
+                    options.set(
+                        bitwuzla::Option::TIME_LIMIT_PER,
+                        static_cast< uint64_t >(std::max< int64_t >(1, left.count()))
+                    );
+                }
                 options.set(bitwuzla::Option::REWRITE_LEVEL, settings_.rewrite_level);
                 options.set(bitwuzla::Option::PRODUCE_MODELS, models);
                 solver_ = std::make_unique< bitwuzla::Bitwuzla >(terms_, options);
