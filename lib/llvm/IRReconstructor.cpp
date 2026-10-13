@@ -4,11 +4,14 @@
 #include "cobra/core/Expr.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
+#include "llvm/Support/KnownBits.h"
 
 #include <cstdint>
 #include <unordered_map>
@@ -364,18 +367,42 @@ namespace cobra {
                     if (!var_map.empty()) {
                         leaf_idx = var_map[leaf.var_index];
                     }
-                    if (leaf_idx >= candidate.leaf_bits.size()) {
+                    if (leaf_idx >= candidate.leaf_values.size()) {
                         return nullptr;
                     }
-                    const auto &bits     = candidate.leaf_bits[leaf_idx];
                     const uint64_t width = candidate.bitwidth >= 64 ? ~uint64_t{ 0 }
                                                                     : (uint64_t{ 1 } << candidate.bitwidth) - 1;
+                    // What may be relied on is what holds of the value the
+                    // rewrite reads, now - not what the tree was read under.
+                    // The proof covers the leaf masked by its known bits, which
+                    // is the leaf itself only while those bits hold. A leaf the
+                    // rewrite freezes because it may be poison holds any value
+                    // once frozen, so its known bits say nothing about it; and
+                    // a rewrite earlier in the run, exact only on the bits its
+                    // readers look at, may have changed the leaf in bits this
+                    // tree's facts were about. So the facts are read again, and
+                    // none are read for a frozen leaf.
+                    LeafBits bits;
+                    auto *value       = candidate.leaf_values[leaf_idx];
+                    const bool frozen = leaves != nullptr
+                        && (leaves->freeze_on_use[leaf_idx] || leaves->values[leaf_idx] != value);
+                    if (!frozen && value->getType()->isIntegerTy()
+                        && value->getType()->getIntegerBitWidth() <= 64)
+                    {
+                        const llvm::KnownBits known = llvm::computeKnownBits(
+                            value, builder.GetInsertBlock()->getModule()->getDataLayout()
+                        );
+                        bits.zero = known.Zero.getZExtValue() & width;
+                        bits.one  = known.One.getZExtValue() & width;
+                    }
                     // The bits above a narrow leaf's own width are known zero
                     // too - `NarrowWidth` masks them wherever the leaf is read,
                     // which is why `LeafBitsOf` leaves them out as "not news" -
                     // so a mask that only keeps those bits clear says nothing
                     // either, and emitting it would price the answer one
-                    // instruction higher than it is.
+                    // instruction higher than it is. That holds of a frozen
+                    // leaf too: it is frozen at its own width and then
+                    // zero-extended.
                     uint64_t zero = bits.zero;
                     if (leaf_idx < candidate.leaf_widths.size()) {
                         if (const auto own = candidate.leaf_widths[leaf_idx]; own != 0) {
