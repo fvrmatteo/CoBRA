@@ -1777,12 +1777,20 @@ namespace cobra {
         }
         auto &memo = PatternMemo();
         if (memo.depth == 0) { memo.TrimIfLarge(); }
-        ++memo.depth;
+        // Released on every way out: a worker that catches what a solve
+        // throws keeps its memo, and a depth left raised would stop it ever
+        // being trimmed again.
+        struct Nesting
+        {
+            unsigned &depth;
+            explicit Nesting(unsigned &d) : depth(d) { ++depth; }
+            ~Nesting() { --depth; }
+            Nesting(const Nesting &)            = delete;
+            Nesting &operator=(const Nesting &) = delete;
+        } nesting(memo.depth);
         SubtreeMemo::Ids ids;
         memo.Intern(*expr, bitwidth, ids);
-        auto result = SimplifyPatternSubtreesMemo(std::move(expr), bitwidth, memo, ids);
-        --memo.depth;
-        return result;
+        return SimplifyPatternSubtreesMemo(std::move(expr), bitwidth, memo, ids);
     }
 
     std::unique_ptr< Expr > SimplifyXorChains(std::unique_ptr< Expr > expr, uint32_t bitwidth) {

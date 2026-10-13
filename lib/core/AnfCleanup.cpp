@@ -423,8 +423,8 @@ namespace cobra {
                 return 1;
             case Expr::Kind::kNot:
             case Expr::Kind::kNeg:
-                return 1 + ExprCost(*expr.children[0]);
             case Expr::Kind::kShr:
+                return 1 + ExprCost(*expr.children[0]);
             case Expr::Kind::kAdd:
             case Expr::Kind::kMul:
             case Expr::Kind::kAnd:

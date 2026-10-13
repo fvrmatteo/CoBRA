@@ -171,3 +171,22 @@ TEST(TemplateDecomposer, CachedSuccessIsReverified) {
     auto colliding_ctx = make_ctx(1, colliding_eval, { "x" });
     EXPECT_FALSE(TryTemplateDecomposition(colliding_ctx, opts, 1, nullptr).Succeeded());
 }
+
+// A search answered from the cache is the search it replays: asked again for
+// the same function, the template search gives the same answer.
+TEST(TemplateDecomposer, CachedAnswerIsTheSearchedOne) {
+    auto eval = [](const std::vector< uint64_t > &v) -> uint64_t {
+        return (v[0] & v[1]) + (v[0] ^ 0x1234);
+    };
+    auto ctx  = make_ctx(2, eval, { "x", "y" });
+    auto opts = make_opts();
+
+    auto first  = TryTemplateDecomposition(ctx, opts, 2, nullptr);
+    auto second = TryTemplateDecomposition(ctx, opts, 2, nullptr);
+    ASSERT_EQ(first.Succeeded(), second.Succeeded());
+    if (first.Succeeded()) {
+        EXPECT_EQ(
+            Render(*first.Payload().expr, { "x", "y" }), Render(*second.Payload().expr, { "x", "y" })
+        );
+    }
+}

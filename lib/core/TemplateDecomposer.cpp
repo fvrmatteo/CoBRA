@@ -88,9 +88,18 @@ namespace cobra {
             ProbeVals target;
             uint32_t num_vars;
             uint32_t bitwidth;
+            // The cost a candidate has to beat, which turns candidates down
+            // as surely as the full-width check does: two searches replay
+            // each other only under the same one.
+            bool has_baseline      = false;
+            ExprCost baseline_cost = {};
 
             bool operator==(const TemplateCacheKey &other) const {
                 return num_vars == other.num_vars && bitwidth == other.bitwidth
+                    && has_baseline == other.has_baseline
+                    && baseline_cost.weighted_size == other.baseline_cost.weighted_size
+                    && baseline_cost.nonlinear_mul_count == other.baseline_cost.nonlinear_mul_count
+                    && baseline_cost.max_depth == other.baseline_cost.max_depth
                     && static_cast< const std::array< uint64_t, kNProbes > & >(target)
                     == static_cast< const std::array< uint64_t, kNProbes > & >(other.target);
             }
@@ -104,6 +113,8 @@ namespace cobra {
                     + (hash >> 2);
                 hash ^= static_cast< size_t >(key.bitwidth) + 0x9E3779B9U + (hash << 6)
                     + (hash >> 2);
+                hash ^= static_cast< size_t >(key.baseline_cost.weighted_size) + 0x9E3779B9U
+                    + (hash << 6) + (hash >> 2);
                 return hash;
             }
         };
@@ -113,13 +124,27 @@ namespace cobra {
         // The enumeration a template search performs is a pure function of the
         // cache key: the probe points, the atom pool and the seeded constants
         // are all derived from the target signature, the arity and the
-        // bitwidth. The evaluator only enters through FullWidthCheckEval, so
-        // two searches sharing a key differ only in which candidates that check
-        // accepts. Keeping the rejected candidates means a later search on the
-        // same key can be answered by re-checking just those: if they all fail
-        // again, every other candidate was already ruled out on the probe
-        // values alone and the search cannot end anywhere but where it did.
-        using MissWitnesses = std::vector< std::unique_ptr< Expr > >;
+        // bitwidth, and what a candidate's cost decides is fixed by the
+        // baseline the key carries. The evaluator only enters through
+        // FullWidthCheckEval, so two searches sharing a key differ only in
+        // which candidates that check accepts.
+        //
+        // Keeping the candidates the check turned down means a later search on
+        // the same key can be replayed by re-checking just those. If they all
+        // fail again, the candidates this search accepts are a subset of the
+        // ones the recorded search accepted: a miss stays a miss, and a found
+        // answer stays the one found - every layer either takes the first
+        // candidate it accepts or the cheapest, and neither changes when
+        // candidates after it, or dearer than it, drop out. A candidate turned
+        // down only on its cost is recorded too, but is turned down again under
+        // the same baseline whatever the check says, so it is not re-checked.
+        struct MissWitness
+        {
+            std::unique_ptr< Expr > expr;
+            // Turned down by the full-width check, rather than on cost.
+            bool by_check = true;
+        };
+        using MissWitnesses = std::vector< MissWitness >;
 
         struct WitnessCollector
         {
@@ -156,7 +181,35 @@ namespace cobra {
             WitnessCollector *previous_;
         };
 
-        void RecordMissWitness(const Expr &candidate) {
+        enum class TurnedDown : uint8_t { kByCheck, kOnCost };
+
+        // How the candidates a search turns down relate to the function the
+        // recorded search is replayed against: the search for `-f` or `~f`
+        // checks its candidates against that, and a candidate `c` it turns
+        // down is `-c` or `~c` turned down for `f` (the check reads the same
+        // points for both, which only the candidate's constants decide).
+        enum class WitnessWrap : uint8_t { kNone, kNeg, kNot };
+
+        WitnessWrap &ActiveWitnessWrap() {
+            static thread_local WitnessWrap wrap = WitnessWrap::kNone;
+            return wrap;
+        }
+
+        class WitnessWrapScope
+        {
+          public:
+            explicit WitnessWrapScope(WitnessWrap wrap) : previous_(ActiveWitnessWrap()) {
+                ActiveWitnessWrap() = wrap;
+            }
+            WitnessWrapScope(const WitnessWrapScope &)            = delete;
+            WitnessWrapScope &operator=(const WitnessWrapScope &) = delete;
+            ~WitnessWrapScope() { ActiveWitnessWrap() = previous_; }
+
+          private:
+            WitnessWrap previous_;
+        };
+
+        void RecordMissWitness(const Expr &candidate, TurnedDown why) {
             auto *collector = ActiveWitnessCollector();
             if (collector == nullptr || collector->overflow) {
                 return;
@@ -166,7 +219,31 @@ namespace cobra {
                 collector->failed.clear();
                 return;
             }
-            collector->failed.push_back(CloneExpr(candidate));
+            auto expr = CloneExpr(candidate);
+            switch (ActiveWitnessWrap()) {
+                case WitnessWrap::kNeg:
+                    expr = Expr::Negate(std::move(expr));
+                    break;
+                case WitnessWrap::kNot:
+                    expr = Expr::BitwiseNot(std::move(expr));
+                    break;
+                case WitnessWrap::kNone:
+                    break;
+            }
+            collector->failed.push_back(
+                MissWitness{ .expr = std::move(expr), .by_check = why == TurnedDown::kByCheck }
+            );
+        }
+
+        // Whether a search recorded with `witnesses` replays for `eval`: every
+        // candidate the full-width check turned down is turned down again.
+        bool WitnessesStillFail(
+            const MissWitnesses &witnesses, const Evaluator &eval, uint32_t num_vars,
+            uint32_t bitwidth
+        ) {
+            return std::none_of(witnesses.begin(), witnesses.end(), [&](const MissWitness &w) {
+                return w.by_check && FullWidthCheckEval(eval, num_vars, *w.expr, bitwidth).passed;
+            });
         }
 
         class TemplateCache
@@ -178,10 +255,19 @@ namespace cobra {
                 return it == misses_.end() ? nullptr : it->second;
             }
 
-            std::unique_ptr< Expr > FindSuccess(const TemplateCacheKey &key) const {
+            struct Success
+            {
+                std::unique_ptr< Expr > expr;
+                std::shared_ptr< const MissWitnesses > witnesses;
+            };
+
+            std::optional< Success > FindSuccess(const TemplateCacheKey &key) const {
                 const std::lock_guard< std::mutex > lock(mutex_);
                 const auto it = successes_.find(key);
-                return it == successes_.end() ? nullptr : CloneExpr(*it->second);
+                if (it == successes_.end()) {
+                    return std::nullopt;
+                }
+                return Success{ .expr = CloneExpr(*it->second.expr), .witnesses = it->second.witnesses };
             }
 
             void InsertMiss(TemplateCacheKey key, MissWitnesses witnesses) {
@@ -191,11 +277,14 @@ namespace cobra {
                 misses_.insert_or_assign(std::move(key), std::move(entry));
             }
 
-            void InsertSuccess(TemplateCacheKey key, const Expr &expr) {
-                auto clone = CloneExpr(expr);
+            void InsertSuccess(TemplateCacheKey key, const Expr &expr, MissWitnesses witnesses) {
+                Stored entry{ .expr      = CloneExpr(expr),
+                              .witnesses = std::make_shared< const MissWitnesses >(
+                                  std::move(witnesses)
+                              ) };
                 const std::lock_guard< std::mutex > lock(mutex_);
                 MakeRoom();
-                successes_.insert_or_assign(std::move(key), std::move(clone));
+                successes_.insert_or_assign(std::move(key), std::move(entry));
             }
 
           private:
@@ -213,9 +302,12 @@ namespace cobra {
             std::unordered_map<
                 TemplateCacheKey, std::shared_ptr< const MissWitnesses >, TemplateCacheKeyHash >
                 misses_;
-            std::unordered_map<
-                TemplateCacheKey, std::unique_ptr< Expr >, TemplateCacheKeyHash >
-                successes_;
+            struct Stored
+            {
+                std::unique_ptr< Expr > expr;
+                std::shared_ptr< const MissWitnesses > witnesses;
+            };
+            std::unordered_map< TemplateCacheKey, Stored, TemplateCacheKeyHash > successes_;
         };
 
         TemplateCache &SharedTemplateCache() {
@@ -637,17 +729,17 @@ namespace cobra {
             saw_probe_match = true;
             auto chk        = FullWidthCheckEval(eval, num_vars, *candidate, bw);
             if (!chk.passed) {
-                RecordMissWitness(*candidate);
+                RecordMissWitness(*candidate, TurnedDown::kByCheck);
                 return false;
             }
 
             auto info = ComputeCost(*candidate);
             if ((baseline != nullptr) && !IsBetter(info.cost, *baseline)) {
-                RecordMissWitness(*candidate);
+                RecordMissWitness(*candidate, TurnedDown::kOnCost);
                 return false;
             }
             if (best.has_value() && !IsBetter(info.cost, best->cost)) {
-                RecordMissWitness(*candidate);
+                RecordMissWitness(*candidate, TurnedDown::kOnCost);
                 return false;
             }
 
@@ -1244,12 +1336,12 @@ namespace cobra {
                             saw_probe_match = true;
                             auto chk        = FullWidthCheckEval(eval, nv, *e, bw);
                             if (!chk.passed) {
-                                RecordMissWitness(*e);
+                                RecordMissWitness(*e, TurnedDown::kByCheck);
                                 continue;
                             }
                             auto info = ComputeCost(*e);
                             if ((baseline != nullptr) && !IsBetter(info.cost, *baseline)) {
-                                RecordMissWitness(*e);
+                                RecordMissWitness(*e, TurnedDown::kOnCost);
                                 continue;
                             }
                             SignaturePayload s{
@@ -1577,36 +1669,32 @@ namespace cobra {
         for (size_t i = 0; i < kNProbes; ++i) {
             target[i] = (*ctx.eval)(pts[i]);
         }
-        const TemplateCacheKey cache_key{ .target   = target,
-                                          .num_vars = num_vars,
-                                          .bitwidth = opts.bitwidth };
+        const TemplateCacheKey cache_key{ .target        = target,
+                                          .num_vars      = num_vars,
+                                          .bitwidth      = opts.bitwidth,
+                                          .has_baseline  = baseline_cost != nullptr,
+                                          .baseline_cost = baseline_cost != nullptr ? *baseline_cost
+                                                                                    : ExprCost{} };
         auto &template_cache = SharedTemplateCache();
+        // A recorded search stands for this one only while it replays
+        // (`WitnessesStillFail`): then the answer it found is the answer this
+        // search would find, and a cached answer can never depend on which
+        // search happened to be recorded first.
         if (auto cached = template_cache.FindSuccess(cache_key)) {
-            auto chk = FullWidthCheckEval(*ctx.eval, num_vars, *cached, opts.bitwidth);
-            if (chk.passed) {
-                auto info = ComputeCost(*cached);
-                if ((baseline_cost == nullptr) || IsBetter(info.cost, *baseline_cost)) {
-                    SignaturePayload payload{
-                        .expr         = std::move(cached),
-                        .cost         = info.cost,
-                        .verification = VerificationState::kVerified,
-                    };
-                    return SolverResult< SignaturePayload >::Success(std::move(payload));
-                }
+            if (WitnessesStillFail(*cached->witnesses, *ctx.eval, num_vars, opts.bitwidth)
+                && FullWidthCheckEval(*ctx.eval, num_vars, *cached->expr, opts.bitwidth).passed)
+            {
+                auto info = ComputeCost(*cached->expr);
+                SignaturePayload payload{
+                    .expr         = std::move(cached->expr),
+                    .cost         = info.cost,
+                    .verification = VerificationState::kVerified,
+                };
+                return SolverResult< SignaturePayload >::Success(std::move(payload));
             }
         }
         if (auto witnesses = template_cache.FindMiss(cache_key)) {
-            // A recorded miss only stands while every candidate it turned down
-            // is still turned down. Re-checking them costs a handful of
-            // evaluations against the whole layered search behind them.
-            bool still_missing = true;
-            for (const auto &witness : *witnesses) {
-                if (FullWidthCheckEval(*ctx.eval, num_vars, *witness, opts.bitwidth).passed) {
-                    still_missing = false;
-                    break;
-                }
-            }
-            if (still_missing) {
+            if (WitnessesStillFail(*witnesses, *ctx.eval, num_vars, opts.bitwidth)) {
                 return SolverResult< SignaturePayload >::Blocked(
                     ReasonDetail{
                         .top = { .code    = { ReasonCategory::kSearchExhausted,
@@ -1619,7 +1707,11 @@ namespace cobra {
         }
         WitnessScope witness_scope;
         auto return_success = [&](SignaturePayload payload) {
-            template_cache.InsertSuccess(cache_key, *payload.expr);
+            if (!witness_scope.collector().overflow) {
+                template_cache.InsertSuccess(
+                    cache_key, *payload.expr, std::move(witness_scope.collector().failed)
+                );
+            }
             return SolverResult< SignaturePayload >::Success(std::move(payload));
         };
         bool saw_probe_match = false;
@@ -1681,9 +1773,9 @@ namespace cobra {
                         };
                         return return_success(std::move(s));
                     }
-                    RecordMissWitness(*e);
+                    RecordMissWitness(*e, TurnedDown::kOnCost);
                 } else {
-                    RecordMissWitness(*e);
+                    RecordMissWitness(*e, TurnedDown::kByCheck);
                 }
             }
         }
@@ -1736,12 +1828,12 @@ namespace cobra {
                 saw_probe_match = true;
                 auto chk = FullWidthCheckEval(*ctx.eval, num_vars, *wrapped, opts.bitwidth);
                 if (!chk.passed) {
-                    RecordMissWitness(*wrapped);
+                    RecordMissWitness(*wrapped, TurnedDown::kByCheck);
                     return std::nullopt;
                 }
                 auto info = ComputeCost(*wrapped);
                 if (baseline_cost && !IsBetter(info.cost, *baseline_cost)) {
-                    RecordMissWitness(*wrapped);
+                    RecordMissWitness(*wrapped, TurnedDown::kOnCost);
                     return std::nullopt;
                 }
                 SignaturePayload s{
@@ -1763,11 +1855,25 @@ namespace cobra {
                 }
             }
 
-            // Layer 1 on lifted
-            auto w1 = Layer1(
-                lifted, pool, vmap, kMask, *ctx.eval, num_vars, opts.bitwidth, nullptr,
-                saw_probe_match
+            // Layer 1 on lifted. Its candidates are candidates for the lifted
+            // function, so they are checked against that: against the target
+            // itself only a candidate equal to its own negation could pass.
+            const Evaluator &target_eval = *ctx.eval;
+            const Evaluator lifted_eval(
+                [&target_eval, wrap, kMask](const std::vector< uint64_t > &values) {
+                    const uint64_t value = target_eval(values);
+                    return (wrap == 0 ? (uint64_t{ 0 } - value) : ~value) & kMask;
+                },
+                num_vars, EvaluatorTraceKind::kNone
             );
+            std::optional< SignaturePayload > w1;
+            {
+                const WitnessWrapScope wrapped(wrap == 0 ? WitnessWrap::kNeg : WitnessWrap::kNot);
+                w1 = Layer1(
+                    lifted, pool, vmap, kMask, lifted_eval, num_vars, opts.bitwidth, nullptr,
+                    saw_probe_match
+                );
+            }
             if (w1.has_value()) {
                 auto r = check_wrap(std::move(w1->expr));
                 if (r.has_value()) {

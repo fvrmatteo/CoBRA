@@ -486,7 +486,8 @@ namespace cobra {
         std::vector< std::pair< const Expr *, uint32_t > > nodes;
         CollectComparisons(lhs, index, nodes);
         CollectComparisons(rhs, index, nodes);
-        if (index.empty() || index.size() > limits.max_comparisons) {
+        // Every case is a bit of a 64-bit counter, whatever the limit says.
+        if (index.empty() || index.size() > limits.max_comparisons || index.size() >= 64) {
             return false;
         }
         const uint64_t cases = uint64_t{ 1 } << index.size();
