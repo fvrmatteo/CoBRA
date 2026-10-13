@@ -974,6 +974,7 @@ namespace cobra {
                 if (OperationsAbove(candidate, shape, seen_after) >= before) {
                     return std::nullopt;
                 }
+                linear_atoms_ = shape.atoms;
                 return candidate;
             }
 
@@ -1085,7 +1086,9 @@ namespace cobra {
 
             // `lhs != rhs` with every subterm the two sides share replaced by a
             // fresh constant: if that is unsatisfiable, so is the lemma.
-            Term Generalized(const Term &lhs, const Term &rhs) {
+            // `lhs != rhs` with the terms both sides share cut free - or, given
+            // `atoms`, with exactly those cut free.
+            Term Generalized(const Term &lhs, const Term &rhs, const std::vector< Term > *atoms = nullptr) {
                 const auto gather = [](const Term &root) {
                     std::unordered_set< uint64_t > seen;
                     std::vector< Term > stack{ root };
@@ -1101,8 +1104,8 @@ namespace cobra {
                     }
                     return seen;
                 };
-                const auto left  = gather(lhs);
-                const auto right = gather(rhs);
+                const auto left  = atoms == nullptr ? gather(lhs) : std::unordered_set< uint64_t >{};
+                const auto right = atoms == nullptr ? gather(rhs) : std::unordered_set< uint64_t >{};
                 std::unordered_map< uint64_t, Term > cut;
                 const auto rebuild = [&](const Term &root) {
                     std::vector< std::pair< Term, bool > > stack{ { root, false } };
@@ -1116,7 +1119,12 @@ namespace cobra {
                             cut.emplace(term.id(), term);
                             continue;
                         }
-                        if (left.count(term.id()) != 0 && right.count(term.id()) != 0) {
+                        const bool free = atoms != nullptr
+                            ? std::any_of(atoms->begin(), atoms->end(), [&](const Term &atom) {
+                                  return atom.id() == term.id();
+                              })
+                            : left.count(term.id()) != 0 && right.count(term.id()) != 0;
+                        if (free) {
                             cut.emplace(term.id(), terms_.mk_const(term.sort()));
                             continue;
                         }
@@ -1179,17 +1187,24 @@ namespace cobra {
             // is the whole claim, and small, so what it cannot settle quickly is
             // not worth the rest of the budget.
             bitwuzla::Result Prove(const Term &lhs, const Term &rhs, bool linear) {
-                const Term full    = terms_.mk_term(Kind::DISTINCT, { lhs, rhs });
-                const Term general = Generalized(lhs, rhs);
+                const Term full = terms_.mk_term(Kind::DISTINCT, { lhs, rhs });
                 if (linear) {
+                    // The claim is about the atoms the candidate was read over,
+                    // as free variables, and those alone: cutting every term the
+                    // two sides share would also cut a bitwise function of the
+                    // atoms the candidate happens to spell the way the tree does
+                    // - `a & b` in `3 * (a & b) + (a ^ b)` against
+                    // `a + b + (a & b)` - and the claim is false with it free.
+                    const Term over_atoms = Generalized(lhs, rhs, &linear_atoms_);
                     const auto answer =
-                        Ask(general, std::min(settings_.deadline, Clock::now() + kLinearBudget), false, nullptr);
+                        Ask(over_atoms, std::min(settings_.deadline, Clock::now() + kLinearBudget), false, nullptr);
                     if (answer == bitwuzla::Result::UNSAT) {
                         ++counters_.generalized;
                         return answer;
                     }
                     return bitwuzla::Result::UNKNOWN;
                 }
+                const Term general = Generalized(lhs, rhs);
                 if (general.id() != full.id()) {
                     const auto answer =
                         Ask(general, std::min(settings_.deadline, Clock::now() + kGeneralizedBudget), false, nullptr);
@@ -1217,6 +1232,8 @@ namespace cobra {
             std::unordered_map< uint64_t, uint32_t > index_;
             std::vector< std::vector< uint64_t > > values_; // per node: samples, scratch, counterexamples
             std::vector< Term > rebuilt_;
+            // The atoms the last linear candidate was read over (`Prove`).
+            std::vector< Term > linear_atoms_;
             std::unordered_map< uint64_t, std::optional< std::vector< uint32_t > > > support_;
             std::unordered_map< uint64_t, bool > arithmetic_;
             std::unique_ptr< bitwuzla::Bitwuzla > solver_;

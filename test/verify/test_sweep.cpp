@@ -161,6 +161,31 @@ TEST(Sweep, SynthesizesLinearCombinationsOverAtoms) {
     EXPECT_EQ(Solve(t, swept, 2000), bitwuzla::Result::UNSAT);
 }
 
+// A linear candidate is proved over the atoms it was read over, free. The
+// candidate spells `a & b` the way the tree does, so cutting every term the two
+// sides share would cut that too, and `3 * c + (a ^ b) == a + b + c` is false
+// for a free `c`: the identity would never be proved.
+TEST(Sweep, ProvesLinearCandidatesOverTheirAtoms) {
+    bitwuzla::TermManager t;
+    const auto sort  = t.mk_bv_sort(64);
+    const Term x     = t.mk_const(sort, "x");
+    const Term y     = t.mk_const(sort, "y");
+    const Term a     = t.mk_term(Kind::BV_MUL, { x, y });
+    const Term b     = t.mk_term(Kind::BV_ADD, { x, y });
+    const Term three = t.mk_bv_value_uint64(sort, 3);
+    const Term tree  = t.mk_term(
+        Kind::BV_ADD,
+        { t.mk_term(Kind::BV_MUL, { three, t.mk_term(Kind::BV_AND, { a, b }) }),
+          t.mk_term(Kind::BV_XOR, { a, b }) }
+    );
+    const Term question = t.mk_term(Kind::DISTINCT, { tree, t.mk_bv_value_uint64(sort, 12345) });
+
+    SweepCounters counters;
+    SweepFormula(t, { question }, Budget(std::chrono::milliseconds(5000)), &counters);
+    EXPECT_GT(counters.synthesized, 0u);
+    EXPECT_GT(counters.generalized, 0u);
+}
+
 // A displacement hidden behind the carry identity simulates to one value, a
 // genuine function of its input to many, and an operator the sweep does not
 // evaluate to nothing at all.
