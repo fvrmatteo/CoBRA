@@ -181,7 +181,7 @@ namespace cobra {
         uint64_t solver_unknown_nanoseconds = 0;
         // Proofs not asked because the identical question had already run its budget out.
         // See `OutcomeCache::RecordUnknown`: before it existed an UNKNOWN left no trace at
-        // all, so the same timeout was paid on every run, and on one replayed proof CFG
+        // all, so the same timeout was paid on every run, and on one replayed function
         // that was 121.49 s of the 128.41 s the solver cost.
         uint64_t solver_unknown_skipped = 0;
         // Candidates turned down without being searched because their tree stands on a

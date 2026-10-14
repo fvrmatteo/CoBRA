@@ -47,8 +47,6 @@ namespace cobra {
         // Same shape as `HasNonleafBitwise`, and quadratic for the same reason
         // when written as recursion: one bottom-up pass for the variable
         // dependency turns the test at each arithmetic node into a lookup.
-        // Same shape as `HasNonleafBitwise`, and quadratic for the same reason
-        // when written as recursion.
         bool HasArithVar(const Expr &expr) {
             const uint8_t kFolded = FoldPostOrder< uint8_t >(
                 expr,

@@ -15,10 +15,8 @@ namespace cobra {
 
     namespace {
 
-        /// Bottom-up evaluation with variables taking {0, 2^bit_pos} values.
-        /// Structurally identical to SignatureEval::EvalSigRecursive, but
-        /// the kVariable case returns 2^bit_pos instead of 1.
-        // The work one node does once its children's rows are in hand, shared
+        // Bottom-up evaluation with variables taking {0, 2^bit_pos} values:
+        // the work one node does once its children's rows are in hand, shared
         // by both walks below.
         std::vector< uint64_t > CombineSemilinear(
             const Expr &expr, size_t len, uint32_t bitwidth, uint32_t bit_pos,
@@ -62,24 +60,24 @@ namespace cobra {
                 }
 
                 case Expr::Kind::kAdd: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] + right[i]) & kMask; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] + right[i]) & kMask; }
                     return std::move(left);
                 }
                 case Expr::Kind::kMul: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] * right[i]) & kMask; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] * right[i]) & kMask; }
                     return std::move(left);
                 }
 
                 case Expr::Kind::kAnd: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = left[i] & right[i]; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = left[i] & right[i]; }
                     return std::move(left);
                 }
                 case Expr::Kind::kOr: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] | right[i]) & kMask; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] | right[i]) & kMask; }
                     return std::move(left);
                 }
                 case Expr::Kind::kXor: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] ^ right[i]) & kMask; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] ^ right[i]) & kMask; }
                     return std::move(left);
                 }
 
@@ -88,7 +86,7 @@ namespace cobra {
                 case Expr::Kind::kCmpEq:
                 case Expr::Kind::kCmpUlt:
                 case Expr::Kind::kCmpSlt: {
-                                        for (size_t i = 0; i < len; ++i) {
+                    for (size_t i = 0; i < len; ++i) {
                         left[i] = expr.kind == Expr::Kind::kCmpEq
                             ? ModCmpEq(left[i], right[i], bitwidth)
                             : (expr.kind == Expr::Kind::kCmpUlt

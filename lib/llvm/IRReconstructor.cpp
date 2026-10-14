@@ -208,9 +208,8 @@ namespace cobra {
         // `select` spells its else arm twice, and a condition put back over the
         // values it was computed from repeats what they share; built once, a leaf
         // beneath them is read once, which is what lets the caller count its reads
-        // over distinct sub-expressions when it decides what to freeze
-        // (`LeafReadsOverDistinctSubtrees`) - without depending on `IrReuse`
-        // finding the copy among a leaf's first readers.
+        // over distinct sub-expressions when it decides what to freeze - without
+        // depending on `IrReuse` finding the copy among a leaf's first readers.
         struct SubtreeMemo
         {
             std::unordered_multimap< size_t, std::pair< const Expr *, llvm::Value * > > built;

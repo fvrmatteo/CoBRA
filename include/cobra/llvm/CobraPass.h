@@ -17,7 +17,7 @@ namespace cobra {
     // more than once by the rewrite could be read as two different values.
     enum class LeafFreezing : uint8_t {
         // Every leaf that can be poison while the root is defined (behind a
-        // `freeze`, a `select`'s arm or a phi only), and every `undef` leaf the
+        // `freeze` or a `select`'s arm only), and every `undef` leaf the
         // rewrite reads more than once. Exact for LLVM's semantics.
         kSound,
 

@@ -8,14 +8,14 @@
 ; width the extensions name, each one is an ordinary cancellation; the root is
 ; then recovered by the extension the slice was proved to be (`SliceToRead`).
 
-; The obfuscator's sign extension, as it writes the export data
-; directory's address: `zext(x ^ m) ^ sext(m)` with `m` the sign mask of `x`,
+; The obfuscator's sign extension, as it writes it into an address:
+; `zext(x ^ m) ^ sext(m)` with `m` the sign mask of `x`,
 ; which `(lshr(x,31) ^ -K) + K` is for any odd K. The low 32 bits are
 ; `(m ^ x) ^ m`, which is `x`, and the whole is `sext x`.
-; CHECK-LABEL: @export_directory(
+; CHECK-LABEL: @obfuscated_sign_extension(
 ; CHECK: %[[S:.*]] = sext i32 %e to i64
 ; CHECK-NEXT: ret i64 %[[S]]
-define i64 @export_directory(i32 %e) {
+define i64 @obfuscated_sign_extension(i32 %e) {
   %lobit = lshr i32 %e, 31
   %g = xor i32 %lobit, -325934777
   %m = add nsw i32 %g, 325934777

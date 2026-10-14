@@ -746,8 +746,6 @@ namespace cobra {
                 if (const char *floor = std::getenv("COBRA_VARS_REPORT")) {
                     out.variable_floor = static_cast< uint32_t >(std::strtoul(floor, nullptr, 10));
                 }
-                std::error_code code;
-                llvm::sys::fs::create_directories(out.directory, true);
                 return out;
             }();
             return report;

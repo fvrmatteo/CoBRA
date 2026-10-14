@@ -6,7 +6,7 @@
 ; The slice reading is the one thing that gets through an identity written
 ; across a width boundary, and it is asked about the root: is the root the
 ; extension of its own low bits? A base added into the sum is enough to make the
-; answer no - the high bits of `DllBase + 136 + sext(e)` are the base's - and
+; answer no - the high bits of `base + 136 + sext(e)` are the base's - and
 ; the whole expression then stands as written, however many of its own
 ; identities would fold. So the sum is split by leaf support first and the
 ; question is asked of each group on its own.
@@ -14,8 +14,8 @@
 ; The obfuscator's sign extension as a signed sum: with `s` the sign bit of `e`,
 ; `n = -s` and `u = zext(e ^ trunc n)`, the sum `u - 2*(u & n) - s` is `u ^ n`,
 ; which is `sext e`. Read at 32 bits the same terms are `x - 2*(x & -s) - s`,
-; which cancels to `e`. Here with a base added, which is how the walk computes
-; the data directory's address: nothing may be read off the root, and the group
+; which cancels to `e`. Here with a base added, as an address computed off a
+; base has it: nothing may be read off the root, and the group
 ; standing on `e` is read at 32 bits and extended back.
 ; CHECK-LABEL: @base_plus_signed_sum(
 ; CHECK: %[[S:.*]] = sext i32 %e to i64

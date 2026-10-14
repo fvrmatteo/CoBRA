@@ -621,11 +621,6 @@ namespace cobra {
                 return result;
             }
 
-            // The bitwise function of its variables node `i` computes, when its
-            // values say it computes one: evaluated with each variable all ones
-            // or all zeros, turned into algebraic normal form (an XOR of ANDs of
-            // variables, each under a constant mask), and checked against every
-            // input there is.
             // ---- linear MBA over atoms ------------------------------------
 
             // The subterms a linear MBA reading of a term treats as opaque: what
@@ -749,15 +744,15 @@ namespace cobra {
                 return result;
             }
 
-            // The linear MBA signature: integers modulo the width, the bitwise
-            // parts at one-bit inputs, and a constant c as -c times the
-            // all-ones function.
             struct LinearValues
             {
                 TermValues linear;
                 TermValues bit;
             };
 
+            // The linear MBA signature: integers modulo the width, the bitwise
+            // parts at one-bit inputs, and a constant c as -c times the
+            // all-ones function.
             static uint64_t EvaluateLinear(
                 const Term &term, const LinearShape &shape, size_t bits, uint64_t mask, LinearValues &memo
             ) {
@@ -978,6 +973,11 @@ namespace cobra {
                 return candidate;
             }
 
+            // The bitwise function of its variables node `i` computes, when its
+            // values say it computes one: evaluated with each variable all ones
+            // or all zeros, turned into algebraic normal form (an XOR of ANDs of
+            // variables, each under a constant mask), and checked against every
+            // input there is.
             std::optional< Term > Synthesize(uint32_t i) {
                 const Node &node = nodes_[i];
                 if (node.width == 0) {

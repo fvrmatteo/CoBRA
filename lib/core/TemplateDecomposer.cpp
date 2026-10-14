@@ -722,11 +722,9 @@ namespace cobra {
         // NOLINTNEXTLINE(readability-identifier-naming)
         bool TryUpdate(
             std::optional< SignaturePayload > &best, std::unique_ptr< Expr > candidate,
-            const Evaluator &eval, uint32_t num_vars, uint32_t bw, const ExprCost *baseline,
-            bool &saw_probe_match
+            const Evaluator &eval, uint32_t num_vars, uint32_t bw, const ExprCost *baseline
         ) {
             COBRA_ZONE_N("TemplateFWCheck");
-            saw_probe_match = true;
             auto chk        = FullWidthCheckEval(eval, num_vars, *candidate, bw);
             if (!chk.passed) {
                 RecordMissWitness(*candidate, TurnedDown::kByCheck);
@@ -755,7 +753,7 @@ namespace cobra {
         std::optional< SignaturePayload > Layer1(
             const ProbeVals &target, std::span< const Atom > pool, const ValMap &vmap,
             uint64_t mask, const Evaluator &eval, uint32_t nv, uint32_t bw,
-            const ExprCost *baseline, bool &saw_probe_match
+            const ExprCost *baseline
         ) {
             std::optional< SignaturePayload > best;
             const size_t pool_n = pool.size();
@@ -771,7 +769,7 @@ namespace cobra {
                         auto e = GateExpr(
                             g, CloneExpr(*pool[ai].expr), CloneExpr(*pool[*slot].expr)
                         );
-                        TryUpdate(best, std::move(e), eval, nv, bw, baseline, saw_probe_match);
+                        TryUpdate(best, std::move(e), eval, nv, bw, baseline);
                     }
                 } else {
                     for (size_t ai = 0; ai < pool_n; ++ai) {
@@ -789,7 +787,7 @@ namespace cobra {
                                 g, CloneExpr(*pool[ai].expr), CloneExpr(*pool[bi].expr)
                             );
                             TryUpdate(
-                                best, std::move(e), eval, nv, bw, baseline, saw_probe_match
+                                best, std::move(e), eval, nv, bw, baseline
                             );
                         }
                     }
@@ -1116,7 +1114,7 @@ namespace cobra {
         std::optional< SignaturePayload > Layer2(
             const ProbeVals &target, std::span< const Atom > pool,
             const InnerCompositions &inner_cache, uint64_t mask, const Evaluator &eval,
-            uint32_t nv, uint32_t bw, const ExprCost *baseline, bool &saw_probe_match
+            uint32_t nv, uint32_t bw, const ExprCost *baseline
         ) {
             std::span< const InnerComp > inner = inner_cache.comps;
             const auto &inner_idx              = inner_cache.index;
@@ -1145,7 +1143,7 @@ namespace cobra {
                             continue;
                         }
                         auto e = GateExpr(g_out, CloneExpr(*ai.expr), make_inner(inner[*slot]));
-                        TryUpdate(best, std::move(e), eval, nv, bw, baseline, saw_probe_match);
+                        TryUpdate(best, std::move(e), eval, nv, bw, baseline);
                     }
                     if (best.has_value()) {
                         return best;
@@ -1164,7 +1162,7 @@ namespace cobra {
                         }
                         auto e =
                             GateExpr(g_out, make_inner(inner[ii]), make_inner(inner[*slot]));
-                        TryUpdate(best, std::move(e), eval, nv, bw, baseline, saw_probe_match);
+                        TryUpdate(best, std::move(e), eval, nv, bw, baseline);
                     }
                     if (best.has_value()) {
                         return best;
@@ -1206,7 +1204,7 @@ namespace cobra {
                             }
                             auto e = GateExpr(g_out, CloneExpr(*ai.expr), make_inner(ii));
                             TryUpdate(
-                                best, std::move(e), eval, nv, bw, baseline, saw_probe_match
+                                best, std::move(e), eval, nv, bw, baseline
                             );
                             if (best.has_value()) {
                                 return best;
@@ -1250,7 +1248,7 @@ namespace cobra {
                             }
                             auto e = GateExpr(Gate::kMul, CloneExpr(*ai.expr), make_inner(ii));
                             TryUpdate(
-                                best, std::move(e), eval, nv, bw, baseline, saw_probe_match
+                                best, std::move(e), eval, nv, bw, baseline
                             );
                             if (best.has_value()) {
                                 return best;
@@ -1265,7 +1263,7 @@ namespace cobra {
                             continue;
                         }
                         auto e = GateExpr(Gate::kMul, CloneExpr(*ai.expr), make_inner(ii));
-                        TryUpdate(best, std::move(e), eval, nv, bw, baseline, saw_probe_match);
+                        TryUpdate(best, std::move(e), eval, nv, bw, baseline);
                         if (best.has_value()) {
                             return best;
                         }
@@ -1282,7 +1280,7 @@ namespace cobra {
         std::optional< SignaturePayload > Layer3(
             const ProbeVals &target, std::span< const Atom > pool, const ValMap &vmap,
             const InnerCompositions &inner_cache, uint64_t mask, const Evaluator &eval,
-            uint32_t nv, uint32_t bw, const ExprCost *baseline, bool &saw_probe_match
+            uint32_t nv, uint32_t bw, const ExprCost *baseline
         ) {
             std::span< const InnerComp > inner = inner_cache.comps;
             const auto &inner_idx              = inner_cache.index;
@@ -1333,7 +1331,6 @@ namespace cobra {
                             auto mid =
                                 GateExpr(g2, CloneExpr(*pool[bi].expr), std::move(r2_expr));
                             auto e = GateExpr(g1, CloneExpr(*pool[ai].expr), std::move(mid));
-                            saw_probe_match = true;
                             auto chk        = FullWidthCheckEval(eval, nv, *e, bw);
                             if (!chk.passed) {
                                 RecordMissWitness(*e, TurnedDown::kByCheck);
@@ -1367,7 +1364,7 @@ namespace cobra {
         std::optional< SignaturePayload > Layer4(
             const ProbeVals &target, std::span< const Atom > pool, const ValMap &vmap,
             const InnerCompositions &inner_cache, uint64_t mask, const Evaluator &eval,
-            uint32_t nv, uint32_t bw, const ExprCost *baseline, bool &saw_probe_match
+            uint32_t nv, uint32_t bw, const ExprCost *baseline
         ) {
             std::span< const InnerComp > inner = inner_cache.comps;
             const auto &inner_idx              = inner_cache.index;
@@ -1421,8 +1418,7 @@ namespace cobra {
                                 auto e =
                                     GateExpr(g1, CloneExpr(*pool[ai].expr), std::move(wrapped));
                                 if (TryUpdate(
-                                        best, std::move(e), eval, nv, bw, baseline,
-                                        saw_probe_match
+                                        best, std::move(e), eval, nv, bw, baseline
                                     ))
                                 {
                                     return best;
@@ -1502,8 +1498,7 @@ namespace cobra {
                                         g1, CloneExpr(*pool[ai].expr), std::move(wrapped)
                                     );
                                     if (TryUpdate(
-                                            best, std::move(e), eval, nv, bw, baseline,
-                                            saw_probe_match
+                                            best, std::move(e), eval, nv, bw, baseline
                                         ))
                                     {
                                         return best;
@@ -1554,8 +1549,7 @@ namespace cobra {
                                             g1, CloneExpr(*pool[ai].expr), std::move(wrapped)
                                         );
                                         if (TryUpdate(
-                                                best, std::move(e), eval, nv, bw, baseline,
-                                                saw_probe_match
+                                                best, std::move(e), eval, nv, bw, baseline
                                             ))
                                         {
                                             return best;
@@ -1581,8 +1575,7 @@ namespace cobra {
                                         g1, CloneExpr(*pool[ai].expr), std::move(wrapped)
                                     );
                                     if (TryUpdate(
-                                            best, std::move(e), eval, nv, bw, baseline,
-                                            saw_probe_match
+                                            best, std::move(e), eval, nv, bw, baseline
                                         ))
                                     {
                                         return best;
@@ -1714,7 +1707,6 @@ namespace cobra {
             }
             return SolverResult< SignaturePayload >::Success(std::move(payload));
         };
-        bool saw_probe_match = false;
 
         // Build atom pool.
         std::vector< Atom > pool;
@@ -1761,7 +1753,6 @@ namespace cobra {
             const auto *slot = vmap.find(target);
             if (slot != nullptr) {
                 auto e          = CloneExpr(*pool[*slot].expr);
-                saw_probe_match = true;
                 auto chk        = FullWidthCheckEval(*ctx.eval, num_vars, *e, opts.bitwidth);
                 if (chk.passed) {
                     auto info = ComputeCost(*e);
@@ -1784,8 +1775,7 @@ namespace cobra {
         {
             COBRA_ZONE_N("TemplateLayer1");
             auto r1 = Layer1(
-                target, pool, vmap, kMask, *ctx.eval, num_vars, opts.bitwidth, baseline_cost,
-                saw_probe_match
+                target, pool, vmap, kMask, *ctx.eval, num_vars, opts.bitwidth, baseline_cost
             );
             if (r1.has_value()) {
                 return return_success(std::move(*r1));
@@ -1799,8 +1789,7 @@ namespace cobra {
             COBRA_ZONE_N("TemplateLayer2");
             auto inner = BuildInnerCompositions(pool, vmap, kMask);
             auto r2    = Layer2(
-                target, pool, inner, kMask, *ctx.eval, num_vars, opts.bitwidth, baseline_cost,
-                saw_probe_match
+                target, pool, inner, kMask, *ctx.eval, num_vars, opts.bitwidth, baseline_cost
             );
             if (r2.has_value()) {
                 return return_success(std::move(*r2));
@@ -1825,7 +1814,6 @@ namespace cobra {
                 [&](std::unique_ptr< Expr > inner) -> std::optional< SignaturePayload > {
                 auto wrapped    = (wrap == 0) ? Expr::Negate(std::move(inner))
                                               : Expr::BitwiseNot(std::move(inner));
-                saw_probe_match = true;
                 auto chk = FullWidthCheckEval(*ctx.eval, num_vars, *wrapped, opts.bitwidth);
                 if (!chk.passed) {
                     RecordMissWitness(*wrapped, TurnedDown::kByCheck);
@@ -1870,8 +1858,7 @@ namespace cobra {
             {
                 const WitnessWrapScope wrapped(wrap == 0 ? WitnessWrap::kNeg : WitnessWrap::kNot);
                 w1 = Layer1(
-                    lifted, pool, vmap, kMask, lifted_eval, num_vars, opts.bitwidth, nullptr,
-                    saw_probe_match
+                    lifted, pool, vmap, kMask, lifted_eval, num_vars, opts.bitwidth, nullptr
                 );
             }
             if (w1.has_value()) {
@@ -1890,7 +1877,7 @@ namespace cobra {
             COBRA_ZONE_N("TemplateLayer3");
             auto r3 = Layer3(
                 target, pool, vmap, *inner_cache, kMask, *ctx.eval, num_vars, opts.bitwidth,
-                baseline_cost, saw_probe_match
+                baseline_cost
             );
             if (r3.has_value()) {
                 return return_success(std::move(*r3));
@@ -1903,7 +1890,7 @@ namespace cobra {
             COBRA_ZONE_N("TemplateLayer4");
             auto r4 = Layer4(
                 target, pool, vmap, *inner_cache, kMask, *ctx.eval, num_vars, opts.bitwidth,
-                baseline_cost, saw_probe_match
+                baseline_cost
             );
             if (r4.has_value()) {
                 return return_success(std::move(*r4));

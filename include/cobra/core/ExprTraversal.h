@@ -9,44 +9,17 @@
 
 namespace cobra {
 
-    // A post-order listing of every node under a root, with each node's
-    // children recorded as indices into the same listing.
+    // Walks over an expression without recursion.
     //
     // Nearly every walk over an expression is a post-order walk, and written as
     // recursion each costs a stack frame per level of the tree. The depth is
     // set by the input rather than by anything CoBRA chooses: obfuscated code
     // nests as deeply as it likes, and a lowered MBA chain nests as far as the
     // rewriter's growth budget allows. A deep enough expression therefore
-    // overflows the stack instead of returning an answer, and the same tree is
-    // walked again by every predicate that asks a question about it.
-    //
-    // Building the order once removes both problems: the traversal itself is a
-    // loop over an explicit worklist, and a fold over the result computes any
-    // bottom-up property in a single pass, so predicates that used to call one
-    // another - each re-walking the subtree - become one array lookup.
-    struct ExprPostOrder
-    {
-        // Children always precede their parent; the root is last.
-        std::vector< const Expr * > nodes;
-        // Compressed rows: the children of node `i` are `child_index` over
-        // `[child_start[i], child_start[i + 1])`.
-        std::vector< uint32_t > child_start;
-        std::vector< uint32_t > child_index;
+    // overflows the stack instead of returning an answer. These walk an
+    // explicit worklist instead.
 
-        [[nodiscard]] size_t Size() const { return nodes.size(); }
-        [[nodiscard]] size_t RootIndex() const { return nodes.size() - 1; }
-        [[nodiscard]] uint32_t ChildCount(size_t i) const {
-            return child_start[i + 1] - child_start[i];
-        }
-        [[nodiscard]] uint32_t Child(size_t i, uint32_t k) const {
-            return child_index[child_start[i] + k];
-        }
-    };
-
-    ExprPostOrder BuildPostOrder(const Expr &root);
-
-    // The number of nodes under `root`, which needs neither the order nor the
-    // rows that `BuildPostOrder` builds.
+    // The number of nodes under `root`.
     size_t CountNodes(const Expr &root);
 
     // True when any node under `root` satisfies `pred`, stopping at the first.

@@ -45,10 +45,11 @@ namespace cobra {
         // Complexity: O(tree_size * 2^n) element-wise ops in a single tree
         // walk. Per-node result buffers are recycled through `pool` so the
         // 2^n vectors are not malloc'd once per leaf.
-                // The work one node does once its children's buffers are in hand. Both
+        //
+        // The work one node does once its children's buffers are in hand. Both
         // walks below share it, so the recursive and the iterative evaluation
         // are the same arithmetic by construction.
-std::vector< uint64_t > CombineSig(
+        std::vector< uint64_t > CombineSig(
             const Expr &expr, SigBufferPool &pool, uint32_t bitwidth,
             std::vector< uint64_t > left, std::vector< uint64_t > right
         ) {
@@ -90,46 +91,46 @@ std::vector< uint64_t > CombineSig(
                     return std::move(child);
                 }
                 case Expr::Kind::kAdd: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] + right[i]) & kMask; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] + right[i]) & kMask; }
                     pool.Release(std::move(right));
                     return std::move(left);
                 }
                 case Expr::Kind::kMul: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] * right[i]) & kMask; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] * right[i]) & kMask; }
                     pool.Release(std::move(right));
                     return std::move(left);
                 }
                 case Expr::Kind::kAnd: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = left[i] & right[i]; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = left[i] & right[i]; }
                     pool.Release(std::move(right));
                     return std::move(left);
                 }
                 case Expr::Kind::kOr: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] | right[i]) & kMask; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] | right[i]) & kMask; }
                     pool.Release(std::move(right));
                     return std::move(left);
                 }
                 case Expr::Kind::kXor: {
-                                        for (size_t i = 0; i < len; ++i) { left[i] = (left[i] ^ right[i]) & kMask; }
+                    for (size_t i = 0; i < len; ++i) { left[i] = (left[i] ^ right[i]) & kMask; }
                     pool.Release(std::move(right));
                     return std::move(left);
                 }
                 case Expr::Kind::kCmpEq: {
-                                        for (size_t i = 0; i < len; ++i) {
+                    for (size_t i = 0; i < len; ++i) {
                         left[i] = ModCmpEq(left[i], right[i], bitwidth);
                     }
                     pool.Release(std::move(right));
                     return std::move(left);
                 }
                 case Expr::Kind::kCmpUlt: {
-                                        for (size_t i = 0; i < len; ++i) {
+                    for (size_t i = 0; i < len; ++i) {
                         left[i] = ModCmpUlt(left[i], right[i], bitwidth);
                     }
                     pool.Release(std::move(right));
                     return std::move(left);
                 }
                 case Expr::Kind::kCmpSlt: {
-                                        for (size_t i = 0; i < len; ++i) {
+                    for (size_t i = 0; i < len; ++i) {
                         left[i] = ModCmpSlt(left[i], right[i], bitwidth);
                     }
                     pool.Release(std::move(right));

@@ -270,9 +270,10 @@ namespace cobra {
     // Find MBA candidates across a function.  Blocks are scanned in
     // post-order (uses before defs) with reverse instruction iteration
     // so that the outermost MBA root claims its full subtree first.
-    // PHI nodes are treated as transparent when all incoming values
-    // are MBA opcodes and evaluate identically; otherwise the PHI
-    // becomes a leaf.
+    // PHI nodes are treated as transparent when every incoming value is an
+    // instruction the walk reads and the same computation as the one followed,
+    // and every leaf the followed arm reads is available at the root;
+    // otherwise the PHI becomes a leaf.
     //
     // A root already carrying a fingerprint recorded under the same
     // `options_tag` is claimed but not returned: the tree has not changed
@@ -472,9 +473,9 @@ namespace cobra {
     // The slice reading above is the one thing that gets through an identity
     // written across a width boundary, and it is asked about the root: is the
     // root the extension of its own low bits? A base added into the sum is
-    // enough to make the answer no. `DllBase + 136 + sext(e)`, which is what an
-    // image walk computes, is written by the obfuscator as
-    // `DllBase + 136 + u - 2*(u & n) - z` over `u = zext(e ^ trunc n)`,
+    // enough to make the answer no. `base + 136 + sext(e)`, an address computed
+    // off a base, is written by the obfuscator as
+    // `base + 136 + u - 2*(u & n) - z` over `u = zext(e ^ trunc n)`,
     // `n = -(e >> 31)` and `z = e >> 31`; the part standing on `e` is a sign
     // extension and reads as `e` at 32 bits, but the whole sum is no extension
     // of anything - its high bits are the base's - and the slice is refused on

@@ -376,8 +376,6 @@ namespace cobra {
                 if (candidate->kind == Expr::Kind::kConstant) { continue; }
                 if (candidate->kind == Expr::Kind::kVariable) { continue; }
 
-                auto candidate_hash = std::hash< Expr >{}(*candidate);
-
                 // Check all other terms for this factor.
                 bool universal = true;
                 std::vector< size_t > match_indices;

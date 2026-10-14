@@ -112,8 +112,7 @@ namespace cobra {
             bitwuzla::TermManager &tm, const std::vector< uint64_t > &coeffs,
             const std::vector< bitwuzla::Term > &var_terms, uint32_t num_vars, uint32_t bitwidth
         ) {
-            const auto kSort = tm.mk_bv_sort(bitwidth);
-            auto result      = BvValue(tm, bitwidth, coeffs[0]);
+            auto result = BvValue(tm, bitwidth, coeffs[0]);
 
             const size_t kLen = 1ULL << num_vars;
             for (size_t i = 1; i < kLen; ++i) {

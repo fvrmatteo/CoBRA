@@ -10,8 +10,8 @@
 ; find: `zext(x ^ m) ^ sext(m)` is `sext x` only when `m` is the sign mask of
 ; `x`, and with the shift a leaf `m` and `x` are two independent variables.
 
-; The export walk's sign extension, with the sign mask taken by `ashr` - which
-; is how the lifter spells `movsxd`'s companion `sar`.
+; The obfuscator's sign extension, with the sign mask taken by `ashr` - which
+; is how a lifter spells the arithmetic shift that goes with a sign extension.
 ; CHECK-LABEL: @ashr_sign_mask(
 ; CHECK: %[[S:.*]] = sext i32 %e to i64
 ; CHECK-NEXT: ret i64 %[[S]]

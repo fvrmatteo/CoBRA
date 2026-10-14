@@ -46,8 +46,8 @@ namespace cobra {
     // that refutes a candidate joins the inputs and rules out every other
     // candidate it separates.
     //
-    // What comes back is equisatisfiable with what went in - every substitution
-    // is backed by an UNSAT answer - and holds new terms made in `terms`, which
+    // What comes back is equivalent to what went in - every substitution is a
+    // proved identity, backed by an UNSAT answer - and holds new terms made in `terms`, which
     // the caller must own for the duration of the call. It was written for the
     // obfuscated carry arithmetic of `((a ^ b) >> 1) - ((a - b) >> 1
     // | borrow << 63)` standing for `b & ~a`: Bitwuzla needs one to five seconds

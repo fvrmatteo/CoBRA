@@ -22,7 +22,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
              .RegisterPassBuilderCallbacks = [](llvm::PassBuilder &pb) {
                  // `COBRA_FAMILIES=semilinear,bitwise,...` restricts the
                  // techniques every pipeline below runs with. A consumer picks
-                 // its own set (the deobfuscator's `cobra-techniques`), and a
+                 // its own set, and a
                  // test that is about what the search *cannot* do has to be able
                  // to pin that set, or it passes because a family the consumer
                  // never enables answered.

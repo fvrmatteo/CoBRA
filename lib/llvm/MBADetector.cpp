@@ -2183,10 +2183,8 @@ namespace cobra {
             return true;
         }
 
-        // Verify that all incoming arms of each transparent phi
-        // evaluate identically for random inputs.  Returns false if
-        // any arm diverges, indicating the phi should be treated as
-        // a leaf instead.
+        // What became of the transparent phis the collection checked
+        // (`VerifyPhiArms`), for the report.
         std::atomic< uint64_t > phi_arms_checked{ 0 };
         std::atomic< uint64_t > phi_arms_probes_accept{ 0 };
         std::atomic< uint64_t > phi_arms_exact_accept{ 0 };
