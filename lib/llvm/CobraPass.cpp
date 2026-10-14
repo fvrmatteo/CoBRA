@@ -3192,7 +3192,10 @@ namespace cobra {
                 return false;
             }
             for (const auto *incoming : phi->blocks()) {
-                if (dominators.dominates(phi->getParent(), incoming)) {
+                // Every block dominates an unreachable one, which is no back edge.
+                if (dominators.isReachableFromEntry(incoming)
+                    && dominators.dominates(phi->getParent(), incoming))
+                {
                     return true;
                 }
             }

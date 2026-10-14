@@ -1,4 +1,5 @@
 #include "IRReconstructor.h"
+#include "cobra/core/BitWidth.h"
 #include "cobra/core/ExprUtils.h"
 #include "MBADetector.h"
 #include "cobra/core/Expr.h"
@@ -317,7 +318,10 @@ namespace cobra {
 
         switch (expr.kind) {
             case Expr::Kind::kConstant:
-                return llvm::ConstantInt::get(int_ty, expr.constant_val);
+                // Reduced to the width first: the expression may hold a
+                // constant wider than it, which `ConstantInt::get` truncates
+                // only on request in newer LLVM.
+                return llvm::ConstantInt::get(int_ty, expr.constant_val & Bitmask(int_ty->getBitWidth()));
 
             case Expr::Kind::kVariable: {
                 uint32_t leaf_idx = expr.var_index;

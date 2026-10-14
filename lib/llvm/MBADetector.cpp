@@ -63,11 +63,23 @@ namespace cobra {
     // b)` hides `a + b` - and any identity the obfuscator wrote across it is
     // invisible: no candidate is ever built for the sum, and the IR
     // afterwards cannot be told from one that was examined and left alone.
+    //
+    // The target computes addresses at the DataLayout's index width, and
+    // truncates a wider index to it - which the sum of the indices at their
+    // own width survives, reduction being a homomorphism. A narrower index is
+    // sign-extended first, which the sum does not say, and such a
+    // `getelementptr` is not read this way.
     const llvm::GetElementPtrInst *ByteGepOf(const llvm::Value *v) {
         const auto *gep = llvm::dyn_cast_or_null< llvm::GetElementPtrInst >(v);
         if (gep == nullptr || gep->getNumIndices() != 1
-            || !gep->getSourceElementType()->isIntegerTy(8)
-            || !gep->getOperand(1)->getType()->isIntegerTy(64))
+            || !gep->getSourceElementType()->isIntegerTy(8) || gep->getModule() == nullptr)
+        {
+            return nullptr;
+        }
+        const auto *index = gep->getOperand(1)->getType();
+        if (!index->isIntegerTy() || index->getIntegerBitWidth() > 64
+            || index->getIntegerBitWidth()
+                < gep->getModule()->getDataLayout().getIndexTypeSizeInBits(gep->getType()))
         {
             return nullptr;
         }
@@ -676,8 +688,8 @@ namespace cobra {
         }
 
         bool FitsTreeWidth(const llvm::Instruction *inst, uint32_t bw, bool narrow_comparisons = false) {
-            if (ByteGepOf(inst) != nullptr) {
-                return bw == 64; // the index width, which is the pointer width
+            if (const auto *gep = ByteGepOf(inst)) {
+                return bw == gep->getOperand(1)->getType()->getIntegerBitWidth();
             }
             if (const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
                 if (narrow_comparisons && ComparesExactlyNarrow(*cmp, bw)) {
@@ -1569,23 +1581,18 @@ namespace cobra {
                     return true;
                 }
 
-                if (inst->getOpcode() == llvm::Instruction::ZExt
-                    || inst->getOpcode() == llvm::Instruction::SExt)
-                {
-                    const bool dep    = check(inst->getOperand(0));
-                    depends_on_var[v] = dep;
-                    return dep;
+                // Every operand, a `select`'s false arm and a phi's later arms
+                // included. Marked first, so a walk that came back here would
+                // stop rather than recurse.
+                depends_on_var[v] = true;
+                bool dep          = false;
+                const auto *call  = llvm::dyn_cast< llvm::CallBase >(inst);
+                const unsigned count =
+                    call != nullptr ? call->arg_size() : inst->getNumOperands();
+                for (unsigned index = 0; index < count; ++index) {
+                    dep = check(inst->getOperand(index)) || dep;
                 }
-
-                const bool lhs_dep = check(inst->getOperand(0));
-                const bool rhs_dep =
-                    inst->getNumOperands() > 1 ? check(inst->getOperand(1)) : false;
-                const bool dep    = lhs_dep || rhs_dep;
                 depends_on_var[v] = dep;
-
-                if (inst->getOpcode() == llvm::Instruction::Mul && lhs_dep && rhs_dep) {
-                    return true;
-                }
                 return dep;
             };
 
@@ -2106,55 +2113,6 @@ namespace cobra {
             );
         }
 
-        // Check that every leaf dependency of an alternative phi arm
-        // is either a constant or present in `leaf_set`.  This guards
-        // against evaluating arms whose subtrees reference variables
-        // outside the candidate's variable set.
-        bool ArmDepsInLeafSet(
-            llvm::Value *arm_root, const llvm::DenseSet< llvm::Value * > &leaf_set
-        ) {
-            llvm::DenseSet< llvm::Value * > visited;
-            std::queue< llvm::Value * > work;
-            work.push(arm_root);
-
-            while (!work.empty()) {
-                auto *v = work.front();
-                work.pop();
-                if (!visited.insert(v).second) {
-                    continue;
-                }
-
-                if (llvm::isa< llvm::ConstantInt >(v)) {
-                    continue;
-                }
-                if (leaf_set.contains(v)) {
-                    continue;
-                }
-
-                auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
-                if ((inst == nullptr)
-                    || (!IsMbaOpcode(inst->getOpcode()) && !IsTransparentFreeze(inst)))
-                {
-                    return false;
-                }
-
-                // LShr with variable shift — can't evaluate
-                if (inst->getOpcode() == llvm::Instruction::LShr
-                    && !llvm::isa< llvm::ConstantInt >(inst->getOperand(1)))
-                {
-                    if (!leaf_set.contains(inst)) {
-                        return false;
-                    }
-                    continue;
-                }
-
-                for (auto &op : inst->operands()) {
-                    work.push(op.get());
-                }
-            }
-            return true;
-        }
-
         // What became of the transparent phis the collection checked
         // (`VerifyPhiArms`), for the report.
         std::atomic< uint64_t > phi_arms_checked{ 0 };
@@ -2357,7 +2315,7 @@ namespace cobra {
             llvm::Instruction *root,
             const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
             llvm::ArrayRef< llvm::Instruction * > tree_insts,
-            const std::vector< llvm::Value * > &leaves, uint32_t bitwidth
+            const std::vector< llvm::Value * > &leaves
         ) {
             if (phi_redirects.empty()) {
                 return true;
@@ -2619,7 +2577,8 @@ namespace cobra {
                     continue;
                 }
 
-                const bool ptradd = ByteGepOf(&inst) != nullptr;
+                const auto *gep   = ByteGepOf(&inst);
+                const bool ptradd = gep != nullptr;
                 if (!ptradd && !inst.getType()->isIntegerTy()) {
                     DeclinedRoot(inst, "not an integer", 0, 0);
                     continue;
@@ -2627,7 +2586,7 @@ namespace cobra {
                 // A slice reads the root at the width the caller proved it to
                 // be an extension of, not at the width of its type.
                 const uint32_t bw = slice != nullptr ? slice->width
-                    : ptradd                         ? 64u
+                    : ptradd                         ? gep->getOperand(1)->getType()->getIntegerBitWidth()
                                                      : inst.getType()->getIntegerBitWidth();
                 if (bw > 64 || bw == 0) {
                     continue;
@@ -2686,7 +2645,7 @@ namespace cobra {
                 // it read through a phi: the arms' cones bring their own leaves,
                 // and with the phi a leaf the tree may well fit.
                 if (has_phi_redirect()
-                    && (over_cap() || !VerifyPhiArms(&inst, phi_redirects, tree_insts, leaves, bw)))
+                    && (over_cap() || !VerifyPhiArms(&inst, phi_redirects, tree_insts, leaves)))
                 {
                     tree_insts.clear();
                     leaves.clear();
@@ -3440,7 +3399,7 @@ namespace cobra {
         // As the detector collects it: a phi only read through when its arms
         // are the same computation, or the fingerprint would describe a tree
         // the detector never builds and never match.
-        if (!phi_redirects.empty() && !VerifyPhiArms(inst, phi_redirects, tree_insts, leaves, bw)) {
+        if (!phi_redirects.empty() && !VerifyPhiArms(inst, phi_redirects, tree_insts, leaves)) {
             tree_insts.clear();
             leaves.clear();
             phi_redirects.clear();
