@@ -762,7 +762,17 @@ namespace cobra {
             if (code) {
                 return;
             }
-            const auto &names = outcome.real_vars.empty() ? cand.var_names : outcome.real_vars;
+            // By position, not by `real_vars`: an outcome served from the cache
+            // carries the names of the candidate that first solved it.
+            std::vector< std::string > names = cand.var_names;
+            if (!outcome.real_var_positions.empty()) {
+                names.clear();
+                for (const uint32_t position : outcome.real_var_positions) {
+                    names.push_back(
+                        position < cand.var_names.size() ? cand.var_names[position] : "?"
+                    );
+                }
+            }
             log << cand.root->getFunction()->getName() << " | emitted " << emitted << " of " << budget
                 << (outcome.accepted_unknown ? " | unknown accepted" : "") << " | in "
                 << (cand.expr ? RenderSSA(*cand.expr, cand.var_names) : std::string("?")) << " | out "
