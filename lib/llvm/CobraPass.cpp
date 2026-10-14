@@ -2,6 +2,7 @@
 #include "IRReconstructor.h"
 #include "LocalDemandedBits.h"
 #include "SmtStrategy.h"
+#include "DeferredFingerprints.h"
 #include "MBADetector.h"
 #include "cobra/llvm/CobraStats.h"
 #include "../verify/VerifyCache.h"
@@ -23,6 +24,7 @@
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/AssumptionCache.h"
@@ -3618,6 +3620,10 @@ namespace cobra {
         // first ones are expressions the function holds.
         std::vector< CandidateOrigin > origins(candidates.size(), CandidateOrigin::kDetected);
 
+        // `CobraPassOptions::retry_undecided_roots`: the fingerprints of turned-down
+        // roots, held until their ladders decide.
+        DeferredFingerprints deferred;
+
         NumCandidates += candidates.size();
 
         auto &cache = SharedOutcomeCache();
@@ -3675,6 +3681,23 @@ namespace cobra {
 
         for (size_t index = 0; index < candidates.size(); ++index) {
             auto &cand = candidates[index];
+
+            // Whether this candidate's question is left for a later run: its proof
+            // ran out of time, its rewrite did not fit, or its tree went stale. A
+            // root whose ladder holds such a rung keeps no fingerprint under
+            // `retry_undecided_roots`, so the next run collects it again.
+            bool left_for_later = false;
+            const auto finished = llvm::make_scope_exit([&] {
+                if (!options_.retry_undecided_roots) {
+                    return;
+                }
+                if (const auto head = deferred.Finish(index, left_for_later)) {
+                    const auto &owner = candidates[*head];
+                    if (!replaced_roots.contains(owner.root)) {
+                        RecordMbaFingerprint(owner.root, owner.fingerprint, options_tag);
+                    }
+                }
+            });
 
             // A root an earlier rewrite replaced has no readers left. Its
             // re-cuts and inner roots were queued before that happened, and
@@ -3734,6 +3757,7 @@ namespace cobra {
                        })))
             {
                 ++stats.stale_trees;
+                left_for_later = true;
                 pass_by();
                 continue;
             }
@@ -3755,6 +3779,7 @@ namespace cobra {
                 );
                 if ((now & ~cand.demanded_mask) != 0) {
                     ++stats.demanded_grew;
+                    left_for_later = true;
                     pass_by();
                     continue;
                 }
@@ -3765,7 +3790,12 @@ namespace cobra {
             // would tell the next run the whole tree was examined.
             bool undecided_refusal = false;
             const auto record_rejection = [&] {
-                if (cand.node_limit == 0 && !undecided_refusal) {
+                if (cand.node_limit != 0 || undecided_refusal) {
+                    return;
+                }
+                if (options_.retry_undecided_roots) {
+                    deferred.Defer(index);
+                } else {
                     RecordMbaFingerprint(cand.root, cand.fingerprint, options_tag);
                 }
             };
@@ -3886,6 +3916,9 @@ namespace cobra {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
                         origins.push_back(CandidateOrigin::kSlice);
+                        if (options_.retry_undecided_roots) {
+                            deferred.Queue(candidates.size() - 1, index);
+                        }
                         ++stats.requeued;
                     }
                 }
@@ -3894,6 +3927,9 @@ namespace cobra {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
                         origins.push_back(CandidateOrigin::kSumGroup);
+                        if (options_.retry_undecided_roots) {
+                            deferred.Queue(candidates.size() - 1, index);
+                        }
                         ++stats.requeued;
                     }
                 }
@@ -3902,6 +3938,9 @@ namespace cobra {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
                         origins.push_back(CandidateOrigin::kBooleanCut);
+                        if (options_.retry_undecided_roots) {
+                            deferred.Queue(candidates.size() - 1, index);
+                        }
                         ++stats.requeued;
                     }
                 }
@@ -3910,6 +3949,9 @@ namespace cobra {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
                         origins.push_back(CandidateOrigin::kBoundaryCut);
+                        if (options_.retry_undecided_roots) {
+                            deferred.Queue(candidates.size() - 1, index);
+                        }
                         ++stats.requeued;
                     }
                 }
@@ -3918,6 +3960,9 @@ namespace cobra {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
                         origins.push_back(CandidateOrigin::kSharedCut);
+                        if (options_.retry_undecided_roots) {
+                            deferred.Queue(candidates.size() - 1, index);
+                        }
                         ++stats.requeued;
                     }
                 }
@@ -3926,6 +3971,9 @@ namespace cobra {
                         queue_key(recut);
                         candidates.push_back(std::move(recut));
                         origins.push_back(CandidateOrigin::kRecut);
+                        if (options_.retry_undecided_roots) {
+                            deferred.Queue(candidates.size() - 1, index);
+                        }
                         ++stats.requeued;
                     }
                 }
@@ -4068,6 +4116,7 @@ namespace cobra {
                 const bool evicted = cache.WasEvicted(key);
                 auto proposal = ProposeRewrite(cand, options_, verdict, stats);
                 undecided_refusal = proposal == nullptr && RestedOnUnknown();
+                left_for_later    = undecided_refusal;
                 outcome = undecided_refusal ? nullptr : cache.Insert(key, std::move(proposal));
                 if (evicted) {
                     ++stats.resolved_after_eviction;
@@ -4152,6 +4201,7 @@ namespace cobra {
             if (!outcome->verified && cache.WasUnknown(key, ProofBudgetScale(cand))) {
                 ++stats.solver_unknown_skipped;
                 ++stats.rejected_unverified;
+                left_for_later = true;
                 account(false);
                 requeue_retries();
                 continue;
@@ -4474,6 +4524,7 @@ namespace cobra {
                 // freeze, how many of the tree's instructions die with the
                 // root. A later run may find it fits; the outcome cache keeps
                 // the search from being paid again.
+                left_for_later = true;
                 account(false);
                 requeue_retries();
                 continue;
@@ -4538,6 +4589,7 @@ namespace cobra {
                     stats.rejected_nanoseconds += rebuilding + verifying;
                     spent += rebuilding;
                     ++stats.rejected_unverified;
+                    left_for_later = proof_unknown;
                     account(false);
                     if (!proof_unknown) {
                         record_rejection();

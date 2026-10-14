@@ -136,6 +136,23 @@ namespace cobra {
         // Off by default.
         bool boolean_variables = false;
 
+        // Hold a turned-down root's fingerprint until every slice, sum group
+        // and cut queued from it has decided.
+        //
+        // A fingerprint tells later runs the tree at a root was examined and
+        // holds nothing, and they skip it - with it every rung of its ladder.
+        // Written as soon as the full collection is turned down, it also skips
+        // the rungs whose proof ran out of time, whose rewrite did not fit the
+        // budget or whose tree went stale this run, which a later run could
+        // still win. With this on, such a root keeps no fingerprint and the
+        // next run collects it again, at the price of collecting and re-cutting
+        // it every run until its ladder decides. The outcome cache and the
+        // memo of proofs that ran out of budget keep the repeated questions
+        // cheap, but not free.
+        //
+        // Off by default.
+        bool retry_undecided_roots = false;
+
         // Answer every demanded-bits question both from the readers and from
         // LLVM's whole-function analysis, and report each disagreement on
         // stderr. A check on the pass, for its tests; it changes no answer.
