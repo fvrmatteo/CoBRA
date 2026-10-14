@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace cobra {
 
@@ -1195,9 +1196,14 @@ namespace cobra {
 
                 std::vector< std::unique_ptr< Expr > > hidden;
                 auto scaled = HideAtomShifts(*lifted->scaled, num_vars, hidden);
+                // Named apart from every caller variable: the answer's
+                // variables are mapped back by name.
                 std::vector< std::string > extended = vars;
-                for (size_t index = 0; index < hidden.size(); ++index) {
-                    extended.push_back("$shr" + std::to_string(index));
+                const std::unordered_set< std::string > taken(vars.begin(), vars.end());
+                for (size_t index = 0, suffix = 0; index < hidden.size(); ++index) {
+                    std::string name;
+                    do { name = "$shr" + std::to_string(suffix++); } while (taken.contains(name));
+                    extended.push_back(std::move(name));
                 }
                 if (extended.size() > kMaxInputVars) { return std::nullopt; }
 

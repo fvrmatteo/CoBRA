@@ -127,8 +127,12 @@ namespace cobra {
                     break;
                 }
                 default: {
+                    // Comparisons share one precedence and do not associate:
+                    // `(a == b) <u c` and `a == (b <u c)` are different values.
                     const int kPrec         = Precedence(expr.kind);
-                    const bool kNeedsParens = kPrec > parent_prec && parent_prec > 0;
+                    const bool kNeedsParens = parent_prec > 0
+                        && (kPrec > parent_prec
+                            || (kPrec == parent_prec && IsComparison(expr.kind)));
                     if (kNeedsParens) { out << "("; }
                     RenderImpl(out, *expr.children[0], var_names, bitwidth, kPrec);
                     out << BinopStr(expr.kind);
@@ -243,6 +247,14 @@ namespace cobra {
 
 #endif
 
+    std::unique_ptr< Expr > CloneNode(const Expr &expr) {
+        auto dst          = std::make_unique< Expr >();
+        dst->kind         = expr.kind;
+        dst->constant_val = expr.constant_val;
+        dst->var_index    = expr.var_index;
+        return dst;
+    }
+
 #if COBRA_NONRECURSIVE
 
     Expr::~Expr() {
@@ -266,12 +278,8 @@ namespace cobra {
 
     std::unique_ptr< Expr > CloneExpr(const Expr &expr) {
         return FoldPostOrder< std::unique_ptr< Expr > >(
-            expr,
-            [](const Expr &node, std::unique_ptr< Expr > *kids, size_t count) {
-                auto dst          = std::make_unique< Expr >();
-                dst->kind         = node.kind;
-                dst->constant_val = node.constant_val;
-                dst->var_index    = node.var_index;
+            expr, [](const Expr &node, std::unique_ptr< Expr > *kids, size_t count) {
+                auto dst = CloneNode(node);
                 dst->children.reserve(count);
                 for (size_t k = 0; k < count; ++k) {
                     dst->children.push_back(std::move(kids[k]));
@@ -284,10 +292,7 @@ namespace cobra {
 #else
 
     std::unique_ptr< Expr > CloneExpr(const Expr &expr) {
-        auto dst          = std::make_unique< Expr >();
-        dst->kind         = expr.kind;
-        dst->constant_val = expr.constant_val;
-        dst->var_index    = expr.var_index;
+        auto dst = CloneNode(expr);
         for (const auto &child : expr.children) { dst->children.push_back(CloneExpr(*child)); }
         return dst;
     }

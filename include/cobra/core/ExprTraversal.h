@@ -2,6 +2,7 @@
 
 #include "cobra/core/Expr.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -53,14 +54,16 @@ namespace cobra {
     // operand stack, each as deep as the expression rather than as large as it,
     // and both are kept between calls so a walk of a small expression costs no
     // allocation at all once the buffers have grown. Recording where this call
-    // found them and trimming back to it lets one fold run inside another.
+    // found them and trimming back to it lets one fold run inside another -
+    // of another instantiation: `combine` is handed a pointer into the operand
+    // stack, which a fold of the same `T` and `Combine` started from inside it
+    // could reallocate. No `combine` does; a debug build checks.
     template < typename T, typename Combine >
     T FoldPostOrder(const Expr &root, Combine combine) {
         struct Frame
         {
             const Expr *node;
             uint32_t next_child;
-            uint32_t pushed; // children actually placed on the operand stack
         };
 
         // One thread-local lookup each, not one per access.
@@ -71,22 +74,32 @@ namespace cobra {
         const size_t frame_base   = frames.size();
         const size_t operand_base = operands.size();
 
-        frames.push_back({ .node = &root, .next_child = 0, .pushed = 0 });
+#ifndef NDEBUG
+        thread_local bool combining = false;
+        assert(!combining && "FoldPostOrder: a combine started a fold of its own instantiation");
+#endif
+
+        frames.push_back({ .node = &root, .next_child = 0 });
         while (frames.size() > frame_base) {
             Frame &frame         = frames.back();
             const auto &children = frame.node->children;
             if (frame.next_child < children.size()) {
                 const Expr *child = children[frame.next_child++].get();
-                if (child != nullptr) {
-                    ++frame.pushed;
-                    frames.push_back({ .node = child, .next_child = 0, .pushed = 0 });
-                }
+                // A missing child would shift every later one's position.
+                assert(child != nullptr && "FoldPostOrder: null child");
+                frames.push_back({ .node = child, .next_child = 0 });
                 continue;
             }
 
-            const size_t present = frame.pushed;
+            const size_t present = children.size();
             const size_t first   = operands.size() - present;
-            T value              = combine(*frame.node, operands.data() + first, present);
+#ifndef NDEBUG
+            combining = true;
+#endif
+            T value = combine(*frame.node, operands.data() + first, present);
+#ifndef NDEBUG
+            combining = false;
+#endif
             // The node's own result takes the place of its children's.
             if (present > 0) {
                 operands[first] = std::move(value);

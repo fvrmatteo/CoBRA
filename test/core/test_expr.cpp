@@ -123,3 +123,17 @@ TEST(ExprTest, EvalConstantShr8bit) {
     auto shr = Expr::LogicalShr(Expr::Constant(0xFF), 4);
     EXPECT_EQ(EvalConstantExpr(*shr, 8), 0xFu);
 }
+
+// Comparisons share a precedence and do not associate, so one nested in
+// another is parenthesised: printed bare, `(a == b) <u c` and `a == (b <u c)`
+// would read the same.
+TEST(ExprTest, RenderNestedComparisonsKeepTheirGrouping) {
+    auto left = Expr::CmpUlt(
+        Expr::CmpEq(Expr::Variable(0), Expr::Variable(1)), Expr::Variable(2)
+    );
+    auto right = Expr::CmpEq(
+        Expr::Variable(0), Expr::CmpUlt(Expr::Variable(1), Expr::Variable(2))
+    );
+    EXPECT_EQ(Render(*left, { "a", "b", "c" }), "(a == b) <u c");
+    EXPECT_EQ(Render(*right, { "a", "b", "c" }), "a == (b <u c)");
+}

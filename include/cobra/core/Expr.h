@@ -94,6 +94,10 @@ namespace cobra {
 
     std::unique_ptr< Expr > CloneExpr(const Expr &expr);
 
+    // `expr` without its children: the one place a node's own fields are
+    // copied, for a rewrite that rebuilds the children itself.
+    std::unique_ptr< Expr > CloneNode(const Expr &expr);
+
     std::string Render(
         const Expr &expr, const std::vector< std::string > &var_names, uint32_t bitwidth = 64
     );

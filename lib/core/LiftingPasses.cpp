@@ -44,7 +44,6 @@ namespace cobra {
         {
             const Expr *subtree;
             size_t hash;
-            std::string rendered;
         };
 
         // Single source of truth for the lift predicate, shared by
@@ -58,33 +57,28 @@ namespace cobra {
         }
 
         void CollectLiftableAtoms(
-            const Expr &node, bool parent_is_bitwise, const std::vector< std::string > &vars,
-            uint32_t bitwidth, std::vector< LiftCandidate > &out
+            const Expr &node, bool parent_is_bitwise, std::vector< LiftCandidate > &out
         ) {
             if (ShouldLift(node, parent_is_bitwise)) {
-                size_t h      = std::hash< Expr >{}(node);
-                auto rendered = Render(node, vars, bitwidth);
                 out.push_back(
-                    LiftCandidate{
-                        .subtree  = &node,
-                        .hash     = h,
-                        .rendered = std::move(rendered),
-                    }
+                    LiftCandidate{ .subtree = &node, .hash = std::hash< Expr >{}(node) }
                 );
                 return;
             }
 
             bool current_is_bitwise = IsBitwiseKind(node.kind);
             for (const auto &child : node.children) {
-                CollectLiftableAtoms(*child, current_is_bitwise, vars, bitwidth, out);
+                CollectLiftableAtoms(*child, current_is_bitwise, out);
             }
         }
 
+        // An atom is identified by its structure: the hash finds the bucket and
+        // structural equality decides, so two atoms that only print alike stay
+        // apart.
         struct DeduplicatedAtom
         {
             const Expr *subtree;
             size_t hash;
-            std::string rendered;
             uint32_t virtual_index;
         };
 
@@ -117,7 +111,7 @@ namespace cobra {
                 auto it    = by_hash.find(cand.hash);
                 if (it != by_hash.end()) {
                     for (size_t idx : it->second) {
-                        if (result[idx].rendered == cand.rendered) {
+                        if (ExprStructurallyEqual(*result[idx].subtree, *cand.subtree)) {
                             found = true;
                             break;
                         }
@@ -130,7 +124,6 @@ namespace cobra {
                         DeduplicatedAtom{
                             .subtree       = cand.subtree,
                             .hash          = cand.hash,
-                            .rendered      = cand.rendered,
                             .virtual_index = vi,
                         }
                     );
@@ -139,22 +132,20 @@ namespace cobra {
             return result;
         }
 
-        std::optional< uint32_t > FindVirtualIndex(
-            const Expr &node, const std::vector< DeduplicatedAtom > &atoms,
-            const std::vector< std::string > &vars, uint32_t bitwidth
-        ) {
-            size_t h      = std::hash< Expr >{}(node);
-            auto rendered = Render(node, vars, bitwidth);
+        std::optional< uint32_t >
+        FindVirtualIndex(const Expr &node, const std::vector< DeduplicatedAtom > &atoms) {
+            const size_t h = std::hash< Expr >{}(node);
             for (const auto &atom : atoms) {
-                if (atom.hash == h && atom.rendered == rendered) { return atom.virtual_index; }
+                if (atom.hash == h && ExprStructurallyEqual(*atom.subtree, node)) {
+                    return atom.virtual_index;
+                }
             }
             return std::nullopt;
         }
 
         std::unique_ptr< Expr > ReplaceAtomsWithVirtual(
             const Expr &node, bool parent_is_bitwise,
-            const std::vector< DeduplicatedAtom > &atoms,
-            const std::vector< std::string > &vars, uint32_t bitwidth
+            const std::vector< DeduplicatedAtom > &atoms
         ) {
             if (ShouldLift(node, parent_is_bitwise)) {
                 // CollectLiftableAtoms walks the same predicate before
@@ -162,7 +153,7 @@ namespace cobra {
                 // this branch must already be in `atoms`. Assert the
                 // invariant rather than producing Variable(UINT32_MAX)
                 // on a sentinel miss.
-                auto vi = FindVirtualIndex(node, atoms, vars, bitwidth);
+                auto vi = FindVirtualIndex(node, atoms);
                 assert(
                     vi.has_value()
                     && "ReplaceAtomsWithVirtual: liftable atom missing from atom table"
@@ -170,16 +161,12 @@ namespace cobra {
                 return Expr::Variable(*vi);
             }
 
-            // Clone via CloneExpr (single source of truth for Expr field
-            // copying) and rebuild children with remapped subtrees. A future
-            // Expr field added to CloneExpr propagates here automatically.
-            auto result = CloneExpr(node);
-            result->children.clear();
+            auto result = CloneNode(node);
 
             bool current_is_bitwise = IsBitwiseKind(node.kind);
             for (const auto &child : node.children) {
                 result->children.push_back(
-                    ReplaceAtomsWithVirtual(*child, current_is_bitwise, atoms, vars, bitwidth)
+                    ReplaceAtomsWithVirtual(*child, current_is_bitwise, atoms)
                 );
             }
             return result;
@@ -217,7 +204,6 @@ namespace cobra {
         struct RepeatEntry
         {
             size_t hash;
-            std::string rendered;
             const Expr *first_occurrence;
             uint32_t count;
             uint32_t size;
@@ -225,22 +211,18 @@ namespace cobra {
         };
 
         // Returns the subtree node count via post-order summation,
-        // eliminating per-node CountNodes calls (was O(n^2)). Render is
-        // deferred until a hash-bucket hit forces disambiguation; the
-        // first registration in a bucket stores rendered as empty and
-        // back-fills it lazily on the next hit.
+        // eliminating per-node CountNodes calls (was O(n^2)). A hash-bucket
+        // hit is decided by structural equality.
         uint32_t CollectNonLeafSubtrees(
             const Expr &node, uint32_t &preorder_counter,
-            const std::vector< std::string > &vars, uint32_t bitwidth,
             std::unordered_map< size_t, std::vector< size_t > > &by_hash,
             std::vector< RepeatEntry > &entries
         ) {
             const uint32_t my_order = preorder_counter++;
             uint32_t subtree_size   = 1;
             for (const auto &child : node.children) {
-                subtree_size += CollectNonLeafSubtrees(
-                    *child, preorder_counter, vars, bitwidth, by_hash, entries
-                );
+                subtree_size +=
+                    CollectNonLeafSubtrees(*child, preorder_counter, by_hash, entries);
             }
 
             const bool kIsLeaf =
@@ -250,13 +232,8 @@ namespace cobra {
             const size_t kHash = std::hash< Expr >{}(node);
             auto hit           = by_hash.find(kHash);
             if (hit != by_hash.end()) {
-                auto rendered = Render(node, vars, bitwidth);
                 for (size_t idx : hit->second) {
-                    if (entries[idx].rendered.empty()) {
-                        entries[idx].rendered =
-                            Render(*entries[idx].first_occurrence, vars, bitwidth);
-                    }
-                    if (entries[idx].rendered == rendered) {
+                    if (ExprStructurallyEqual(*entries[idx].first_occurrence, node)) {
                         entries[idx].count++;
                         return subtree_size;
                     }
@@ -267,7 +244,6 @@ namespace cobra {
             entries.push_back(
                 RepeatEntry{
                     .hash             = kHash,
-                    .rendered         = {},
                     .first_occurrence = &node,
                     .count            = 1,
                     .size             = subtree_size,
@@ -286,33 +262,22 @@ namespace cobra {
         }
 
         std::unique_ptr< Expr > ReplaceRepeatsWithVirtual(
-            const Expr &node, const std::vector< DeduplicatedAtom > &atoms,
-            const std::vector< std::string > &vars, uint32_t bitwidth
+            const Expr &node, const std::vector< DeduplicatedAtom > &atoms
         ) {
             // Check if this node matches a replacement target.
             if (node.kind != Expr::Kind::kConstant && node.kind != Expr::Kind::kVariable) {
                 size_t h = std::hash< Expr >{}(node);
                 for (const auto &atom : atoms) {
-                    if (atom.hash == h) {
-                        auto rendered = Render(node, vars, bitwidth);
-                        if (atom.rendered == rendered) {
-                            return Expr::Variable(atom.virtual_index);
-                        }
+                    if (atom.hash == h && ExprStructurallyEqual(*atom.subtree, node)) {
+                        return Expr::Variable(atom.virtual_index);
                     }
                 }
             }
 
-            // Clone via CloneExpr (single source of truth for Expr field
-            // copying) and rebuild children with remapped subtrees. A
-            // future Expr field added to CloneExpr propagates here
-            // automatically.
-            auto result = CloneExpr(node);
-            result->children.clear();
+            auto result = CloneNode(node);
 
             for (const auto &child : node.children) {
-                result->children.push_back(
-                    ReplaceRepeatsWithVirtual(*child, atoms, vars, bitwidth)
-                );
+                result->children.push_back(ReplaceRepeatsWithVirtual(*child, atoms));
             }
             return result;
         }
@@ -335,14 +300,14 @@ namespace cobra {
         std::vector< LiftCandidate > candidates;
         bool root_is_bitwise = IsBitwiseKind(ast.expr->kind);
         for (const auto &child : ast.expr->children) {
-            CollectLiftableAtoms(*child, root_is_bitwise, vars, ctx.bitwidth, candidates);
+            CollectLiftableAtoms(*child, root_is_bitwise, candidates);
         }
 
         if (candidates.empty()) {
             return Ok(PassResult{ .decision = PassDecision::kNotApplicable });
         }
 
-        // Deduplicate by structural hash + rendered string equality.
+        // Deduplicate by structural hash + structural equality.
         auto atoms = DeduplicateAtoms(candidates, original_var_count);
 
         // Check max_vars limit.
@@ -372,7 +337,7 @@ namespace cobra {
         }
 
         // Build outer expression by replacing atoms with virtual vars.
-        auto outer_expr = ReplaceAtomsWithVirtual(*ast.expr, false, atoms, vars, ctx.bitwidth);
+        auto outer_expr = ReplaceAtomsWithVirtual(*ast.expr, false, atoms);
 
         // Build extended variable list: original vars + virtual vars.
         std::vector< std::string > outer_vars = vars;
@@ -464,12 +429,12 @@ namespace cobra {
         }
 
         // Candidate discovery: traverse all non-leaf subtrees,
-        // group by structural hash + rendered string equality,
+        // group by structural hash + structural equality,
         // track occurrence count, size, and first pre-order index.
         std::unordered_map< size_t, std::vector< size_t > > by_hash;
         std::vector< RepeatEntry > entries;
         uint32_t preorder = 0;
-        CollectNonLeafSubtrees(*ast.expr, preorder, vars, ctx.bitwidth, by_hash, entries);
+        CollectNonLeafSubtrees(*ast.expr, preorder, by_hash, entries);
 
         // Filter: keep only candidates with count >= 2 AND size >= 4.
         std::vector< RepeatEntry * > viable;
@@ -528,14 +493,13 @@ namespace cobra {
                 DeduplicatedAtom{
                     .subtree       = selected[i]->first_occurrence,
                     .hash          = selected[i]->hash,
-                    .rendered      = selected[i]->rendered,
                     .virtual_index = vi,
                 }
             );
         }
 
         // Build outer expression by replacing repeated subtrees.
-        auto outer_expr = ReplaceRepeatsWithVirtual(*ast.expr, atoms, vars, ctx.bitwidth);
+        auto outer_expr = ReplaceRepeatsWithVirtual(*ast.expr, atoms);
 
         // Build extended variable list: original vars + virtual vars.
         std::vector< std::string > outer_vars = vars;
@@ -545,8 +509,7 @@ namespace cobra {
             std::make_move_iterator(virtual_names.end())
         );
 
-        // Build bindings — use atoms (which have copies of
-        // rendered strings) instead of selected for subtree access.
+        // Build bindings from the atoms.
         std::vector< LiftedBinding > bindings;
         bindings.reserve(atoms.size());
         for (const auto &atom : atoms) {
