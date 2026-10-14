@@ -167,6 +167,23 @@ TEST(SignaturePass, ReducedPolynomialFastPath_UnivariateReturnsCandidate) {
     EXPECT_EQ(candidate->verification, VerificationState::kVerified);
 }
 
+// The fast path is a polynomial recovery: a caller that declines the
+// polynomial family gets none from it either. Taken anyway, its early answer
+// stood in the way of better semilinear ones on replayed lifted code.
+TEST(SignaturePass, ReducedPolynomialFastPath_DeclinedWithoutPolynomialFamily) {
+    auto expr = Expr::Mul(Expr::Variable(0), Expr::Variable(0));
+    auto sig  = EvaluateBooleanSignature(*expr, 1, 64);
+
+    Options opts{ .bitwidth = 64, .max_vars = 16, .spot_check = true };
+    opts.evaluator                  = Evaluator::FromExpr(*expr, 64);
+    opts.enabled_families           = TechniqueFamily::kSemilinear;
+    std::vector< std::string > vars = { "x" };
+    auto ctx                        = MakeCtx(opts, vars);
+
+    WorkItem item = MakeSignatureItem(sig, vars, ctx);
+    EXPECT_FALSE(TryReducedPolynomialFastPath(item, ctx).has_value());
+}
+
 TEST(SignaturePass, ReducedPolynomialFastPath_MultivarReturnsCandidate) {
     auto expr = Expr::Add(
         Expr::Mul(Expr::Variable(0), Expr::Variable(0)),
