@@ -114,3 +114,11 @@ foreach(LL_FILE ${LL_TEST_FILES})
     get_filename_component(LL_NAME "${LL_FILE}" NAME)
     cobra_add_demanded_check_test("${LL_NAME}")
 endforeach()
+
+# `cobra-stats` prints the pass's report after the functions it ran on.
+add_test(
+    NAME "LLVMPass.cobra_stats_reports"
+    COMMAND sh -c "${OPT_BIN} -load-pass-plugin=$<TARGET_FILE:CobraPass> -passes='function(cobra-simplify),cobra-stats' -disable-output '${CMAKE_CURRENT_SOURCE_DIR}/test_basic.ll' 2>&1 | grep -q 'candidates solved  *1'"
+)
+set_tests_properties("LLVMPass.cobra_stats_reports" PROPERTIES LABELS "llvm")
+

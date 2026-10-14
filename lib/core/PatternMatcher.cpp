@@ -8,6 +8,8 @@
 #include "cobra/core/SignatureEval.h"
 #include "cobra/core/Trace.h"
 #include <algorithm>
+#include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -1631,14 +1633,20 @@ namespace cobra {
         // ids of its children, and its rewrite is kept under that id. Ids are
         // assigned by exact comparison of a node's kind, constant, variable and
         // children's ids, so two subtrees share one exactly when they are the
-        // same tree. `COBRA_PATTERN_MEMO=0` turns this off.
+        // same tree.
+        //
+        // Most subtrees have no rewrite at all. Those are remembered as such
+        // rather than by a copy of themselves: a hit hands back the subtree it
+        // was asked about, which is that very tree, and nothing is cloned.
         struct SubtreeShape
         {
             Expr::Kind kind;
             uint64_t constant_val;
             uint32_t var_index;
             uint32_t bitwidth;
-            std::vector< uint32_t > children;
+            // A node has at most two children.
+            std::array< uint32_t, 2 > children{};
+            uint8_t arity = 0;
 
             bool operator==(const SubtreeShape &other) const = default;
         };
@@ -1653,7 +1661,7 @@ namespace cobra {
                 mix(shape.constant_val);
                 mix(shape.var_index);
                 mix(shape.bitwidth);
-                for (uint32_t child : shape.children) { mix(child); }
+                for (uint8_t i = 0; i < shape.arity; ++i) { mix(shape.children[i]); }
                 return static_cast< size_t >(hash);
             }
         };
@@ -1665,22 +1673,33 @@ namespace cobra {
 
             // The id of `expr`, recording the id of every node under it.
             uint32_t Intern(const Expr &expr, uint32_t bitwidth, Ids &ids) {
-                SubtreeShape shape{ expr.kind, expr.constant_val, expr.var_index, bitwidth, {} };
-                shape.children.reserve(expr.children.size());
+                assert(expr.children.size() <= 2);
+                SubtreeShape shape{ .kind         = expr.kind,
+                                    .constant_val = expr.constant_val,
+                                    .var_index    = expr.var_index,
+                                    .bitwidth     = bitwidth };
                 for (const auto &child : expr.children) {
-                    shape.children.push_back(Intern(*child, bitwidth, ids));
+                    shape.children[shape.arity++] = Intern(*child, bitwidth, ids);
                 }
                 auto [it, inserted] =
-                    shapes_.try_emplace(std::move(shape), static_cast< uint32_t >(results_.size()));
+                    shapes_.try_emplace(shape, static_cast< uint32_t >(results_.size()));
                 if (inserted) { results_.emplace_back(); }
                 ids[&expr] = it->second;
                 return it->second;
             }
 
-            const Expr *Find(uint32_t id) const { return results_[id].get(); }
+            enum class Known : uint8_t { kNothing, kUnchanged, kRewritten };
+
+            Known Find(uint32_t id) const { return results_[id].known; }
+
+            // The rewrite of a subtree recorded as `kRewritten`.
+            const Expr &Rewrite(uint32_t id) const { return *results_[id].rewrite; }
+
+            void RecordUnchanged(uint32_t id) { results_[id].known = Known::kUnchanged; }
 
             void Record(uint32_t id, const Expr &result) {
-                results_[id] = CloneExpr(result);
+                results_[id].known   = Known::kRewritten;
+                results_[id].rewrite = CloneExpr(result);
                 stored_nodes_ += CountNodes(result);
             }
 
@@ -1706,8 +1725,14 @@ namespace cobra {
             // megabytes.
             static constexpr size_t kMaxNodes = size_t{ 1 } << 19;
 
+            struct Result
+            {
+                Known known = Known::kNothing;
+                std::unique_ptr< Expr > rewrite;
+            };
+
             std::unordered_map< SubtreeShape, uint32_t, SubtreeShapeHash > shapes_;
-            std::vector< std::unique_ptr< Expr > > results_;
+            std::vector< Result > results_;
             size_t stored_nodes_ = 0;
         };
 
@@ -1716,15 +1741,30 @@ namespace cobra {
             return memo;
         }
 
+        // `changed` is set when anything in the subtree was rewritten. It is not
+        // read off the node: one whose children were rewritten comes back as
+        // the same node with new children.
         std::unique_ptr< Expr > SimplifyPatternSubtreesMemo(
             std::unique_ptr< Expr > expr, uint32_t bitwidth, SubtreeMemo &memo,
-            const SubtreeMemo::Ids &ids
+            const SubtreeMemo::Ids &ids, bool &changed
         ) {
             const uint32_t id = ids.at(expr.get());
-            if (const Expr *known = memo.Find(id)) { return CloneExpr(*known); }
+            switch (memo.Find(id)) {
+                case SubtreeMemo::Known::kUnchanged:
+                    changed = false;
+                    return expr;
+                case SubtreeMemo::Known::kRewritten:
+                    changed = true;
+                    return CloneExpr(memo.Rewrite(id));
+                case SubtreeMemo::Known::kNothing:
+                    break;
+            }
 
+            changed = false;
             for (auto &child : expr->children) {
-                child = SimplifyPatternSubtreesMemo(std::move(child), bitwidth, memo, ids);
+                bool child_changed = false;
+                child = SimplifyPatternSubtreesMemo(std::move(child), bitwidth, memo, ids, child_changed);
+                changed = changed || child_changed;
             }
 
             std::unique_ptr< Expr > result;
@@ -1734,9 +1774,13 @@ namespace cobra {
                        recovered.has_value())
             {
                 result = SimplifyPatternSubtrees(std::move(*recovered), bitwidth);
+            } else if (!changed) {
+                memo.RecordUnchanged(id);
+                return expr;
             } else {
                 result = std::move(expr);
             }
+            changed = true;
             memo.Record(id, *result);
             return result;
         }
@@ -1759,8 +1803,10 @@ namespace cobra {
             Nesting &operator=(const Nesting &) = delete;
         } nesting(memo.depth);
         SubtreeMemo::Ids ids;
+        ids.reserve(64);
         memo.Intern(*expr, bitwidth, ids);
-        return SimplifyPatternSubtreesMemo(std::move(expr), bitwidth, memo, ids);
+        bool changed = false;
+        return SimplifyPatternSubtreesMemo(std::move(expr), bitwidth, memo, ids, changed);
     }
 
     std::unique_ptr< Expr > SimplifyXorChains(std::unique_ptr< Expr > expr, uint32_t bitwidth) {

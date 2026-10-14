@@ -42,41 +42,13 @@ namespace cobra {
             return ctx.in_mixed_product || ctx.in_bitwise_over_arith;
         }
 
-#if COBRA_NONRECURSIVE
-
-        // Same shape as `HasNonleafBitwise`, and quadratic for the same reason
-        // when written as recursion: one bottom-up pass for the variable
-        // dependency turns the test at each arithmetic node into a lookup.
+        // Same shape as `HasNonleafBitwise`.
         bool HasArithVar(const Expr &expr) {
-            const uint8_t kFolded = FoldPostOrder< uint8_t >(
-                expr,
-                [](const Expr &node, uint8_t *kids, size_t count) -> uint8_t {
-                    uint8_t state = node.kind == Expr::Kind::kVariable ? 1 : 0;
-                    for (size_t k = 0; k < count; ++k) { state |= kids[k]; }
-                    const bool kArith = node.kind == Expr::Kind::kAdd
-                        || node.kind == Expr::Kind::kMul || node.kind == Expr::Kind::kNeg;
-                    if (kArith && (state & 1) != 0) { state |= 2; }
-                    return state;
-                }
-            );
-            return (kFolded & 2) != 0;
+            return VariableUnderMarked(expr, [](const Expr &node) {
+                return node.kind == Expr::Kind::kAdd || node.kind == Expr::Kind::kMul
+                    || node.kind == Expr::Kind::kNeg;
+            });
         }
-
-#else
-
-        bool HasArithVar(const Expr &expr) {
-            if (expr.kind == Expr::Kind::kAdd || expr.kind == Expr::Kind::kMul
-                || expr.kind == Expr::Kind::kNeg)
-            {
-                if (HasVarDep(expr)) { return true; }
-            }
-            for (const auto &c : expr.children) {
-                if (HasArithVar(*c)) { return true; }
-            }
-            return false;
-        }
-
-#endif
 
         uint32_t CountSitesImpl(const Expr &expr, const RewriteContext &ctx) {
             uint32_t count = 0;

@@ -46,6 +46,28 @@ namespace cobra {
         return false;
     }
 
+    // True when some variable under `root` has an ancestor `marks` accepts -
+    // that is, when some marked node depends on a variable. One walk from the
+    // top, stopping at the first such variable: asking every marked node for
+    // its own dependency instead re-walks the subtree under each of them.
+    template < typename Marks >
+    bool VariableUnderMarked(const Expr &root, Marks marks) {
+        thread_local std::vector< std::pair< const Expr *, bool > > worklist;
+        const size_t base = worklist.size();
+        worklist.emplace_back(&root, false);
+        while (worklist.size() > base) {
+            const auto [node, under] = worklist.back();
+            worklist.pop_back();
+            if (under && node->kind == Expr::Kind::kVariable) {
+                worklist.resize(base);
+                return true;
+            }
+            const bool below = under || marks(*node);
+            for (const auto &child : node->children) { worklist.emplace_back(child.get(), below); }
+        }
+        return false;
+    }
+
     // Fold every node bottom-up without recursion and without allocating.
     //
     // `combine(node, operands, count)` is called once per node, after its

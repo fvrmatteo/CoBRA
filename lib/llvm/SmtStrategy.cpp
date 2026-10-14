@@ -211,9 +211,22 @@ namespace cobra {
             }
         };
 
+        // A context keeps every constant it was ever asked for, so one that
+        // lived as long as its thread grew with every question the thread
+        // compiled. It is replaced after this many; each question erases its
+        // function before the next is asked, so nothing outlives it.
+        constexpr unsigned kQuestionsPerCompiler = 4096;
+
+        // Called once per question.
         Compiler &ThreadCompiler() {
-            static thread_local Compiler compiler;
-            return compiler;
+            static thread_local std::unique_ptr< Compiler > compiler;
+            static thread_local unsigned questions = 0;
+            if (compiler == nullptr || ++questions > kQuestionsPerCompiler) {
+                compiler.reset();
+                compiler  = std::make_unique< Compiler >();
+                questions = 0;
+            }
+            return *compiler;
         }
 
         // `expr` at width `width`, every operation total.

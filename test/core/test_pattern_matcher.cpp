@@ -875,3 +875,25 @@ TEST(PatternMatcherTest, XorSelfCancelOddMultiplicity) {
     EXPECT_EQ(result->kind, Expr::Kind::kAnd);
     EXPECT_TRUE(FullWidthCheck(*original, 2, *result, {}, 64).passed);
 }
+
+// The subtree memo remembers a subtree with nothing to rewrite anywhere in it
+// as unchanged. One with a rewrite deeper down is not that, though its own node
+// and its child's survive: the second copy of it has to come back simplified
+// too.
+TEST(PatternMatcherTest, SubtreeMemoServesASubtreeWithARewriteBelowSimplified) {
+    const auto shared = [] {
+        // ((a ^ b) + 2 * (a & b)) * c | d - the sum is a + b, and neither the
+        // product nor the `or` above it is a pattern.
+        auto sum = Expr::Add(
+            Expr::BitwiseXor(Expr::Variable(0), Expr::Variable(1)),
+            Expr::Mul(
+                Expr::Constant(2), Expr::BitwiseAnd(Expr::Variable(0), Expr::Variable(1))
+            )
+        );
+        return Expr::BitwiseOr(Expr::Mul(std::move(sum), Expr::Variable(2)), Expr::Variable(3));
+    };
+    auto expr   = Expr::BitwiseXor(shared(), Expr::Add(shared(), Expr::Variable(4)));
+    auto result = SimplifyPatternSubtrees(std::move(expr), 64);
+    const auto rendered = Render(*result, { "a", "b", "c", "d", "e" }, 64);
+    EXPECT_EQ(rendered.find('&'), std::string::npos) << rendered;
+}

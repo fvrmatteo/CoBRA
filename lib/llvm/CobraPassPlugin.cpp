@@ -1,4 +1,5 @@
 #include "cobra/llvm/CobraPass.h"
+#include "cobra/llvm/CobraStats.h"
 
 #include <cstdint>
 #include <string>
@@ -150,6 +151,20 @@ namespace {
         return options;
     }
 
+    // `cobra-stats`: the pass's report so far (`PrintStatistics`) on stderr,
+    // for a pipeline that ends with it.
+    struct PrintStatisticsPass : llvm::PassInfoMixin< PrintStatisticsPass >
+    {
+        // NOLINTNEXTLINE(readability-identifier-naming) - LLVM interface
+        llvm::PreservedAnalyses run(llvm::Module &, llvm::ModuleAnalysisManager &) {
+            cobra::PrintStatistics(llvm::errs());
+            return llvm::PreservedAnalyses::all();
+        }
+
+        // NOLINTNEXTLINE(readability-identifier-naming) - LLVM interface
+        static bool isRequired() { return true; }
+    };
+
 } // namespace
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -172,6 +187,16 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
                              return false;
                          }
                          fpm.addPass(cobra::CobraPass(*options));
+                         return true;
+                     }
+                 );
+                 pb.registerPipelineParsingCallback(
+                     [](llvm::StringRef name, llvm::ModulePassManager &mpm,
+                        llvm::ArrayRef< llvm::PassBuilder::PipelineElement >) {
+                         if (name != "cobra-stats") {
+                             return false;
+                         }
+                         mpm.addPass(PrintStatisticsPass());
                          return true;
                      }
                  );
