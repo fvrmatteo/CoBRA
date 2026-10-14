@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified-boolean>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_FAMILIES=semilinear COBRA_TIMEOUT_MS=20000
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;boolean;families=semilinear;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: families=semilinear;timeout=20000
 
 ; A condition and the negation of another spelling of it. The `select` picks 0 when
 ; `v == 5` and the largest signed value otherwise, so shifted up by one it is 0 or

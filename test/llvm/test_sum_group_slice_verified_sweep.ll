@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified-sweep>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_TIMEOUT_MS=20000
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;sweep;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: timeout=20000
 
 ; A width-crossing identity with a base added into the sum.
 ;

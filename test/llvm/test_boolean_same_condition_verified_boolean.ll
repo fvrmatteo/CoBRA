@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified-boolean>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_FAMILIES=semilinear COBRA_TIMEOUT_MS=20000
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;boolean;families=semilinear;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: families=semilinear;timeout=20000
 
 ; Two spellings of one condition. `c` compares a 16-bit value with 90; the sign of
 ; `-((w + 65446) & 0xFFFF)` - the negated difference `w - 90` at 16 bits - is set

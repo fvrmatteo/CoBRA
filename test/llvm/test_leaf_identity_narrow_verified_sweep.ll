@@ -1,5 +1,5 @@
-; RUN: env COBRA_FAMILIES=semilinear COBRA_TIMEOUT_MS=10000 opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified-sweep>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_FAMILIES=semilinear COBRA_TIMEOUT_MS=10000
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;sweep;families=semilinear;timeout=10000>' -S %s | FileCheck %s
+; COBRA_PARAMS: families=semilinear;timeout=10000
 
 ; A tree that computes one of its own inputs, where that input is narrower than
 ; the tree.

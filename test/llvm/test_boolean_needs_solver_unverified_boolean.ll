@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<boolean>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_FAMILIES=semilinear
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<boolean;families=semilinear>' -S %s | FileCheck %s
+; COBRA_PARAMS: families=semilinear
 
 ; The boolean reading asked for without the solver it needs. Its merges are proofs
 ; and so is the check of what it finds, so without a solver it reads nothing, and the

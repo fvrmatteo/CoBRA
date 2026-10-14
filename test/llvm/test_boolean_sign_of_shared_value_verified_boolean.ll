@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified-boolean>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_FAMILIES=semilinear COBRA_TIMEOUT_MS=20000
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;boolean;families=semilinear;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: families=semilinear;timeout=20000
 
 ; `fshl(ashr(o, 63), o, 1)` is `ashr(o, 63)` whatever `o` is: the high part is the
 ; sign of `o` spread over the word, and the bit shifted in below it is that sign

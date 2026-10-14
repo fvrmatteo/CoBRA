@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified-boolean>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_FAMILIES=semilinear COBRA_TIMEOUT_MS=20000
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;boolean;families=semilinear;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: families=semilinear;timeout=20000
 
 ; A value stored encrypted with a constant key `k` is read back as `a ^ k`, and
 ; the tree below computes `(a ^ k) - 2` from it the long way: half of

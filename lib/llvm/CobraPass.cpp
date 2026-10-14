@@ -130,9 +130,8 @@ namespace cobra {
         // (`LocalDemandedBits`), and the whole-function analysis is kept for a
         // value whose readers reach much of the function.
         //
-        // `COBRA_DEMANDED=global` answers everything from the whole-function
-        // analysis, as before; `COBRA_DEMANDED_CHECK=1` answers every question
-        // both ways and counts the ones where they disagree.
+        // `CobraPassOptions::check_demanded_bits` answers every question both
+        // ways and reports the ones where they disagree.
         class DemandedBitsOracle
         {
           public:
@@ -142,9 +141,11 @@ namespace cobra {
             // need not build them again. Registered first, which does nothing
             // where the host has registered them already.
             DemandedBitsOracle(
-                llvm::Function &f, CobraStatistics &stats, llvm::FunctionAnalysisManager &am
+                llvm::Function &f, CobraStatistics &stats, llvm::FunctionAnalysisManager &am,
+                bool check
             )
-                : f_(f), stats_(stats), assumptions_(Analysis< llvm::AssumptionAnalysis >(f, am)),
+                : f_(f), stats_(stats), check_(check),
+                  assumptions_(Analysis< llvm::AssumptionAnalysis >(f, am)),
                   dominators_(Analysis< llvm::DominatorTreeAnalysis >(f, am)),
                   local_(assumptions_, dominators_, kMaxLocalRegion),
                   function_size_(f.getInstructionCount()) {}
@@ -189,23 +190,6 @@ namespace cobra {
             const llvm::DominatorTree &Dominators() const { return dominators_; }
 
           private:
-            enum class Mode : uint8_t { kLocal, kGlobal, kCheck };
-
-            static Mode Configured() {
-                static const Mode mode = [] {
-                    if (const char *check = std::getenv("COBRA_DEMANDED_CHECK");
-                        check != nullptr && *check != '\0' && *check != '0')
-                    {
-                        return Mode::kCheck;
-                    }
-                    const char *choice = std::getenv("COBRA_DEMANDED");
-                    return choice != nullptr && std::string_view(choice) == "global"
-                        ? Mode::kGlobal
-                        : Mode::kLocal;
-                }();
-                return mode;
-            }
-
             std::array< uint64_t, 4 > Counters() const {
                 return { local_.settled, local_.regions, local_.region_nodes, local_.declined };
             }
@@ -218,12 +202,11 @@ namespace cobra {
             // root, does - one whole-function build answers the rest of them
             // for less.
             llvm::APInt Demanded(llvm::Instruction *inst) {
-                const Mode mode = Configured();
                 const bool local_is_cheaper =
                     !analysis_.has_value() && local_.work_this_epoch < function_size_;
-                if (mode == Mode::kCheck || (mode == Mode::kLocal && local_is_cheaper)) {
+                if (check_ || local_is_cheaper) {
                     if (auto local = local_.Get(inst)) {
-                        if (mode == Mode::kCheck) {
+                        if (check_) {
                             const llvm::APInt global = Global(inst);
                             if (global != *local) {
                                 ++stats_.demanded_check_mismatches;
@@ -253,7 +236,7 @@ namespace cobra {
                     return;
                 }
                 ++printed;
-                llvm::errs() << "COBRA_DEMANDED_CHECK: " << f_.getName() << ": local 0x"
+                llvm::errs() << "cobra: demanded-bits mismatch: " << f_.getName() << ": local 0x"
                              << llvm::utohexstr(local.getZExtValue()) << ", global 0x"
                              << llvm::utohexstr(global.getZExtValue()) << " for" << *inst
                              << "\n";
@@ -308,6 +291,7 @@ namespace cobra {
           private:
             llvm::Function &f_;
             CobraStatistics &stats_;
+            bool check_;
             llvm::AssumptionCache &assumptions_;
             llvm::DominatorTree &dominators_;
             LocalDemandedBits local_;
@@ -1115,14 +1099,12 @@ namespace cobra {
                 }
                 if (auto it = old_.find(key); it != old_.end()) {
                     Entry entry = it->second;
-                    if (!Legacy()) {
-                        old_.erase(it);
-                        if (young_.size() >= Generation()) {
-                            old_ = std::move(young_);
-                            young_.clear();
-                        }
-                        young_.emplace(key, entry);
+                    old_.erase(it);
+                    if (young_.size() >= kGeneration) {
+                        old_ = std::move(young_);
+                        young_.clear();
                     }
+                    young_.emplace(key, entry);
                     return entry;
                 }
                 return std::nullopt;
@@ -1160,10 +1142,8 @@ namespace cobra {
                         return it->second;
                     }
                 }
-                if (young_.size() >= Generation()) {
-                    // `COBRA_OUTCOME_CACHE=legacy`: one generation of 8192,
-                    // cleared when it fills, as the cache used to be.
-                    old_ = Legacy() ? decltype(old_){} : std::move(young_);
+                if (young_.size() >= kGeneration) {
+                    old_ = std::move(young_);
                     young_.clear();
                 }
                 young_.insert_or_assign(key, entry);
@@ -1298,16 +1278,6 @@ namespace cobra {
             // and a small expression, so this is tens of megabytes at most.
             static constexpr size_t kGeneration = 32768;
             static constexpr size_t kMaxTracked = size_t{ 1 } << 20;
-
-            static bool Legacy() {
-                static const bool legacy = [] {
-                    const char *choice = std::getenv("COBRA_OUTCOME_CACHE");
-                    return choice != nullptr && std::string_view(choice) == "legacy";
-                }();
-                return legacy;
-            }
-
-            static size_t Generation() { return Legacy() ? 8192 : kGeneration; }
 
             // Dropped whole when it fills rather than aged in generations: an entry here
             // only ever saves a timeout, so losing one costs the budget once instead of
@@ -1482,9 +1452,6 @@ namespace cobra {
             }
             return true;
         }
-
-        // `COBRA_OLD` (defined below, declared here because the search needs it).
-        bool Old(std::string_view behaviour);
 
 #ifdef COBRA_HAS_Z3
         // `CobraPassOptions::boolean_variables`: a tree read with every condition
@@ -2029,7 +1996,7 @@ namespace cobra {
             if (!searched && options.z3_verify && options.z3_settings.sweep && ast != nullptr) {
                 const auto count = static_cast< uint32_t >(cand.var_names.size());
                 for (uint32_t index = 0; index < count; ++index) {
-                    auto leaf = Old("leaf-width") ? Expr::Variable(index) : LeafExpr(cand, index);
+                    auto leaf = LeafExpr(cand, index);
                     if (leaf == nullptr) {
                         continue;
                     }
@@ -2561,33 +2528,19 @@ namespace cobra {
                 RejectReason() = reason
                     + (RejectReason().empty() || RejectReason() == reason ? "" : "; " + RejectReason());
             };
-            if (!Old("free-leaf")) {
-                if (auto freed = ProposeFreeLeafRewrite(cand, options, stats)) {
-                    verdict = SolveVerdict::kSolved;
-                    return freed;
-                }
-                append();
+            if (auto freed = ProposeFreeLeafRewrite(cand, options, stats)) {
+                verdict = SolveVerdict::kSolved;
+                return freed;
             }
-            if (!Old("keyed-leaf")) {
-                const std::string so_far = RejectReason();
-                if (auto keyed = ProposeKeyedLeafRewrite(cand, options, stats)) {
-                    verdict = SolveVerdict::kSolved;
-                    return keyed;
-                }
-                RejectReason() = so_far
-                    + (RejectReason().empty() || RejectReason() == so_far ? "" : "; " + RejectReason());
+            append();
+            const std::string so_far = RejectReason();
+            if (auto keyed = ProposeKeyedLeafRewrite(cand, options, stats)) {
+                verdict = SolveVerdict::kSolved;
+                return keyed;
             }
+            RejectReason() = so_far
+                + (RejectReason().empty() || RejectReason() == so_far ? "" : "; " + RejectReason());
             return nullptr;
-        }
-
-        // `COBRA_RING_PROOF=0` sends every question past the enumeration to the
-        // solver, as before the ring normal form existed.
-        bool RingProofEnabled() {
-            static const bool enabled = [] {
-                const char *choice = std::getenv("COBRA_RING_PROOF");
-                return choice == nullptr || std::string_view(choice) != "0";
-            }();
-            return enabled;
         }
 
         // `COBRA_RING_CHECK=1`: every ring proof is also checked by evaluating both
@@ -2734,27 +2687,6 @@ namespace cobra {
             return enabled;
         }
 
-        // `COBRA_OLD=<a,b,...>` puts individual behaviours back as they were,
-        // for measuring what each one changes on a workload: `flags`
-        // (readers keep their flags), `fingerprint` (budget rejections and
-        // every rewrite's output recorded), `dce` (whole-function sweep),
-        // `slice` (no root is re-read at an extension's width; with
-        // `COBRA_SEXT=leaf` beside it, the two halves of the cross-width
-        // change), `sum-group` (a root's sum is never split into groups that
-        // share no leaf, so a width-crossing identity with a base added into it
-        // stays out of reach), `leaf-width` (a leaf identity is offered as a bare variable
-        // rather than as the tree reads the leaf, which refuses every tree whose
-        // answer is a leaf narrower than it), `free-leaf` (a tree the search turns
-        // down is not read again with its masked leaves free), `keyed-leaf` (nor
-        // over the keyed values of its leaves).
-        bool Old(std::string_view behaviour) {
-            static const std::string chosen = [] {
-                const char *value = std::getenv("COBRA_OLD");
-                return value == nullptr ? std::string{} : "," + std::string(value) + ",";
-            }();
-            return chosen.find("," + std::string(behaviour) + ",") != std::string::npos;
-        }
-
         // CPU time this thread has run, in nanoseconds.
         uint64_t ThreadCpuNanoseconds() {
             timespec now{};
@@ -2865,7 +2797,7 @@ namespace cobra {
                 // settles in microseconds what bit-blasting a multiplier cannot in
                 // seconds (see `ProveEqualByRingNormalForm`). It only ever proves,
                 // so what it does not settle goes on to the solver as before.
-                if (!proved && !solver_only && RingProofEnabled()) {
+                if (!proved && !solver_only) {
                     const auto ring_begin = std::chrono::steady_clock::now();
                     ++stats.ring_attempted;
                     proved = ProveEqualByRingNormalForm(*original, *rewritten, cand.bitwidth);
@@ -3190,39 +3122,6 @@ namespace cobra {
             return std::nullopt;
         }
 
-        // `COBRA_REUSE=0`: build every rewrite from its leaves, as the pass used
-        // to, reading nothing the function already holds (see `IrReuse`).
-        bool ReuseInstructions() {
-            static const bool reuse = [] {
-                const char *choice = std::getenv("COBRA_REUSE");
-                return choice == nullptr || *choice == '\0' || *choice != '0';
-            }();
-            return reuse;
-        }
-
-        // `COBRA_SHARED_CUTS=<n>`: how many rungs the shared-value ladder may
-        // climb, in place of `CobraPassOptions::max_shared_cuts`; zero turns the
-        // ladder off.
-        uint32_t SharedCuts(const CobraPassOptions &options) {
-            static const int64_t chosen = [] {
-                const char *choice = std::getenv("COBRA_SHARED_CUTS");
-                return choice == nullptr || *choice == '\0'
-                    ? int64_t{ -1 }
-                    : static_cast< int64_t >(std::strtoul(choice, nullptr, 10));
-            }();
-            return chosen < 0 ? options.max_shared_cuts : static_cast< uint32_t >(chosen);
-        }
-
-        // `COBRA_VERIFY_BEFORE_BUDGET=1`: prove every rewrite as soon as it is
-        // found, as the pass used to, whether or not it fits the budget.
-        bool VerifyBeforeBudget() {
-            static const bool verify_first = [] {
-                const char *choice = std::getenv("COBRA_VERIFY_BEFORE_BUDGET");
-                return choice != nullptr && *choice != '\0' && *choice != '0';
-            }();
-            return verify_first;
-        }
-
         // How many instructions `ReconstructIr` emits for `expr` at the least.
         // It builds one per operator that reads a variable - an operator over
         // constants alone is folded by the builder - plus the extension of
@@ -3277,8 +3176,7 @@ namespace cobra {
         // The one answer that depends on more than the candidate is a proof the
         // solver could not finish within its budget. A worker has the same
         // budget and a core of its own, so its "unknown" is taken as the loop's
-        // would have been; `COBRA_BACKGROUND_UNKNOWN=retry` leaves such a
-        // rewrite unproved instead, and the loop tries the proof itself.
+        // would have been.
         //
         // `COBRA_THREADS` sets the number of workers; 0 solves everything in
         // the loop, as the pass used to.
@@ -3547,49 +3445,6 @@ namespace cobra {
                 return hardware > 2 ? std::min(4U, hardware - 2) : 0U;
             }
 
-            // Whether a proof the solver could not finish leaves the rewrite
-            // unproved for the loop to take up, rather than standing as a
-            // refutation of it.
-            //
-            // It has to, and it is the default. A worker's "unknown" says the
-            // solver ran out of budget on this thread at this moment; reading
-            // it as "there is no rewrite" is reading UNKNOWN as UNSAT, and
-            // because the answer is cached under the candidate's key it is
-            // read that way for the rest of the process - every later
-            // encounter of the same expression is served the refusal without
-            // anyone solving it again. That made simplification depend on
-            // thread timing: with workers off the loop proved this expression
-            // and rewrote it, and with workers on the same expression was
-            // abandoned, on one workload leaving an obfuscated store
-            // address unsimplified and the host's analysis stuck on the store.
-            //
-            // The entry carries the proposal the search found, unproved. The
-            // worker proves at the budget the loop would (`ProofBudgetScale`),
-            // so its timeout is recorded the way the loop records its own
-            // (`OutcomeCache::RecordUnknown`) and the loop does not ask the
-            // identical question again; a later run that gives the tree a
-            // larger budget does. `COBRA_BACKGROUND_UNKNOWN=refute` restores the
-            // old reading, and `=retry` has the loop prove it again.
-            static bool RetryUnknown() {
-                static const bool retry = [] {
-                    const char *choice = std::getenv("COBRA_BACKGROUND_UNKNOWN");
-                    return choice == nullptr || std::string_view(choice) != "refute";
-                }();
-                return retry;
-            }
-
-            // `COBRA_BACKGROUND_UNKNOWN=retry`: a worker's timeout is not recorded, and the
-            // loop proves the rewrite again when it reaches it, as it did when the worker
-            // proved at a smaller budget than the loop. For measuring what the second
-            // proof buys; the report counts what it came to.
-            static bool RetryUnknownOnTheLoop() {
-                static const bool retry = [] {
-                    const char *choice = std::getenv("COBRA_BACKGROUND_UNKNOWN");
-                    return choice != nullptr && std::string_view(choice) == "retry";
-                }();
-                return retry;
-            }
-
             explicit Speculation(unsigned threads) {
                 for (unsigned index = 0; index < threads; ++index) {
                     // The search and the proof recurse over trees of up to a
@@ -3660,11 +3515,11 @@ namespace cobra {
                 OutcomeCache::Entry entry = proposal;
                 if (proposal != nullptr) {
                     bool reads_variable = false;
-                    if (VerifyBeforeBudget()
-                        || MinimumInstructions(
-                               *proposal->expr, proposal->real_var_positions,
-                               task.leaf_needs_cast, reads_variable
-                           ) < task.budget)
+                    if (MinimumInstructions(
+                            *proposal->expr, proposal->real_var_positions, task.leaf_needs_cast,
+                            reads_variable
+                        )
+                        < task.budget)
                     {
                         bool unknown  = false;
                         const auto verify_begin = std::chrono::steady_clock::now();
@@ -3672,9 +3527,14 @@ namespace cobra {
                         auto verified = VerifyCandidate(
                             task.input, *proposal, task.options, stats, &unknown
                         );
+                        // A proof the solver could not finish is not a refutation:
+                        // the entry keeps the proposal, unproved. A worker's timeout
+                        // read as "no rewrite" and cached under the key made what is
+                        // simplified depend on thread timing - with workers off the
+                        // loop proved what, with workers on, a worker had abandoned.
                         if (verified != nullptr) {
                             entry = std::move(verified);
-                        } else if (!(unknown && RetryUnknown())) {
+                        } else if (!unknown) {
                             entry = nullptr;
                         }
                         // The same question at the same budget the loop would ask it
@@ -3687,7 +3547,7 @@ namespace cobra {
                             stats.background_unknown_nanoseconds += wall;
                             const bool had_it = HadTheProcessor(wall, ThreadCpuNanoseconds() - cpu_begin);
                             stats.unknown_starved += had_it ? 0 : 1;
-                            if (!RetryUnknownOnTheLoop() && had_it) {
+                            if (had_it) {
                                 SharedOutcomeCache().RecordUnknown(
                                     task.key, ProofBudgetScale(task.input)
                                 );
@@ -3741,7 +3601,7 @@ namespace cobra {
 
         const uint64_t options_tag = OptionsTag(options_);
 
-        DemandedBitsOracle demanded_bits(f, stats, AM);
+        DemandedBitsOracle demanded_bits(f, stats, AM, options_.check_demanded_bits);
         const DemandedMaskFn demanded = [&](llvm::Instruction *inst) {
             return demanded_bits.MaskOf(inst);
         };
@@ -3926,7 +3786,7 @@ namespace cobra {
                 // costs probes and nothing else.
                 const auto slice_begin = std::chrono::steady_clock::now();
                 std::vector< MBACandidate > slices;
-                if (const auto read = Old("slice") ? std::nullopt : SliceToRead(cand, options_, stats)) {
+                if (const auto read = SliceToRead(cand, options_, stats)) {
                     slices = SliceMbaCandidate(
                         cand, read->first, read->second, options_.min_ast_size, options_.max_vars,
                         options_tag, options_.cost_model, options_.max_tree_nodes, demanded
@@ -3948,7 +3808,7 @@ namespace cobra {
                 // the same identity with a residual to add back.
                 const auto sum_begin = std::chrono::steady_clock::now();
                 std::vector< MBACandidate > groups;
-                if (slices.empty() && !Old("sum-group")) {
+                if (slices.empty()) {
                     ++stats.sum_group_roots;
                     groups = SumGroupSliceMbaCandidates(
                         cand, options_.min_ast_size, options_.max_vars, options_tag,
@@ -3990,7 +3850,7 @@ namespace cobra {
                 // function already holds.
                 const auto shared_begin = std::chrono::steady_clock::now();
                 auto shared = SharedCutMbaCandidate(
-                    cand, options_.min_ast_size, options_.max_vars, SharedCuts(options_),
+                    cand, options_.min_ast_size, options_.max_vars, options_.max_shared_cuts,
                     options_tag, options_.cost_model, options_.max_tree_nodes, demanded
                 );
                 stats.shared_nanoseconds += since(shared_begin);
@@ -4208,12 +4068,6 @@ namespace cobra {
                 const bool evicted = cache.WasEvicted(key);
                 auto proposal = ProposeRewrite(cand, options_, verdict, stats);
                 undecided_refusal = proposal == nullptr && RestedOnUnknown();
-                if (VerifyBeforeBudget() && proposal != nullptr) {
-                    proposal = VerifyCandidate(cand, *proposal, options_, stats);
-                    if (proposal == nullptr) {
-                        verdict = SolveVerdict::kUnsolved;
-                    }
-                }
                 outcome = undecided_refusal ? nullptr : cache.Insert(key, std::move(proposal));
                 if (evicted) {
                     ++stats.resolved_after_eviction;
@@ -4471,19 +4325,17 @@ namespace cobra {
             // does not come up.
             IrReuse reuse;
             llvm::SmallPtrSet< const llvm::Instruction *, 32 > poisons_root;
-            if (ReuseInstructions()) {
-                reuse.before     = cand.root;
-                reuse.dominators = dominators;
-                reuse.replaced   = &replaced_roots;
-                if (cand.poison_reaches_root) {
-                    poisons_root.insert(cand.tree.begin(), cand.tree.end());
-                    reuse.poisons_root = &poisons_root;
-                }
+            reuse.before     = cand.root;
+            reuse.dominators = dominators;
+            reuse.replaced   = &replaced_roots;
+            if (cand.poison_reaches_root) {
+                poisons_root.insert(cand.tree.begin(), cand.tree.end());
+                reuse.poisons_root = &poisons_root;
             }
 
             auto *new_val = ReconstructIr(
                 *outcome->expr, cand, builder, var_map, freeze_leaves ? &leaf_supply : nullptr,
-                ReuseInstructions() ? &reuse : nullptr, outcome->boolean_reading
+                &reuse, outcome->boolean_reading
             );
 
             // A slice was searched and proved on the low bits of its root, so
@@ -4623,9 +4475,6 @@ namespace cobra {
                 // root. A later run may find it fits; the outcome cache keeps
                 // the search from being paid again.
                 account(false);
-                if (Old("fingerprint")) {
-                    record_rejection();
-                }
                 requeue_retries();
                 continue;
             }
@@ -4755,7 +4604,7 @@ namespace cobra {
             // What the oracle knew described the function before the
             // replacement; the walk below asks about the readers after it.
             demanded_bits.Invalidate();
-            if (!root_readers.empty() && !Old("flags")) {
+            if (!root_readers.empty()) {
                 stats.reader_flags_dropped += DropAssumptionsOfReaders(root_readers, demanded_bits);
             }
             ++rewrites_this_run;
@@ -4808,9 +4657,8 @@ namespace cobra {
             // collection stopped at `max_tree_nodes` has leaves inside the
             // expression, and the replacement's fingerprint would then describe
             // a larger tree - one nobody examined - and have it skipped.
-            const bool whole_tree = Old("fingerprint")
-                || (cand.node_limit == 0 && !cand.boundary_cut
-                    && (options_.max_tree_nodes == 0 || cand.tree_size < options_.max_tree_nodes));
+            const bool whole_tree = cand.node_limit == 0 && !cand.boundary_cut
+                && (options_.max_tree_nodes == 0 || cand.tree_size < options_.max_tree_nodes);
             if (whole_tree && new_inst != nullptr && !reuse.seen.contains(new_inst)
                 && !llvm::is_contained(cand.leaf_values, new_val))
             {
@@ -4837,23 +4685,7 @@ namespace cobra {
         // and judged deadness by `mayHaveSideEffects` alone, which an unread
         // `landingpad` passes - so only CoBRA's leftovers go, each once, by
         // LLVM's own rule for what may be deleted.
-        if (changed && Old("dce")) {
-            for (bool erased = true; erased;) {
-                erased = false;
-                for (auto &bb : f) {
-                    llvm::SmallVector< llvm::Instruction *, 16 > dead;
-                    for (auto &inst : bb) {
-                        if (inst.use_empty() && !inst.isTerminator() && !inst.mayHaveSideEffects()) {
-                            dead.push_back(&inst);
-                        }
-                    }
-                    for (auto *inst : dead) {
-                        inst->eraseFromParent();
-                        erased = true;
-                    }
-                }
-            }
-        } else if (changed) {
+        if (changed) {
             // `RecursivelyDeleteTriviallyDeadInstructions` deletes what it is
             // given, readers or not - only an assertion checks - so a replaced
             // root something reads again is not given to it. None should be: a
@@ -5082,7 +4914,6 @@ namespace cobra {
             if (phis.checked != 0) {
                 part("  transparent phi sets checked", phis.checked);
                 part("    other arms the same computation", phis.exact_accept);
-                part("    accepted by probes alone (not exact)", phis.probes_only);
                 part("    read as leaves: a leaf of the arm unavailable at the root", phis.leaf_unavailable);
             }
         }

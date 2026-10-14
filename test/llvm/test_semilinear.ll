@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; Test: (x ^ 0x10) + 2*(x & 0x10) should simplify to x + 16
 ; This is a semilinear expression (constants inside bitwise ops) —

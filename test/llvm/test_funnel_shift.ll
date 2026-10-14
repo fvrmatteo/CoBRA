@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; A rotate lifts to a funnel shift by a constant, and an obfuscator's identity
 ; can run through it. Here the guest's thread-local block address is rebuilt

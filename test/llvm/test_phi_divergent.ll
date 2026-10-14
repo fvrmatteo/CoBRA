@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; Test: PHI with divergent arms should be treated as a leaf.
 ; The left branch computes xor, the right computes or — different

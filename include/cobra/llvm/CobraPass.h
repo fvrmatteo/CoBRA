@@ -136,6 +136,11 @@ namespace cobra {
         // Off by default.
         bool boolean_variables = false;
 
+        // Answer every demanded-bits question both from the readers and from
+        // LLVM's whole-function analysis, and report each disagreement on
+        // stderr. A check on the pass, for its tests; it changes no answer.
+        bool check_demanded_bits = false;
+
         bool z3_verify = false;
         Z3VerificationSettings z3_settings;
         TechniqueFamily enabled_families = TechniqueFamily::kAll;

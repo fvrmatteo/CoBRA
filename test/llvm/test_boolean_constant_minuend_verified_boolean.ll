@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified-boolean>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_FAMILIES=semilinear COBRA_TIMEOUT_MS=20000
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;boolean;families=semilinear;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: families=semilinear;timeout=20000
 
 ; A hash compared with a constant through the sign of `d | -d`: `d = h*P + K` and
 ; `-d` is written `-K - h*P`. The funnel shift is the spread sign itself, so the

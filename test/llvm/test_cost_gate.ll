@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; Test: cost gate skips replacement when simplified form is not smaller.
 ; 3*x + 5*y + 7*z + 9*w arranged as a balanced tree. The simplifier

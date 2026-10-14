@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; Test: MBA with a transparent PHI node.  Both branches compute the
 ; same xor, merging through a phi.  The detector should recognize

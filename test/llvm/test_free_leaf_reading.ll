@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; A leaf narrower than the tree is read through a mask of its width, and the
 ; search takes `v & 0xffffffff` for an operator over `v`: the sum below,

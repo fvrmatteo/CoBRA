@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; Smoke test: LShr in MBA trees doesn't crash.
 ; The boolean signature at {0,1} is degenerate for shifts (x>>2 = 0

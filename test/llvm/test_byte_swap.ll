@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; A byte swap is a fixed permutation of the value's bytes, and so a bitwise
 ; operation like any other once the width is known. Left as an opaque leaf it

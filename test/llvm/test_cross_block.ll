@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; Test: MBA split across two basic blocks connected by unconditional
 ; branch.  (x ^ y) + 2*(x & y) = x + y.  The xor lives in entry,

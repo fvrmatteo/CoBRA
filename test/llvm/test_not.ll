@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; Test: ~(x & y) + (x & y) + 1 should simplify to 0 (constant)
 ; The ~(x & y) = xor (x & y), -1 is detected as NOT in the Expr bridge.

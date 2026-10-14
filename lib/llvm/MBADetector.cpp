@@ -38,7 +38,6 @@
 #include <optional>
 #include <cstdlib>
 #include <queue>
-#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -87,16 +86,6 @@ namespace cobra {
 
 
     namespace {
-
-        // See `Old` in CobraPass.cpp: `claim` puts back claiming the whole tree
-        // of a root skipped on its fingerprint.
-        bool OldClaim() {
-            static const bool old = [] {
-                const char *value = std::getenv("COBRA_OLD");
-                return value != nullptr && ("," + std::string(value) + ",").find(",claim,") != std::string::npos;
-            }();
-            return old;
-        }
 
         // The low 64 bits of a constant of any width: `getZExtValue` asserts
         // on a wider one, which a `trunc` of an i128 constant can bring into a
@@ -548,21 +537,9 @@ namespace cobra {
         // check, the probe plan and the Expr - so none of them can model the
         // extension differently from the others.
         uint64_t SignBitOfExtensionSource(const llvm::Instruction *inst, uint32_t bw) {
-            // `COBRA_SEXT=leaf` restores the reading this replaced - a sign
-            // extension from anything wider than an `i1` is a leaf - so that
-            // what modelling it is worth is a measurement on a workload rather
-            // than a rebuild. The three readings all go through here, so the
-            // switch cannot leave them disagreeing.
-            static const bool leaf = [] {
-                const char *mode = std::getenv("COBRA_SEXT");
-                return mode != nullptr && std::string_view(mode) == "leaf";
-            }();
             if (inst->getOpcode() != llvm::Instruction::SExt || !inst->getType()->isIntegerTy()
                 || inst->getType()->getIntegerBitWidth() > bw)
             {
-                return 0;
-            }
-            if (leaf && !inst->getOperand(0)->getType()->isIntegerTy(1)) {
                 return 0;
             }
             const auto *source = inst->getOperand(0)->getType();
@@ -595,17 +572,12 @@ namespace cobra {
         // Zero for a variable amount, which has no expression at all; for an
         // amount at or past the value's own width, which is poison; and for a
         // value wider than the tree, whose sign bit is not in the tree to begin
-        // with. `COBRA_ASHR=leaf` restores the reading this replaced, so what
-        // modelling it is worth stays a measurement on a workload.
+        // with.
         //
         // One answer for the three readings of a tree, for the reason
         // `SignBitOfExtensionSource` gives.
         uint64_t AShrSignBit(const llvm::Instruction *inst, uint32_t bw) {
-            static const bool leaf = [] {
-                const char *mode = std::getenv("COBRA_ASHR");
-                return mode != nullptr && std::string_view(mode) == "leaf";
-            }();
-            if (leaf || inst->getOpcode() != llvm::Instruction::AShr
+            if (inst->getOpcode() != llvm::Instruction::AShr
                 || !inst->getType()->isIntegerTy())
             {
                 return 0;
@@ -2186,9 +2158,7 @@ namespace cobra {
         // What became of the transparent phis the collection checked
         // (`VerifyPhiArms`), for the report.
         std::atomic< uint64_t > phi_arms_checked{ 0 };
-        std::atomic< uint64_t > phi_arms_probes_accept{ 0 };
         std::atomic< uint64_t > phi_arms_exact_accept{ 0 };
-        std::atomic< uint64_t > phi_arms_probes_only{ 0 };
         std::atomic< uint64_t > phi_arms_leaf_unavailable{ 0 };
 
         // Whether `a` and `b` compute the same value: the very same value, or
@@ -2368,11 +2338,6 @@ namespace cobra {
             return true;
         }
 
-        bool VerifyPhiArmsByProbes(
-            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
-            const std::vector< llvm::Value * > &leaves, uint32_t bitwidth
-        );
-
         // Whether the collection may read each transparent phi as the arm it
         // followed. The tree is that arm, so every other arm has to be equal
         // to it on every input, or the expression is not the value.
@@ -2384,8 +2349,6 @@ namespace cobra {
         // followed arm passed (a `sext` read as a `zext`). Either way the
         // rewrite was proved against an expression only one path computes.
         // Now every other arm has to be the same computation, which is exact.
-        // `COBRA_PHI_ARMS=probes` puts the probes back, for measuring what the
-        // exact check costs in rewrites.
         //
         // The arms agreeing is not all: the tree reads its leaves at the root,
         // so each has to be available there (`LeavesAvailableAtRoot`), and a
@@ -2399,10 +2362,6 @@ namespace cobra {
             if (phi_redirects.empty()) {
                 return true;
             }
-            static const bool probes = [] {
-                const char *choice = std::getenv("COBRA_PHI_ARMS");
-                return choice != nullptr && std::string_view(choice) == "probes";
-            }();
             llvm::DenseMap< const llvm::PHINode *, ArmIdentity > identities;
             const bool exact = PhiArmsAreTheSameComputation(phi_redirects, identities);
             if (exact && !LeavesAvailableAtRoot(root, phi_redirects, identities, tree_insts, leaves)) {
@@ -2411,98 +2370,7 @@ namespace cobra {
             }
             phi_arms_checked.fetch_add(1, std::memory_order_relaxed);
             phi_arms_exact_accept.fetch_add(exact ? 1 : 0, std::memory_order_relaxed);
-            if (!probes) {
-                return exact;
-            }
-            // The probes are only run when they decide, which is also when
-            // what they accept beyond the exact check is worth counting.
-            const bool probed = VerifyPhiArmsByProbes(phi_redirects, leaves, bitwidth);
-            phi_arms_probes_accept.fetch_add(probed ? 1 : 0, std::memory_order_relaxed);
-            phi_arms_probes_only.fetch_add(probed && !exact ? 1 : 0, std::memory_order_relaxed);
-            return probed;
-        }
-
-        bool VerifyPhiArmsByProbes(
-            const llvm::DenseMap< llvm::Value *, llvm::Value * > &phi_redirects,
-            const std::vector< llvm::Value * > &leaves, uint32_t bitwidth
-        ) {
-            if (phi_redirects.empty()) {
-                return true;
-            }
-
-            const uint64_t mask           = Bitmask(bitwidth);
-            constexpr uint32_t kNumProbes = 8;
-
-            llvm::DenseSet< llvm::Value * > leaf_set;
-            for (auto *lv : leaves) {
-                leaf_set.insert(lv);
-            }
-
-            // Arms recur across probes and across phis, so each one is
-            // lowered at most once.
-            llvm::DenseMap< llvm::Value *, TreeEvalPlan > arm_plans;
-            auto plan_for = [&](llvm::Value *arm) -> const TreeEvalPlan & {
-                auto [it, inserted] = arm_plans.try_emplace(arm);
-                if (inserted) {
-                    it->second = TreeEvalPlan::Build(
-                        llvm::cast< llvm::Instruction >(arm), leaves, bitwidth, phi_redirects
-                    );
-                }
-                return it->second;
-            };
-
-            // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp)
-            std::mt19937_64 rng(0xC0B7A);
-            std::vector< uint64_t > inputs(leaves.size());
-            std::vector< uint64_t > slots;
-
-            for (const auto &[phi_val, chosen] : phi_redirects) {
-                auto *phi = llvm::dyn_cast< llvm::PHINode >(phi_val);
-                if (phi == nullptr) {
-                    continue;
-                }
-
-                for (uint32_t probe = 0; probe < kNumProbes; ++probe) {
-                    for (uint64_t &input : inputs) {
-                        input = rng() & mask;
-                    }
-
-                    // Evaluate chosen arm.
-                    uint64_t chosen_val = 0;
-                    if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(chosen)) {
-                        chosen_val = LowWord(ci) & mask;
-                    } else {
-                        chosen_val =
-                            plan_for(chosen).Evaluate(inputs.data(), inputs.size(), slots);
-                    }
-
-                    // Check every other arm.
-                    for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
-                        auto *inc = phi->getIncomingValue(i);
-                        if (inc == chosen) {
-                            continue;
-                        }
-
-                        // Pre-check: arm's dependencies must be in our leaf set.
-                        if (!ArmDepsInLeafSet(inc, leaf_set)) {
-                            return false;
-                        }
-
-                        uint64_t inc_val = 0;
-                        if (auto *ci = llvm::dyn_cast< llvm::ConstantInt >(inc)) {
-                            inc_val = LowWord(ci) & mask;
-                        } else {
-                            inc_val =
-                                plan_for(inc).Evaluate(inputs.data(), inputs.size(), slots);
-                        }
-
-                        if (inc_val != chosen_val) {
-                            return false;
-                        }
-                    }
-                }
-            }
-            return true;
+            return exact;
         }
 
     } // namespace
@@ -2943,11 +2811,6 @@ namespace cobra {
                     && FingerprintUnchanged(inst, fingerprint, options_tag))
                 {
                     ++NumFingerprintSkips;
-                    if (OldClaim()) {
-                        for (auto *ti : tree_insts) {
-                            already_in_tree.insert(ti);
-                        }
-                    }
                     continue;
                 }
 
@@ -3553,10 +3416,8 @@ namespace cobra {
     }
 
     PhiArmCounters PhiArmStatistics() {
-        return PhiArmCounters{ .checked       = phi_arms_checked.load(),
-                               .probes_accept = phi_arms_probes_accept.load(),
-                               .exact_accept  = phi_arms_exact_accept.load(),
-                               .probes_only   = phi_arms_probes_only.load(),
+        return PhiArmCounters{ .checked          = phi_arms_checked.load(),
+                               .exact_accept     = phi_arms_exact_accept.load(),
                                .leaf_unavailable = phi_arms_leaf_unavailable.load() };
     }
 

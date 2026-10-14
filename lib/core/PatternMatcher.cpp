@@ -1663,14 +1663,6 @@ namespace cobra {
           public:
             using Ids = std::unordered_map< const Expr *, uint32_t >;
 
-            static bool Enabled() {
-                static const bool enabled = [] {
-                    const char *choice = std::getenv("COBRA_PATTERN_MEMO");
-                    return choice == nullptr || std::string_view(choice) != "0";
-                }();
-                return enabled;
-            }
-
             // The id of `expr`, recording the id of every node under it.
             uint32_t Intern(const Expr &expr, uint32_t bitwidth, Ids &ids) {
                 SubtreeShape shape{ expr.kind, expr.constant_val, expr.var_index, bitwidth, {} };
@@ -1724,25 +1716,6 @@ namespace cobra {
             return memo;
         }
 
-        std::unique_ptr< Expr > SimplifyPatternSubtreesUncached(
-            std::unique_ptr< Expr > expr, uint32_t bitwidth
-        ) {
-            for (auto &child : expr->children) {
-                child = SimplifyPatternSubtreesUncached(std::move(child), bitwidth);
-            }
-
-            auto rewritten = TrySimplifyPatternSubtree(*expr, bitwidth);
-            if (rewritten.has_value()) {
-                return SimplifyPatternSubtreesUncached(std::move(*rewritten), bitwidth);
-            }
-
-            auto recovered = TryRecoverInclusionExclusion(*expr, bitwidth);
-            if (recovered.has_value()) {
-                return SimplifyPatternSubtreesUncached(std::move(*recovered), bitwidth);
-            }
-            return expr;
-        }
-
         std::unique_ptr< Expr > SimplifyPatternSubtreesMemo(
             std::unique_ptr< Expr > expr, uint32_t bitwidth, SubtreeMemo &memo,
             const SubtreeMemo::Ids &ids
@@ -1772,9 +1745,6 @@ namespace cobra {
 
     std::unique_ptr< Expr >
     SimplifyPatternSubtrees(std::unique_ptr< Expr > expr, uint32_t bitwidth) {
-        if (!SubtreeMemo::Enabled()) {
-            return SimplifyPatternSubtreesUncached(std::move(expr), bitwidth);
-        }
         auto &memo = PatternMemo();
         if (memo.depth == 0) { memo.TrimIfLarge(); }
         // Released on every way out: a worker that catches what a solve

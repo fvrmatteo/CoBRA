@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified-sweep>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_TIMEOUT_MS=20000
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;sweep;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: timeout=20000
 
 ; An arithmetic right shift by a constant, read as the logical shift with the
 ; sign copied into the bits it vacated: `(lshr(v, c) ^ H) - H` with

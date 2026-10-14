@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_FAMILIES=semilinear
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;families=semilinear>' -S %s | FileCheck %s
+; COBRA_PARAMS: families=semilinear
 
 ; The boolean reading is off unless asked for: with the solver and without it, the
 ; tree `test_boolean_sign_splat_funnel_verified_boolean.ll` folds stays as written.

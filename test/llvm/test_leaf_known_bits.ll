@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; A leaf carries what LLVM's value tracking knows of its bits. The phi below is a
 ; leaf of the tree - its arms are not the same computation - and has no bit

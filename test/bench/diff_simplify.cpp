@@ -5,7 +5,7 @@
 // from one expression to the next as they do inside a real host.
 //
 // Usage: diff_simplify [--max-vars N] [--semilinear] file...
-//        COBRA_PATTERN_MEMO=0 diff_simplify ... > off.txt; diff_simplify ... > on.txt
+//        old/diff_simplify ... > old.txt; new/diff_simplify ... > new.txt
 
 #include "ExprParser.h"
 #include "cobra/core/Expr.h"

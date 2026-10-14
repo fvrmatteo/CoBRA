@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes=cobra-simplify -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify' -S %s | FileCheck %s
 
 ; Test: a 3-node MBA that feeds a store should still simplify through the
 ; producer instruction rewrite. (x & y) ^ y + (x & y) = y, so the stored value

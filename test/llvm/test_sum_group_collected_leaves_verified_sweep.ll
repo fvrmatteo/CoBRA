@@ -1,5 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified-sweep>' -S %s | FileCheck %s
-; COBRA_ENV: COBRA_TIMEOUT_MS=20000
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;sweep;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: timeout=20000
 
 ; A sum group is collected again with the summands it leaves out read as zero,
 ; and that is only the group's own sum while the collection reads no further
