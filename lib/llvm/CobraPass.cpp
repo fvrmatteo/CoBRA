@@ -89,8 +89,8 @@ namespace cobra {
             // same key, and the key describes variables by position only, so a
             // position is the one thing about them that holds for all of those
             // candidates. Their names do not: the same name can stand at another
-            // position in another tree - an interpreter's handlers read the same
-            // register and frame slots in different roles - and binding a rewrite by name
+            // position in another tree - obfuscated code reads the same register
+            // and frame slots in different roles - and binding a rewrite by name
             // there hands it the wrong leaves, with nothing on a cache hit to
             // catch it.
             std::vector< uint32_t > real_var_positions;
@@ -136,10 +136,25 @@ namespace cobra {
         class DemandedBitsOracle
         {
           public:
-            DemandedBitsOracle(llvm::Function &f, CobraStatistics &stats)
-                : f_(f), stats_(stats), assumptions_(f), dominators_(f),
+            // The function's assumptions and dominator tree, from the host's
+            // analysis manager: the pass never changes the control flow, so
+            // they hold for the whole run, and a host that already has them
+            // need not build them again. Registered first, which does nothing
+            // where the host has registered them already.
+            DemandedBitsOracle(
+                llvm::Function &f, CobraStatistics &stats, llvm::FunctionAnalysisManager &am
+            )
+                : f_(f), stats_(stats), assumptions_(Analysis< llvm::AssumptionAnalysis >(f, am)),
+                  dominators_(Analysis< llvm::DominatorTreeAnalysis >(f, am)),
                   local_(assumptions_, dominators_, kMaxLocalRegion),
                   function_size_(f.getInstructionCount()) {}
+
+            template< typename AnalysisT >
+            static typename AnalysisT::Result &
+            Analysis(llvm::Function &f, llvm::FunctionAnalysisManager &am) {
+                am.registerPass([] { return AnalysisT(); });
+                return am.getResult< AnalysisT >(f);
+            }
 
             uint64_t MaskOf(llvm::Instruction *inst) {
                 if (inst == nullptr || !inst->getType()->isIntegerTy()
@@ -293,8 +308,8 @@ namespace cobra {
           private:
             llvm::Function &f_;
             CobraStatistics &stats_;
-            llvm::AssumptionCache assumptions_;
-            llvm::DominatorTree dominators_;
+            llvm::AssumptionCache &assumptions_;
+            llvm::DominatorTree &dominators_;
             LocalDemandedBits local_;
             uint64_t function_size_;
             std::optional< llvm::DemandedBits > analysis_;
@@ -657,7 +672,7 @@ namespace cobra {
 
         // ---- where the time goes ------------------------------------------
         //
-        // A single `CobraPass::run` on an obfuscated partial CFG has been
+        // A single `CobraPass::run` on one obfuscated function has been
         // measured at over two minutes, and per-pass timing outside CoBRA can
         // only say that much: it cannot name the expression the time went into,
         // and without the expression there is nothing to fix.
@@ -686,7 +701,7 @@ namespace cobra {
         // recorded there - what went in, what came out, what it cost, and the
         // shape of the tree - and the IR it was read from is written beside it
         // as a module holding one function, so the case can be re-run on its
-        // own instead of by reproducing the exploration that found it.
+        // own instead of by reproducing the workload that found it.
         struct SlowCandidateReport
         {
             bool enabled = false;
@@ -1179,8 +1194,8 @@ namespace cobra {
             // query is asked again on the next run, and the next, each time running the
             // whole budget out.
             //
-            // Measured by replaying the step-1073 proof CFG of one exploration through the
-            // round pipeline, 11 runs: of 128.41 s spent in the solver, **121.49 s was
+            // Measured by replaying one large obfuscated function through a host's
+            // optimization pipeline, 11 runs: of 128.41 s spent in the solver, **121.49 s was
             // spent on queries that came back UNKNOWN** - and `cobra-unknown-as-unsat` is
             // off, so not one of them could ever have produced a rewrite. The same
             // expressions, every run.
@@ -1280,7 +1295,7 @@ namespace cobra {
             // least one whole generation after it was written. Clearing
             // everything at once, as the cache used to, dropped the entries
             // the pass was about to ask for together with the stale ones - over
-            // one long exploration a third of every solve was a candidate solved
+            // one long workload a third of every solve was a candidate solved
             // before and forgotten. An entry is a key of a few hundred bytes
             // and a small expression, so this is tens of megabytes at most.
             static constexpr size_t kGeneration = 32768;
@@ -1420,7 +1435,7 @@ namespace cobra {
         // ran out of its budget on exactly that tree, a host that takes an
         // unknown answer for a yes then accepted the constant, and `K` was one
         // of the only two values the variable ever held - the flag an
-        // interpreter's conditional jump tests. Sixty-five thousand evaluations cost less
+        // obfuscated conditional jump tests. Sixty-five thousand evaluations cost less
         // than the solver's start-up and leave nothing to believe.
         //
         // Empty when the inputs are too many to walk - by count, or by count
@@ -2900,7 +2915,7 @@ namespace cobra {
                 // an obfuscated store address was proved equal to `rdx + 8` by
                 // the search and then dropped because the proof wanted 255 ms
                 // against a flat 250, and the store went on may-aliasing the
-                // frame and stopping the exploration.
+                // frame and stopping the host's analysis.
                 //
                 // Scaling is close to free. The candidates are overwhelmingly
                 // small, and a small tree keeps exactly the budget it had; only
@@ -2931,7 +2946,7 @@ namespace cobra {
                 // replaced the comparison by the side they saw passes every one
                 // of them. There the proof is the only check there is, so an
                 // unknown answer declines the candidate whatever the mode: taken
-                // as a yes, it folded the `icmp ult` behind an interpreter's
+                // as a yes, it folded the `icmp ult` behind an obfuscated
                 // conditional jump to true and the jump's displacement to a constant.
                 //
                 // The same holds for a comparison the rewrite introduces, and
@@ -3415,7 +3430,7 @@ namespace cobra {
                 // The proof's budget is scaled by it (`ProofBudgetScale`). Without it a
                 // worker proved every rewrite at the unscaled budget, ran out of time on
                 // the larger trees, and left the loop to ask the same question again at
-                // the budget it should have had: over one exploration, 63 worker timeouts
+                // the budget it should have had: over one workload, 63 worker timeouts
                 // (64 s) followed by 63 proofs on the loop (153 s), of which 3 succeeded.
                 task->input.tree_size     = cand.tree_size;
                 // Which reading the candidate is: the boolean cut is searched by the
@@ -3548,7 +3563,7 @@ namespace cobra {
             // thread timing: with workers off the loop proved this expression
             // and rewrote it, and with workers on the same expression was
             // abandoned, on one workload leaving an obfuscated store
-            // address unsimplified and the exploration stuck on the store.
+            // address unsimplified and the host's analysis stuck on the store.
             //
             // The entry carries the proposal the search found, unproved. The
             // worker proves at the budget the loop would (`ProofBudgetScale`),
@@ -3707,7 +3722,7 @@ namespace cobra {
     } // namespace
 
     llvm::PreservedAnalyses
-    CobraPass::run(llvm::Function &f, llvm::FunctionAnalysisManager & /*AM*/) {
+    CobraPass::run(llvm::Function &f, llvm::FunctionAnalysisManager &AM) {
         bool changed = false;
 
         // What this run contributes to the report. It is accumulated locally
@@ -3728,7 +3743,7 @@ namespace cobra {
 
         const uint64_t options_tag = OptionsTag(options_);
 
-        DemandedBitsOracle demanded_bits(f, stats);
+        DemandedBitsOracle demanded_bits(f, stats, AM);
         const DemandedMaskFn demanded = [&](llvm::Instruction *inst) {
             return demanded_bits.MaskOf(inst);
         };
@@ -3838,7 +3853,7 @@ namespace cobra {
             // is a shape the next run will not see. Either way the tree is left
             // for the next run, which collects it from the simplified function.
             //
-            // Measured both ways over a whole exploration, with identical
+            // Measured both ways over one whole workload, with identical
             // labels: skipping only trees that *read* a replaced root as a leaf
             // cost 98.5 s and emitted 2814 instructions; skipping every tree
             // that holds one cost 45.5 s and emitted 2756 - the trees built on
@@ -3923,7 +3938,7 @@ namespace cobra {
 
                 // Then the same question about one group of the root's sum. A
                 // base added into the sum is enough to refuse the slice above -
-                // the high bits of `DllBase + 136 + sext(e)` are the base's, so
+                // the high bits of `base + 136 + sext(e)` are the base's, so
                 // the root is the extension of nothing - while the part
                 // standing on `e` is a sign extension and reads as `e` at 32
                 // bits. The groups that share no leaf come apart, and the
@@ -4277,6 +4292,19 @@ namespace cobra {
                 continue;
             }
 
+            // A proof of this exact question has already run its budget out, so asking it
+            // again at the same budget cannot do better - see `OutcomeCache::RecordUnknown`
+            // for what that was costing. Handled exactly as a fresh timeout is: the rewrite
+            // is not made this run and nothing is recorded against the tree. Asked before
+            // the rewrite is built, since nothing it says depends on the IR.
+            if (!outcome->verified && cache.WasUnknown(key, ProofBudgetScale(cand))) {
+                ++stats.solver_unknown_skipped;
+                ++stats.rejected_unverified;
+                account(false);
+                requeue_retries();
+                continue;
+            }
+
             // Build variable index map for aux var elimination.
             // real_vars may be a subset of var_names with
             // reindexed positions.
@@ -4608,23 +4636,6 @@ namespace cobra {
             // verified rewrite replaces the proposal in the cache, and a failed
             // proof replaces it with the rejection it would always have been.
             uint64_t verifying = 0;
-            // A proof of this exact question has already run its budget out, so asking it
-            // again at the same budget cannot do better - see `OutcomeCache::RecordUnknown`
-            // for what that was costing. Handled exactly as a fresh timeout is: the rewrite
-            // is discarded for this run and nothing is recorded against the tree.
-            const bool known_unknown = !outcome->verified && cache.WasUnknown(key, ProofBudgetScale(cand));
-            if (known_unknown) {
-                ++stats.solver_unknown_skipped;
-                discard_rewrite();
-                const uint64_t rebuilding = since(rebuild_begin);
-                stats.rebuild_nanoseconds += rebuilding;
-                stats.rejected_nanoseconds += rebuilding;
-                spent += rebuilding;
-                ++stats.rejected_unverified;
-                account(false);
-                requeue_retries();
-                continue;
-            }
             if (!outcome->verified) {
                 const auto verify_begin  = std::chrono::steady_clock::now();
                 const uint64_t cpu_begin = ThreadCpuNanoseconds();
@@ -4871,7 +4882,13 @@ namespace cobra {
         stats.nanoseconds = since(run_begin);
         MergeStatistics(stats);
 
-        return changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all();
+        // Instructions are replaced and deleted, never blocks or edges.
+        if (!changed) {
+            return llvm::PreservedAnalyses::all();
+        }
+        llvm::PreservedAnalyses preserved;
+        preserved.preserveSet< llvm::CFGAnalyses >();
+        return preserved;
     }
 
     const char *NameOf(CandidateConsumer consumer) {

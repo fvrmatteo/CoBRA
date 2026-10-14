@@ -1,6 +1,7 @@
 #include "cobra/core/SemilinearSignature.h"
 #include "cobra/core/ExprTraversal.h"
 #include "cobra/core/BitWidth.h"
+#include "cobra/core/CompiledExpr.h"
 #include "cobra/core/Expr.h"
 #include "cobra/core/Trace.h"
 #include <algorithm>
@@ -161,70 +162,6 @@ namespace cobra {
         return result;
     }
 
-    namespace {
-
-        /// Evaluate expression at a specific variable assignment.
-        uint64_t
-        EvalAtPoint(const Expr &expr, const std::vector< uint64_t > &var_vals, uint64_t mask) {
-            switch (expr.kind) {
-                case Expr::Kind::kConstant:
-                    return expr.constant_val & mask;
-                case Expr::Kind::kVariable:
-                    // var_vals is sized to num_vars by IsLinearShortcut; a
-                    // sub-expression with var_index >= num_vars indicates a
-                    // malformed AST. Return 0 (treat the variable as having
-                    // no contribution) instead of an OOB read.
-                    return (expr.var_index < var_vals.size()) ? var_vals[expr.var_index] & mask
-                                                              : 0;
-                case Expr::Kind::kNot:
-                    return (~EvalAtPoint(*expr.children[0], var_vals, mask)) & mask;
-                case Expr::Kind::kNeg:
-                    return (-EvalAtPoint(*expr.children[0], var_vals, mask)) & mask;
-                case Expr::Kind::kShr: {
-                    auto v = EvalAtPoint(*expr.children[0], var_vals, mask);
-                    return (expr.constant_val >= 64) ? 0 : (v >> expr.constant_val) & mask;
-                }
-                case Expr::Kind::kAdd:
-                    return (EvalAtPoint(*expr.children[0], var_vals, mask)
-                            + EvalAtPoint(*expr.children[1], var_vals, mask))
-                        & mask;
-                case Expr::Kind::kMul:
-                    return (EvalAtPoint(*expr.children[0], var_vals, mask)
-                            * EvalAtPoint(*expr.children[1], var_vals, mask))
-                        & mask;
-                case Expr::Kind::kAnd:
-                    return EvalAtPoint(*expr.children[0], var_vals, mask)
-                        & EvalAtPoint(*expr.children[1], var_vals, mask);
-                case Expr::Kind::kOr:
-                    return (EvalAtPoint(*expr.children[0], var_vals, mask)
-                            | EvalAtPoint(*expr.children[1], var_vals, mask))
-                        & mask;
-                case Expr::Kind::kXor:
-                    return (EvalAtPoint(*expr.children[0], var_vals, mask)
-                            ^ EvalAtPoint(*expr.children[1], var_vals, mask))
-                        & mask;
-                // Only the mask is threaded through here, but it is always
-                // 2^bitwidth - 1, so its popcount recovers the width the
-                // signed comparison needs.
-                case Expr::Kind::kCmpEq:
-                case Expr::Kind::kCmpUlt:
-                case Expr::Kind::kCmpSlt: {
-                    const auto kBits = static_cast< uint32_t >(std::popcount(mask));
-                    const uint64_t kLhs = EvalAtPoint(*expr.children[0], var_vals, mask);
-                    const uint64_t kRhs = EvalAtPoint(*expr.children[1], var_vals, mask);
-                    if (expr.kind == Expr::Kind::kCmpEq) {
-                        return ModCmpEq(kLhs, kRhs, kBits);
-                    }
-                    return expr.kind == Expr::Kind::kCmpUlt
-                        ? ModCmpUlt(kLhs, kRhs, kBits)
-                        : ModCmpSlt(kLhs, kRhs, kBits);
-                }
-            }
-            return 0;
-        }
-
-    } // namespace
-
     // Rows over more variables than this are sampled one variable at a time.
     constexpr uint32_t kMaxFullRowVars = 8;
 
@@ -235,8 +172,15 @@ namespace cobra {
         if (bitwidth == 0 || num_vars > 20) { return false; }
 
         const uint64_t kMask = Bitmask(bitwidth);
-        std::vector< uint64_t > assignment(num_vars, 0);
-        const uint64_t kFZero = EvalAtPoint(expr, assignment, kMask);
+        // Up to (2^vars - 1) * (bitwidth - 1) points, so the tree is compiled
+        // once and each point is a pass over the program rather than a walk
+        // of the tree. A variable past `num_vars` - a malformed tree - reads
+        // as 0.
+        const CompiledExpr program = CompileExpr(expr, bitwidth);
+        std::vector< uint64_t > assignment(std::max(num_vars, program.arity), 0);
+        std::vector< uint64_t > stack;
+        const auto at = [&] { return EvalCompiledExpr(program, assignment, stack); };
+        const uint64_t kFZero = at();
 
         // The whole row, when it is small enough to evaluate: every subset of
         // the variables set to bit `b` must move the result by 2^b times what
@@ -250,8 +194,8 @@ namespace cobra {
                 for (uint32_t j = 0; j < num_vars; ++j) {
                     assignment[j] = ((subset >> j) & 1) != 0 ? value : 0;
                 }
-                const uint64_t kDelta = (EvalAtPoint(expr, assignment, kMask) - kFZero) & kMask;
-                std::fill(assignment.begin(), assignment.end(), 0);
+                const uint64_t kDelta = (at() - kFZero) & kMask;
+                std::fill(assignment.begin(), assignment.begin() + num_vars, 0);
                 return kDelta;
             };
             for (size_t subset = 1; subset < kLen; ++subset) {
@@ -278,7 +222,7 @@ namespace cobra {
         std::vector< uint64_t > coeff(num_vars);
         for (uint32_t j = 0; j < num_vars; ++j) {
             assignment[j] = 1;
-            coeff[j]      = (EvalAtPoint(expr, assignment, kMask) - kFZero) & kMask;
+            coeff[j]      = (at() - kFZero) & kMask;
             assignment[j] = 0;
         }
 
@@ -287,7 +231,7 @@ namespace cobra {
             const uint64_t kBitVal = 1ULL << bit;
             for (uint32_t j = 0; j < num_vars; ++j) {
                 assignment[j]         = kBitVal;
-                const uint64_t kDelta = (EvalAtPoint(expr, assignment, kMask) - kFZero) & kMask;
+                const uint64_t kDelta = (at() - kFZero) & kMask;
                 const uint64_t kExpect = (coeff[j] * kBitVal) & kMask;
                 if (kDelta != kExpect) {
                     COBRA_TRACE(
