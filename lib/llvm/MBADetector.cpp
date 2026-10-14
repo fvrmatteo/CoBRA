@@ -729,20 +729,16 @@ namespace cobra {
                 return minmax->getType()->getIntegerBitWidth() == bw;
             }
 
+            // A `select` reads its condition as the 0/1 value it is, whatever
+            // computes it: a comparison the tree can read is read, and any
+            // other `i1` - an argument, a load, a comparison too wide for the
+            // tree - is a leaf, held as 0 or 1 by the same narrow-leaf mask
+            // every reading applies.
             if (inst->getOpcode() == llvm::Instruction::Select) {
                 if (!inst->getType()->isIntegerTy() || inst->getType()->getIntegerBitWidth() > bw) {
                     return false;
                 }
-                const auto *cond = inst->getOperand(0);
-                if (llvm::isa< llvm::ConstantInt >(cond)) {
-                    return true;
-                }
-                const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(cond);
-                if (cmp != nullptr && narrow_comparisons && ComparesExactlyNarrow(*cmp, bw)) {
-                    return true;
-                }
-                return cmp != nullptr && IsTreeWidthInt(cmp->getOperand(0), bw)
-                    && IsSupportedPredicate(cmp->getPredicate());
+                return inst->getOperand(0)->getType()->isIntegerTy(1);
             }
 
             // Everything else is held at its own width inside a tree evaluated
@@ -1022,9 +1018,11 @@ namespace cobra {
                         work.push({ op.get(), kReadsBitwise });
                     }
                 } else if (auto *phi = llvm::dyn_cast< llvm::PHINode >(v)) {
-                    // Check if every incoming value is an MBA opcode
-                    // instruction (or a constant).  If so, treat the
-                    // phi as transparent and follow the first arm.
+                    // Check if every incoming value is an instruction the
+                    // walk reads (or a constant) - the same predicate the walk
+                    // itself asks, so a rotate, a byte swap or a minimum is an
+                    // arm as much as an `add` is. If so, treat the phi as
+                    // transparent and follow the first arm.
                     bool all_mba = phi->getNumIncomingValues() > 0;
                     for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
                         auto *inc = phi->getIncomingValue(i);
@@ -1032,7 +1030,7 @@ namespace cobra {
                             continue;
                         }
                         auto *inc_inst = llvm::dyn_cast< llvm::Instruction >(inc);
-                        if ((inc_inst == nullptr) || !IsMbaOpcode(inc_inst->getOpcode())
+                        if ((inc_inst == nullptr) || !IsMbaInstruction(inc_inst)
                             || !FitsTreeWidth(inc_inst, bw, narrow_comparisons))
                         {
                             all_mba = false;
