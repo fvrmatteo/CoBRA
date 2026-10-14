@@ -2698,7 +2698,8 @@ namespace cobra {
         // rather than as the tree reads the leaf, which refuses every tree whose
         // answer is a leaf narrower than it), `free-leaf` (a tree the search turns
         // down is not read again with its masked leaves free), `keyed-leaf` (nor
-        // over the keyed values of its leaves).
+        // over the keyed values of its leaves), `saturating` (a saturating
+        // addition or subtraction is a leaf; read in MBADetector.cpp).
         bool Old(std::string_view behaviour) {
             static const std::string chosen = [] {
                 const char *value = std::getenv("COBRA_OLD");
