@@ -319,19 +319,6 @@ namespace cobra {
         };
         rewrite_chain(ir);
 
-        // An alternative reading is taken only once it passes the probe the
-        // chain's answer faces below: adopted on cost alone, a wrong one
-        // would block the item and lose the chain's answer with it.
-        const auto kNumVars    = static_cast< uint32_t >(vars.size());
-        const auto passes_probe = [&](const SemilinearIR &alternative) {
-            return !local_eval
-                || FullWidthCheckEval(
-                       *local_eval, kNumVars, *ReconstructMaskedAtoms(alternative, {}),
-                       ctx.bitwidth, 16
-                )
-                       .passed;
-        };
-
         // The chain above compares atoms that share a basis, so a variable
         // sitting under a constant inside a multi-variable atom is invisible
         // to it. Re-solving the checked sum one bit class at a time reads
@@ -343,7 +330,7 @@ namespace cobra {
             rewrite_chain(*solved);
             const auto kChainCost  = ComputeCost(*ReconstructMaskedAtoms(ir, {})).cost;
             const auto kSolvedCost = ComputeCost(*ReconstructMaskedAtoms(*solved, {})).cost;
-            if (IsBetter(kSolvedCost, kChainCost) && passes_probe(*solved)) {
+            if (IsBetter(kSolvedCost, kChainCost)) {
                 COBRA_TRACE(
                     "Simplifier", "RunSemilinearRewrite: partition solve wins ({} < {})",
                     kSolvedCost.weighted_size, kChainCost.weighted_size
@@ -362,7 +349,7 @@ namespace cobra {
         {
             const auto kCurrentCost    = ComputeCost(*ReconstructMaskedAtoms(ir, {})).cost;
             const auto kTranslatedCost = ComputeCost(*ReconstructMaskedAtoms(*translated, {})).cost;
-            if (IsBetter(kTranslatedCost, kCurrentCost) && passes_probe(*translated)) {
+            if (IsBetter(kTranslatedCost, kCurrentCost)) {
                 COBRA_TRACE(
                     "Simplifier", "RunSemilinearRewrite: translation wins ({} < {})",
                     kTranslatedCost.weighted_size, kCurrentCost.weighted_size
@@ -372,7 +359,8 @@ namespace cobra {
         }
 
         if (local_eval) {
-            auto probe_expr = ReconstructMaskedAtoms(ir, {});
+            const auto kNumVars = static_cast< uint32_t >(vars.size());
+            auto probe_expr     = ReconstructMaskedAtoms(ir, {});
             auto probe =
                 FullWidthCheckEval(*local_eval, kNumVars, *probe_expr, ctx.bitwidth, 16);
             if (!probe.passed) {
