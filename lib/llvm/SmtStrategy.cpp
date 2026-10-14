@@ -462,6 +462,30 @@ namespace cobra {
                                          terms_.mk_term(Kind::BV_SUB, { a, b }) }
                         );
                     }
+                    case llvm::Intrinsic::sadd_sat:
+                    case llvm::Intrinsic::ssub_sat: {
+                        // Overflowed when the result's sign is not the one the
+                        // operands' signs call for; clamped toward the sign of
+                        // the first operand.
+                        const bool add = call->getIntrinsicID() == llvm::Intrinsic::sadd_sat;
+                        Term a = arg(0), b = arg(1);
+                        Term zero = terms_.mk_bv_zero(a.sort());
+                        Term r = terms_.mk_term(add ? Kind::BV_ADD : Kind::BV_SUB, { a, b });
+                        Term test = add
+                            ? terms_.mk_term(Kind::BV_AND, { terms_.mk_term(Kind::BV_XOR, { r, a }),
+                                                             terms_.mk_term(Kind::BV_XOR, { r, b }) })
+                            : terms_.mk_term(Kind::BV_AND, { terms_.mk_term(Kind::BV_XOR, { a, b }),
+                                                             terms_.mk_term(Kind::BV_XOR, { a, r }) });
+                        const std::string low(width - 1, '1');
+                        Term largest = terms_.mk_bv_value(a.sort(), "0" + low, 2);
+                        Term smallest = terms_.mk_term(Kind::BV_NOT, { largest });
+                        Term bound = terms_.mk_term(
+                            Kind::ITE, { terms_.mk_term(Kind::BV_SLT, { a, zero }), smallest, largest }
+                        );
+                        return terms_.mk_term(
+                            Kind::ITE, { terms_.mk_term(Kind::BV_SLT, { test, zero }), bound, r }
+                        );
+                    }
                     case llvm::Intrinsic::fshl:
                     case llvm::Intrinsic::fshr: {
                         const auto *amount = llvm::dyn_cast< llvm::ConstantInt >(call->getArgOperand(2));

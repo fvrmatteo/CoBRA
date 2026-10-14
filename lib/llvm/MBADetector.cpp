@@ -374,6 +374,31 @@ namespace cobra {
             }
         }
 
+        // A saturating addition or subtraction, which is the wrapped result or
+        // the bound it clamps to, chosen by its overflow test - a `select` over
+        // a comparison, which the model already writes, as it does for a
+        // minimum or maximum. A compiler spells a carry or an overflow flag
+        // this way (`ssub.sat(a, b) == k` for "a - b is k and does not
+        // overflow"), and left as a leaf the test becomes a variable of its
+        // own, apart from the operands it reads: an identity that holds
+        // because of what it tests - an obfuscator's `x == 0` correction,
+        // say - cannot be seen.
+        const llvm::IntrinsicInst *SaturatingOf(const llvm::Value *v) {
+            const auto *intrinsic = llvm::dyn_cast< llvm::IntrinsicInst >(v);
+            if (intrinsic == nullptr || !intrinsic->getType()->isIntegerTy()) {
+                return nullptr;
+            }
+            switch (intrinsic->getIntrinsicID()) { // NOLINT(hicpp-multiway-paths-covered)
+                case llvm::Intrinsic::uadd_sat:
+                case llvm::Intrinsic::usub_sat:
+                case llvm::Intrinsic::sadd_sat:
+                case llvm::Intrinsic::ssub_sat:
+                    return intrinsic;
+                default:
+                    return nullptr;
+            }
+        }
+
         // The rotate amount reduced to the type's width, and the width itself.
         std::pair< uint64_t, uint64_t > FunnelShiftAmount(const llvm::IntrinsicInst &fsh) {
             const uint64_t width = fsh.getType()->getIntegerBitWidth();
@@ -403,7 +428,8 @@ namespace cobra {
         bool IsMbaInstruction(const llvm::Instruction *inst) {
             return IsMbaOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
                 || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr
-                || IsTransparentFreeze(inst) || ByteGepOf(inst) != nullptr;
+                || SaturatingOf(inst) != nullptr || IsTransparentFreeze(inst)
+                || ByteGepOf(inst) != nullptr;
         }
 
         // `icmp` produces i1, which is useless as a candidate root: it is only
@@ -437,7 +463,7 @@ namespace cobra {
         bool IsMbaRoot(const llvm::Instruction *inst) {
             return IsMbaRootOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
                 || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr
-                || IsPtrAddChain(inst);
+                || SaturatingOf(inst) != nullptr || IsPtrAddChain(inst);
         }
 
         // The operators that read their operands bit by bit, and the ones that
@@ -713,6 +739,13 @@ namespace cobra {
                 return minmax->getType()->getIntegerBitWidth() == bw;
             }
 
+            // A saturating operation overflows at its own width, and a signed
+            // one reads the sign bit there: exact at the width the tree is
+            // evaluated at, and only there, as a minimum or maximum is.
+            if (const auto *saturating = SaturatingOf(inst)) {
+                return saturating->getType()->getIntegerBitWidth() == bw;
+            }
+
             // A `select` reads its condition as the 0/1 value it is, whatever
             // computes it: a comparison the tree can read is read, and any
             // other `i1` - an argument, a load, a comparison too wide for the
@@ -940,8 +973,10 @@ namespace cobra {
 
                 if ((inst != nullptr) && IsMbaInstruction(inst)
                     && FitsTreeWidth(inst, bw, narrow_comparisons)) {
+                    // A saturating operation carries between bits like the
+                    // addition it is.
                     if (cut_arith_under_bitwise && from_bitwise
-                        && IsArithmeticOpcode(inst->getOpcode()))
+                        && (IsArithmeticOpcode(inst->getOpcode()) || SaturatingOf(inst) != nullptr))
                     {
                         if (std::find(leaves.begin(), leaves.end(), v) == leaves.end()) {
                             leaves.push_back(v);
@@ -988,6 +1023,14 @@ namespace cobra {
                     if (const auto *minmax = MinMaxOf(inst)) {
                         work.push({ minmax->getArgOperand(0), from_bitwise });
                         work.push({ minmax->getArgOperand(1), from_bitwise });
+                        continue;
+                    }
+                    // A saturating operation adds or subtracts its operands
+                    // before it compares anything, so it reads them the way an
+                    // addition does.
+                    if (const auto *saturating = SaturatingOf(inst)) {
+                        work.push({ saturating->getArgOperand(0), false });
+                        work.push({ saturating->getArgOperand(1), false });
                         continue;
                     }
                     // A freeze is not an operator, so it neither starts nor
@@ -1444,6 +1487,36 @@ namespace cobra {
                             break;
                     }
                     return Emit(Op::kMask, Emit3(Op::kSelect, cond, a, b), 0);
+                }
+
+                // A saturating operation as the choice it is: the wrapped
+                // result, or the bound, on the overflow test.
+                if (const auto *saturating = SaturatingOf(inst)) {
+                    const uint32_t a = Emit(Op::kMask, lower(saturating->getArgOperand(0)), 0);
+                    const uint32_t b = Emit(Op::kMask, lower(saturating->getArgOperand(1)), 0);
+                    switch (saturating->getIntrinsicID()) { // NOLINT(hicpp-multiway-paths-covered)
+                        case llvm::Intrinsic::uadd_sat: {
+                            const uint32_t sum = Emit(Op::kAdd, a, b);
+                            return Emit3(Op::kSelect, Emit(Op::kCmpUlt, sum, a), ConstSlot(mask_), sum);
+                        }
+                        case llvm::Intrinsic::usub_sat:
+                            return Emit3(Op::kSelect, Emit(Op::kCmpUlt, a, b), kZeroSlot, Emit(Op::kSub, a, b));
+                        default: {
+                            // Signed: the operation overflowed when the result's
+                            // sign is not the one its operands' signs call for,
+                            // and it is then clamped toward the first operand's
+                            // sign - the largest value, plus one when negative.
+                            const bool kAdd     = saturating->getIntrinsicID() == llvm::Intrinsic::sadd_sat;
+                            const uint32_t wrap = Emit(kAdd ? Op::kAdd : Op::kSub, a, b);
+                            const uint32_t test = kAdd
+                                ? Emit(Op::kAnd, Emit(Op::kXor, wrap, a), Emit(Op::kXor, wrap, b))
+                                : Emit(Op::kAnd, Emit(Op::kXor, a, b), Emit(Op::kXor, a, wrap));
+                            const uint32_t overflow = Emit(Op::kCmpSlt, test, kZeroSlot);
+                            const uint32_t bound =
+                                Emit(Op::kAdd, ConstSlot(mask_ >> 1), Emit(Op::kCmpSlt, a, kZeroSlot));
+                            return Emit3(Op::kSelect, overflow, bound, wrap);
+                        }
+                    }
                 }
 
                 // A `ptradd` is the addition it spells, over the indices only:
@@ -2027,6 +2100,94 @@ namespace cobra {
                 auto diff   = Expr::BitwiseXor(std::move(a), std::move(b_again));
                 auto masked = Expr::BitwiseAnd(std::move(diff), Expr::Negate(std::move(cond)));
                 return Expr::BitwiseXor(std::move(b), std::move(masked));
+            }
+
+            // A saturating operation: the wrapped result, and the bound it is
+            // clamped to on the overflow test, chosen the way a `select` is.
+            if (const auto *saturating = SaturatingOf(inst)) {
+                auto a = BuildExprFromIRImpl(
+                    saturating->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress,
+                    budget, leaf_bits
+                );
+                auto b = BuildExprFromIRImpl(
+                    saturating->getArgOperand(1), leaves, tree_set, mask, phi_redirects, in_progress,
+                    budget, leaf_bits
+                );
+                if (a == nullptr || b == nullptr) {
+                    return nullptr;
+                }
+                // Every copy is charged; one the budget cannot pay for leaves
+                // the value a leaf.
+                bool paid       = true;
+                const auto copy = [&](const std::unique_ptr< Expr > &expr) {
+                    auto clone = paid ? ChargedClone(*expr, budget) : nullptr;
+                    paid       = clone != nullptr;
+                    return clone;
+                };
+                const uint64_t all = Bitmask(saturating->getType()->getIntegerBitWidth());
+                switch (saturating->getIntrinsicID()) { // NOLINT(hicpp-multiway-paths-covered)
+                    case llvm::Intrinsic::uadd_sat: {
+                        // `s | -(s <u a)`: all ones on a carry.
+                        auto a_copy = copy(a);
+                        auto s      = Expr::Add(std::move(a), std::move(b));
+                        auto s_copy = copy(s);
+                        if (!paid) {
+                            return nullptr;
+                        }
+                        auto carry = Expr::CmpUlt(std::move(s_copy), std::move(a_copy));
+                        return Expr::BitwiseOr(std::move(s), Expr::Negate(std::move(carry)));
+                    }
+                    case llvm::Intrinsic::usub_sat: {
+                        // `(a - b) & ((a <u b) - 1)`: zero on a borrow.
+                        auto a_copy = copy(a);
+                        auto b_copy = copy(b);
+                        if (!paid) {
+                            return nullptr;
+                        }
+                        auto borrow = Expr::CmpUlt(std::move(a_copy), std::move(b_copy));
+                        auto d      = Expr::Add(std::move(a), Expr::Negate(std::move(b)));
+                        return Expr::BitwiseAnd(std::move(d), Expr::Add(std::move(borrow), Expr::Constant(all)));
+                    }
+                    default: {
+                        // Signed: overflowed when the result's sign is not the
+                        // one the operands' signs call for - `(r ^ a) & (r ^ b)`
+                        // for a sum, `(a ^ b) & (a ^ r)` for a difference, is
+                        // negative - and clamped toward the first operand's
+                        // sign: the largest value, plus one when it is negative.
+                        const bool kAdd = saturating->getIntrinsicID() == llvm::Intrinsic::sadd_sat;
+                        auto a_test     = copy(a);
+                        auto a_sign     = copy(a);
+                        auto b_test     = copy(b);
+                        auto r          = kAdd ? Expr::Add(std::move(a), std::move(b))
+                                               : Expr::Add(std::move(a), Expr::Negate(std::move(b)));
+                        auto r_test     = copy(r);
+                        auto r_pick     = copy(r);
+                        // The second operand of the test: `r ^ b` for a sum,
+                        // `a ^ b` for a difference.
+                        auto other = kAdd ? copy(r) : copy(a_test);
+                        if (!paid) {
+                            return nullptr;
+                        }
+                        auto test = kAdd
+                            ? Expr::BitwiseAnd(
+                                  Expr::BitwiseXor(std::move(r_test), std::move(a_test)),
+                                  Expr::BitwiseXor(std::move(other), std::move(b_test))
+                              )
+                            : Expr::BitwiseAnd(
+                                  Expr::BitwiseXor(std::move(other), std::move(b_test)),
+                                  Expr::BitwiseXor(std::move(a_test), std::move(r_test))
+                              );
+                        auto overflow = Expr::CmpSlt(std::move(test), Expr::Constant(0));
+                        auto bound    = Expr::Add(
+                            Expr::Constant(all >> 1), Expr::CmpSlt(std::move(a_sign), Expr::Constant(0))
+                        );
+                        // `select(o, bound, r) == r ^ ((bound ^ r) & -o)`.
+                        auto masked = Expr::BitwiseAnd(
+                            Expr::BitwiseXor(std::move(bound), std::move(r_pick)), Expr::Negate(std::move(overflow))
+                        );
+                        return Expr::BitwiseXor(std::move(r), std::move(masked));
+                    }
+                }
             }
 
             // A `ptradd`, read as the addition of its indices (see `ByteGepOf`).
