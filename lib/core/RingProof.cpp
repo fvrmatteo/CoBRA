@@ -53,6 +53,20 @@ namespace cobra {
                 return result;
             }
 
+            // What the proof splits a comparison by: its normal form, with
+            // every comparison read as the atom it is. Two comparisons whose
+            // operands normalise alike are the same function and take the same
+            // value in every case; one that folds to a constant takes no case
+            // at all, and is none (nothing).
+            std::optional< std::string > ComparisonKey(const Expr &comparison) {
+                static const std::unordered_map< const Expr *, uint64_t > kNoCases;
+                const auto form = Run(comparison, kNoCases);
+                if (!form || ConstantOf(*form)) {
+                    return std::nullopt;
+                }
+                return Serialize(*form);
+            }
+
           private:
             Poly Constant(uint64_t value) const {
                 value &= mask_;
@@ -424,36 +438,22 @@ namespace cobra {
             std::vector< Atom > atoms_;
         };
 
-        // The tree under `expr`, spelled out, to tell comparisons apart.
-        void Spell(const Expr &expr, std::string &out) {
-            out += static_cast< char >('a' + static_cast< int >(expr.kind));
-            if (expr.kind == Expr::Kind::kConstant || expr.kind == Expr::Kind::kShr) {
-                out += std::to_string(expr.constant_val);
-            } else if (expr.kind == Expr::Kind::kVariable) {
-                out += std::to_string(expr.var_index);
-            }
-            out += '(';
-            for (const auto &child : expr.children) {
-                Spell(*child, out);
-            }
-            out += ')';
-        }
-
-        // Every comparison under `expr`, by its spelling: the same comparison
-        // written twice is split on once.
+        // Every comparison under `expr` that does not fold, by its normal
+        // form (`ComparisonKey`): the same comparison, however it is written,
+        // is split on once.
         void CollectComparisons(
-            const Expr &expr, std::unordered_map< std::string, uint32_t > &index,
+            const Expr &expr, Normalizer &normalizer, std::unordered_map< std::string, uint32_t > &index,
             std::vector< std::pair< const Expr *, uint32_t > > &nodes
         ) {
             if (IsComparison(expr.kind)) {
-                std::string spelling;
-                Spell(expr, spelling);
-                const auto [slot, inserted] =
-                    index.try_emplace(std::move(spelling), static_cast< uint32_t >(index.size()));
-                nodes.emplace_back(&expr, slot->second);
+                if (auto key = normalizer.ComparisonKey(expr)) {
+                    const auto [slot, inserted] =
+                        index.try_emplace(std::move(*key), static_cast< uint32_t >(index.size()));
+                    nodes.emplace_back(&expr, slot->second);
+                }
             }
             for (const auto &child : expr.children) {
-                CollectComparisons(*child, index, nodes);
+                CollectComparisons(*child, normalizer, index, nodes);
             }
         }
 
@@ -484,8 +484,8 @@ namespace cobra {
 
         std::unordered_map< std::string, uint32_t > index;
         std::vector< std::pair< const Expr *, uint32_t > > nodes;
-        CollectComparisons(lhs, index, nodes);
-        CollectComparisons(rhs, index, nodes);
+        CollectComparisons(lhs, normalizer, index, nodes);
+        CollectComparisons(rhs, normalizer, index, nodes);
         // Every case is a bit of a 64-bit counter, whatever the limit says.
         if (index.empty() || index.size() > limits.max_comparisons || index.size() >= 64) {
             return false;

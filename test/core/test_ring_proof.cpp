@@ -247,3 +247,30 @@ TEST(RingProof, NeverProvesAFalseEquality) {
     EXPECT_GT(proved_rewrites, 1500);
     EXPECT_GT(checked, 1500);
 }
+
+// A comparison is split on by what it compares, not by how it is written:
+// `(x + y) == z` and `(y + x) == z` are one comparison, and `c * c == c` holds
+// on both of its values. Split as two, the case where they differ is no case
+// at all and the proof failed on it.
+TEST(RingProof, SplitsAComparisonByItsNormalForm) {
+    auto c1 = [] {
+        return Expr::CmpEq(Expr::Add(Expr::Variable(0), Expr::Variable(1)), Expr::Variable(2));
+    };
+    auto c2 = [] {
+        return Expr::CmpEq(Expr::Add(Expr::Variable(1), Expr::Variable(0)), Expr::Variable(2));
+    };
+    auto lhs = Expr::Mul(c1(), c1());
+    auto rhs = c2();
+    EXPECT_TRUE(ProveEqualByRingNormalForm(*lhs, *rhs, 64));
+    EXPECT_TRUE(ProveEqualByRingNormalForm(*lhs, *rhs, 8));
+}
+
+// A comparison of constants is the constant it folds to, and splitting on it
+// would only add cases that cannot happen.
+TEST(RingProof, DoesNotSplitOnAFoldedComparison) {
+    auto lhs = Expr::Add(
+        Expr::Variable(0), Expr::CmpUlt(Expr::Constant(3), Expr::Constant(5))
+    );
+    auto rhs = Expr::Add(Expr::Variable(0), Expr::Constant(1));
+    EXPECT_TRUE(ProveEqualByRingNormalForm(*lhs, *rhs, 32));
+}
