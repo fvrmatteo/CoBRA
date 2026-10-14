@@ -238,10 +238,10 @@ namespace cobra {
                     return;
                 }
                 ++printed;
-                llvm::errs() << "cobra: demanded-bits mismatch: " << f_.getName() << ": local 0x"
-                             << llvm::utohexstr(local.getZExtValue()) << ", global 0x"
-                             << llvm::utohexstr(global.getZExtValue()) << " for" << *inst
-                             << "\n";
+                llvm::errs() << "cobra: demanded-bits mismatch: " << f_.getName()
+                             << ": local 0x" << llvm::utohexstr(local.getZExtValue())
+                             << ", global 0x" << llvm::utohexstr(global.getZExtValue())
+                             << " for" << *inst << "\n";
             }
 
             // What the readers of `inst` look at, following `freeze`.
@@ -2552,7 +2552,8 @@ namespace cobra {
                 return keyed;
             }
             RejectReason() = so_far
-                + (RejectReason().empty() || RejectReason() == so_far ? "" : "; " + RejectReason());
+                + (RejectReason().empty() || RejectReason() == so_far ? ""
+                                                                      : "; " + RejectReason());
             return nullptr;
         }
 
@@ -3116,7 +3117,8 @@ namespace cobra {
                       Expr::Constant((~sign + 1) & mask)
                   );
             ++stats.slice_asked;
-            if (const auto decided = DecideByEnumeration(*claim.expr, *claimed, claim.vars, bw)) {
+            if (const auto decided = DecideByEnumeration(*claim.expr, *claimed, claim.vars, bw))
+            {
                 ++(*decided ? stats.slice_proved : stats.slice_refuted);
                 return *decided ? ClaimVerdict::kProved : ClaimVerdict::kRefuted;
             }
@@ -3127,7 +3129,8 @@ namespace cobra {
             for (uint32_t index = 0; index < claim.vars; ++index) {
                 names.push_back("v" + std::to_string(index));
             }
-            const auto result = VerifyExprsWithStrategy(*claim.expr, *claimed, names, bw, settings);
+            const auto result =
+                VerifyExprsWithStrategy(*claim.expr, *claimed, names, bw, settings);
             if (result.unknown) {
                 ++stats.slice_unknown;
                 return ClaimVerdict::kUnknown;
@@ -3842,11 +3845,12 @@ namespace cobra {
                         options_tag, options_.cost_model, options_.max_tree_nodes, demanded
                     );
                     if (!slices.empty()) {
-                        const auto claim = std::make_shared< const ExtensionClaim >(ExtensionClaim{
-                            .expr      = std::shared_ptr< const Expr >(CloneExpr(*cand.expr)),
-                            .bitwidth  = cand.bitwidth,
-                            .vars      = static_cast< uint32_t >(cand.var_names.size()),
-                            .tree_size = static_cast< uint32_t >(cand.tree_size) });
+                        const auto claim =
+                            std::make_shared< const ExtensionClaim >(ExtensionClaim{
+                                .expr = std::shared_ptr< const Expr >(CloneExpr(*cand.expr)),
+                                .bitwidth  = cand.bitwidth,
+                                .vars      = static_cast< uint32_t >(cand.var_names.size()),
+                                .tree_size = static_cast< uint32_t >(cand.tree_size) });
                         for (auto &slice : slices) {
                             slice.extension_claim = claim;
                         }
@@ -4566,10 +4570,11 @@ namespace cobra {
             // root with the same slice makes its own claim.
             if (cand.slice_extension != SliceExtension::kNone) {
                 const auto claim_begin = std::chrono::steady_clock::now();
-                const auto claim       = cand.extension_claim == nullptr
-                          ? ClaimVerdict::kRefuted
-                          : ProveExtensionClaim(
-                          *cand.extension_claim, cand.bitwidth, cand.slice_extension, options_, stats
+                const auto claim         = cand.extension_claim == nullptr
+                            ? ClaimVerdict::kRefuted
+                            : ProveExtensionClaim(
+                          *cand.extension_claim, cand.bitwidth, cand.slice_extension, options_,
+                          stats
                       );
                 const uint64_t claiming = since(claim_begin);
                 stats.slice_nanoseconds += claiming;
@@ -5089,8 +5094,9 @@ namespace cobra {
         cost("  ladder: inner roots", stats.inner_nanoseconds);
         cost("  ladder: slices", stats.slice_nanoseconds);
         if (stats.slice_asked != 0) {
-            out << "    slice claims asked " << stats.slice_asked << ", proved " << stats.slice_proved
-                << ", refuted " << stats.slice_refuted << ", unknown " << stats.slice_unknown
+            out << "    slice claims asked " << stats.slice_asked << ", proved "
+                << stats.slice_proved << ", refuted " << stats.slice_refuted << ", unknown "
+                << stats.slice_unknown
                 << " (a fitting rewrite dropped for it: " << stats.slice_claim_failed << ")\n";
         }
         cost("  ladder: sum groups", stats.sum_group_nanoseconds);

@@ -63,7 +63,9 @@ namespace cobra {
                 return true;
             }
             const bool below = under || marks(*node);
-            for (const auto &child : node->children) { worklist.emplace_back(child.get(), below); }
+            for (const auto &child : node->children) {
+                worklist.emplace_back(child.get(), below);
+            }
         }
         return false;
     }
@@ -98,7 +100,9 @@ namespace cobra {
 
 #ifndef NDEBUG
         thread_local bool combining = false;
-        assert(!combining && "FoldPostOrder: a combine started a fold of its own instantiation");
+        assert(
+            !combining && "FoldPostOrder: a combine started a fold of its own instantiation"
+        );
 #endif
 
         frames.push_back({ .node = &root, .next_child = 0 });

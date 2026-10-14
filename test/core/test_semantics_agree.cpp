@@ -34,11 +34,14 @@ TEST(SemanticsAgree, EveryEvaluatorGivesEveryNodeOneMeaning) {
                 for (auto &value : values) { value = random.Input(); }
                 const uint64_t truth = EvalExpr(*expr, values, bitwidth);
                 ASSERT_EQ(truth & ~Bitmask(bitwidth), 0u)
-                    << "EvalExpr left bits above the width: " << Render(*expr, VariableNames(vars), bitwidth);
+                    << "EvalExpr left bits above the width: "
+                    << Render(*expr, VariableNames(vars), bitwidth);
                 EXPECT_EQ(EvalCompiledExpr(compiled, values, stack), truth)
-                    << "compiled, w=" << bitwidth << ": " << Render(*expr, VariableNames(vars), bitwidth);
+                    << "compiled, w=" << bitwidth << ": "
+                    << Render(*expr, VariableNames(vars), bitwidth);
                 EXPECT_EQ(EvalConstantExpr(*Substitute(*expr, values), bitwidth), truth)
-                    << "constant folder, w=" << bitwidth << ": " << Render(*expr, VariableNames(vars), bitwidth);
+                    << "constant folder, w=" << bitwidth << ": "
+                    << Render(*expr, VariableNames(vars), bitwidth);
             }
             // The Boolean signature is the same expression on 0/1 inputs.
             const auto sig = EvaluateBooleanSignature(*expr, vars, bitwidth);
@@ -46,7 +49,8 @@ TEST(SemanticsAgree, EveryEvaluatorGivesEveryNodeOneMeaning) {
                 std::vector< uint64_t > values(vars);
                 for (uint32_t v = 0; v < vars; ++v) { values[v] = (index >> v) & 1; }
                 EXPECT_EQ(sig[index], EvalExpr(*expr, values, bitwidth))
-                    << "signature, w=" << bitwidth << ": " << Render(*expr, VariableNames(vars), bitwidth);
+                    << "signature, w=" << bitwidth << ": "
+                    << Render(*expr, VariableNames(vars), bitwidth);
             }
         }
     }

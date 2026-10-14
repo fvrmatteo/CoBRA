@@ -1763,7 +1763,9 @@ namespace cobra {
             changed = false;
             for (auto &child : expr->children) {
                 bool child_changed = false;
-                child = SimplifyPatternSubtreesMemo(std::move(child), bitwidth, memo, ids, child_changed);
+                child              = SimplifyPatternSubtreesMemo(
+                    std::move(child), bitwidth, memo, ids, child_changed
+                );
                 changed = changed || child_changed;
             }
 

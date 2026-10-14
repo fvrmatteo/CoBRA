@@ -61,7 +61,9 @@ namespace cobra::testing {
 
         uint64_t Edge() {
             const uint64_t top = uint64_t{ 1 } << (bitwidth_ - 1);
-            const uint64_t edges[] = { 0, 1, 2, top, top - 1, top + 1, Bitmask(bitwidth_), ~uint64_t{ 0 } };
+            const uint64_t edges[] = {
+                0, 1, 2, top, top - 1, top + 1, Bitmask(bitwidth_), ~uint64_t{ 0 }
+            };
             return edges[Pick(8)];
         }
 
@@ -72,7 +74,8 @@ namespace cobra::testing {
         uint32_t bitwidth_;
     };
 
-    inline std::unique_ptr< Expr > Substitute(const Expr &expr, const std::vector< uint64_t > &values) {
+    inline std::unique_ptr< Expr >
+    Substitute(const Expr &expr, const std::vector< uint64_t > &values) {
         if (expr.kind == Expr::Kind::kVariable) {
             return Expr::Constant(values[expr.var_index]);
         }

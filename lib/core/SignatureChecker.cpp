@@ -105,7 +105,9 @@ namespace cobra {
             // candidate brings its own, and the input's would only slow every
             // check down.
             const auto *scoped = ScopedProbeConstants();
-            if (scoped != nullptr && expr_a == nullptr && expr_b != nullptr && !HasVarDep(*expr_b)) {
+            if (scoped != nullptr && expr_a == nullptr && expr_b != nullptr
+                && !HasVarDep(*expr_b))
+            {
                 raw.insert(raw.end(), scoped->begin(), scoped->end());
             }
 

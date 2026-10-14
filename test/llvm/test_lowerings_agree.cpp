@@ -43,7 +43,9 @@ TEST(LoweringsAgree, ReconstructedIrComputesWhatTheEvaluatorDoes) {
             MBACandidate candidate{};
             candidate.bitwidth = bitwidth;
             for (const uint64_t value : values) {
-                candidate.leaf_values.push_back(llvm::ConstantInt::get(type, value & Bitmask(bitwidth)));
+                candidate.leaf_values.push_back(
+                    llvm::ConstantInt::get(type, value & Bitmask(bitwidth))
+                );
                 candidate.leaf_widths.push_back(bitwidth);
             }
             auto *built    = ReconstructIr(*expr, candidate, builder);
@@ -70,10 +72,12 @@ TEST(LoweringsAgree, SolverLoweringsProveWhatTheEvaluatorComputes) {
                 Z3VerificationSettings settings;
                 settings.timeout_ms = 10000;
                 settings.strategy   = strategy;
-                const auto result   = VerifyExprsWithStrategy(*fixed, *truth, {}, bitwidth, settings);
+                const auto result =
+                    VerifyExprsWithStrategy(*fixed, *truth, {}, bitwidth, settings);
                 EXPECT_TRUE(result.equivalent && !result.unknown)
-                    << (strategy == SmtStrategy::kDirect ? "direct" : "llvm") << ", w=" << bitwidth
-                    << ": " << Render(*expr, VariableNames(vars), bitwidth) << " at "
+                    << (strategy == SmtStrategy::kDirect ? "direct" : "llvm")
+                    << ", w=" << bitwidth << ": "
+                    << Render(*expr, VariableNames(vars), bitwidth) << " at "
                     << Render(*fixed, {}, bitwidth) << " is " << truth->constant_val
                     << (result.counterexample.empty() ? "" : " - " + result.counterexample);
             }

@@ -2586,8 +2586,8 @@ namespace cobra {
                 // A slice reads the root at the width the caller proved it to
                 // be an extension of, not at the width of its type.
                 const uint32_t bw = slice != nullptr ? slice->width
-                    : ptradd                         ? gep->getOperand(1)->getType()->getIntegerBitWidth()
-                                                     : inst.getType()->getIntegerBitWidth();
+                    : ptradd ? gep->getOperand(1)->getType()->getIntegerBitWidth()
+                             : inst.getType()->getIntegerBitWidth();
                 if (bw > 64 || bw == 0) {
                     continue;
                 }
@@ -3199,11 +3199,12 @@ namespace cobra {
                 continue;
             }
             const auto &claimed = whole.front();
-            sliced.front().extension_claim = std::make_shared< const ExtensionClaim >(ExtensionClaim{
-                .expr      = std::shared_ptr< const Expr >(CloneExpr(*claimed.expr)),
-                .bitwidth  = claimed.bitwidth,
-                .vars      = static_cast< uint32_t >(claimed.var_names.size()),
-                .tree_size = static_cast< uint32_t >(claimed.tree_size) });
+            sliced.front().extension_claim = std::make_shared< const ExtensionClaim >(
+                ExtensionClaim{ .expr = std::shared_ptr< const Expr >(CloneExpr(*claimed.expr)),
+                                .bitwidth  = claimed.bitwidth,
+                                .vars      = static_cast< uint32_t >(claimed.var_names.size()),
+                                .tree_size = static_cast< uint32_t >(claimed.tree_size) }
+            );
             candidates.push_back(std::move(sliced.front()));
         }
         return candidates;

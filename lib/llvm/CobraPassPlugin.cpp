@@ -113,14 +113,15 @@ namespace {
                 llvm::SmallVector< llvm::StringRef, 6 > names;
                 value.split(names, '+', -1, false);
                 for (const llvm::StringRef family : names) {
-                    const auto bit = llvm::StringSwitch< cobra::TechniqueFamily >(family)
-                                         .Case("semilinear", cobra::TechniqueFamily::kSemilinear)
-                                         .Case("polynomial", cobra::TechniqueFamily::kPolynomial)
-                                         .Case("template", cobra::TechniqueFamily::kTemplate)
-                                         .Case("bitwise", cobra::TechniqueFamily::kBitwise)
-                                         .Case("ghost", cobra::TechniqueFamily::kGhost)
-                                         .Case("lifting", cobra::TechniqueFamily::kLifting)
-                                         .Default(cobra::TechniqueFamily::kNone);
+                    const auto bit =
+                        llvm::StringSwitch< cobra::TechniqueFamily >(family)
+                            .Case("semilinear", cobra::TechniqueFamily::kSemilinear)
+                            .Case("polynomial", cobra::TechniqueFamily::kPolynomial)
+                            .Case("template", cobra::TechniqueFamily::kTemplate)
+                            .Case("bitwise", cobra::TechniqueFamily::kBitwise)
+                            .Case("ghost", cobra::TechniqueFamily::kGhost)
+                            .Case("lifting", cobra::TechniqueFamily::kLifting)
+                            .Default(cobra::TechniqueFamily::kNone);
                     if (bit == cobra::TechniqueFamily::kNone) {
                         return Invalid(parameter);
                     }
@@ -176,7 +177,9 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
                  pb.registerPipelineParsingCallback(
                      [](llvm::StringRef name, llvm::FunctionPassManager &fpm,
                         llvm::ArrayRef< llvm::PassBuilder::PipelineElement >) {
-                         if (!llvm::PassBuilder::checkParametrizedPassName(name, "cobra-simplify")) {
+                         if (!llvm::PassBuilder::checkParametrizedPassName(
+                                 name, "cobra-simplify"
+                             )) {
                              return false;
                          }
                          auto options = llvm::PassBuilder::parsePassParameters(

@@ -1203,7 +1203,9 @@ namespace cobra {
                 const std::unordered_set< std::string > taken(vars.begin(), vars.end());
                 for (size_t index = 0, suffix = 0; index < hidden.size(); ++index) {
                     std::string name;
-                    do { name = "$shr" + std::to_string(suffix++); } while (taken.contains(name));
+                    do {
+                        name = "$shr" + std::to_string(suffix++);
+                    } while (taken.contains(name));
                     extended.push_back(std::move(name));
                 }
                 if (extended.size() > kMaxInputVars) { return std::nullopt; }

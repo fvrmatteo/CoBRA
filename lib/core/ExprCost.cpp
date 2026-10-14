@@ -97,7 +97,9 @@ namespace cobra {
         CostInfo kids[2]{};
         const size_t count = expr.children.size();
         for (size_t k = 0; k < count; ++k) { kids[k] = ComputeCost(*expr.children[k]); }
-        return CombineCost(expr, count > 0 ? &kids[0] : nullptr, count > 1 ? &kids[1] : nullptr);
+        return CombineCost(
+            expr, count > 0 ? &kids[0] : nullptr, count > 1 ? &kids[1] : nullptr
+        );
     }
 
 #endif
