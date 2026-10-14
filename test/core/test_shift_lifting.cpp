@@ -157,6 +157,49 @@ TEST(ShiftLiftingTest, DivideByPowerOfTwoReadsTheExactWidthAsSigned) {
     }
 }
 
+// A complement over a shifted sum is `-E - 1`, and a product scales through
+// the factor that holds the shift: both lift, to twice the original.
+TEST(ShiftLiftingTest, LiftReadsComplementsAndProducts) {
+    const auto halved = [] { return Expr::LogicalShr(Expr::Add(Var(0), Var(1)), 1); };
+    std::vector< std::unique_ptr< Expr > > exprs;
+    exprs.push_back(Expr::Add(Expr::BitwiseNot(halved()), Var(2)));
+    exprs.push_back(Expr::Mul(halved(), Var(2)));
+    exprs.push_back(Expr::Mul(Var(2), Expr::BitwiseNot(halved())));
+    std::mt19937_64 rng(13);
+    for (const auto &expr : exprs) {
+        auto lifted = LiftShifts(*expr, 32);
+        ASSERT_TRUE(lifted.has_value()) << Render(*expr, { "x", "y", "z" }, 32);
+        EXPECT_EQ(lifted->shift, 1U);
+        EXPECT_FALSE(HasShiftOverArithmetic(*lifted->scaled));
+        for (int sample = 0; sample < 256; ++sample) {
+            const auto inputs = RandomInputs(rng, 3, 32);
+            EXPECT_EQ(Eval(*lifted->scaled, inputs, 32), ModMul(2, Eval(*expr, inputs, 32), 32))
+                << Render(*expr, { "x", "y", "z" }, 32);
+        }
+    }
+    // Both factors shifted: scaling would have to reach into both.
+    EXPECT_FALSE(LiftShifts(*Expr::Mul(halved(), halved()), 32).has_value());
+}
+
+// The factor of two may sit inside the operand of an odd coefficient, or be
+// the cleared low bits of a mask.
+TEST(ShiftLiftingTest, DivideByPowerOfTwoReachesIntoOperandsAndMasks) {
+    auto nested   = Expr::Mul(Const(3), Expr::Mul(Const(2), Var(0)));
+    auto masked   = Expr::BitwiseAnd(Expr::BitwiseXor(Var(0), Var(1)), Const(0xF0));
+    auto q_nested = DivideByPowerOfTwo(*nested, 1, 32);
+    auto q_masked = DivideByPowerOfTwo(*masked, 4, 32);
+    ASSERT_TRUE(q_nested != nullptr);
+    ASSERT_TRUE(q_masked != nullptr);
+    std::mt19937_64 rng(17);
+    for (int sample = 0; sample < 256; ++sample) {
+        const auto inputs = RandomInputs(rng, 2, 32);
+        EXPECT_EQ(ModMul(2, Eval(*q_nested, inputs, 32), 32), Eval(*nested, inputs, 32));
+        EXPECT_EQ(ModMul(16, Eval(*q_masked, inputs, 32), 32), Eval(*masked, inputs, 32));
+    }
+    // A mask with a low bit set carries no factor of sixteen.
+    EXPECT_TRUE(DivideByPowerOfTwo(*Expr::BitwiseAnd(Var(0), Const(0xF8)), 4, 32) == nullptr);
+}
+
 TEST(ShiftLiftingTest, DemandedMaskRecoversTheAndIdentity) {
     const std::vector< std::string > vars = { "x", "y" };
     auto expr = AndIdentity(Var(0), Var(1));

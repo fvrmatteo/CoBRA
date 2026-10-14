@@ -463,6 +463,11 @@ if(TARGET cobra-llvm)
         target_include_directories(test_lowerings_agree PRIVATE
             ${PROJECT_SOURCE_DIR}/lib/llvm ${PROJECT_SOURCE_DIR}/lib)
         gtest_discover_tests(test_lowerings_agree)
+        add_executable(test_smt_strategies llvm/test_smt_strategies.cpp)
+        target_link_libraries(test_smt_strategies PRIVATE cobra-llvm cobra-verify GTest::gtest_main)
+        target_include_directories(test_smt_strategies PRIVATE
+            ${PROJECT_SOURCE_DIR}/lib/llvm ${PROJECT_SOURCE_DIR}/lib)
+        gtest_discover_tests(test_smt_strategies)
     endif()
 endif()
 

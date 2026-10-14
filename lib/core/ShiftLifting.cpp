@@ -143,14 +143,39 @@ namespace cobra {
                     auto operand = Lift(*expr.children[0], shift, bitwidth);
                     return operand ? Expr::Negate(std::move(operand)) : nullptr;
                 }
+                case Expr::Kind::kNot: {
+                    // A complement over a bitwise atom is an atom; over
+                    // anything else it is `-E - 1`, which scales term by term.
+                    if (!HasShiftOverArithmetic(expr)) {
+                        return Scale(CloneExpr(expr), shift, bitwidth);
+                    }
+                    auto operand = Lift(*expr.children[0], shift, bitwidth);
+                    if (!operand) { return nullptr; }
+                    return Expr::Add(
+                        Expr::Negate(std::move(operand)),
+                        Expr::Constant(ModNeg(PowerOfTwo(shift, bitwidth), bitwidth))
+                    );
+                }
                 case Expr::Kind::kMul: {
                     const auto [factor, other] = ConstantFactorOf(expr);
-                    if (factor == nullptr) { return nullptr; }
-                    auto lifted = Lift(*other, shift, bitwidth);
+                    if (factor != nullptr) {
+                        auto lifted = Lift(*other, shift, bitwidth);
+                        if (!lifted) { return nullptr; }
+                        return Expr::Mul(
+                            Expr::Constant(EvalConstantExpr(*factor, bitwidth)),
+                            std::move(lifted)
+                        );
+                    }
+                    // A product scales through one factor: the one holding the
+                    // shifts, as long as the other holds none to lift.
+                    const Expr &lhs   = *expr.children[0];
+                    const Expr &rhs   = *expr.children[1];
+                    const bool in_lhs = HasShiftWithin(lhs, shift);
+                    const bool in_rhs = HasShiftWithin(rhs, shift);
+                    if (in_lhs == in_rhs) { return nullptr; }
+                    auto lifted = Lift(in_lhs ? lhs : rhs, shift, bitwidth);
                     if (!lifted) { return nullptr; }
-                    return Expr::Mul(
-                        Expr::Constant(EvalConstantExpr(*factor, bitwidth)), std::move(lifted)
-                    );
+                    return Expr::Mul(std::move(lifted), CloneExpr(in_lhs ? rhs : lhs));
                 }
                 case Expr::Kind::kShr: {
                     // 2^shift * (L >> t) == 2^(shift - t) * (L - (L mod 2^t)).
@@ -259,9 +284,30 @@ namespace cobra {
             case Expr::Kind::kMul: {
                 const auto [factor, other] = ConstantFactorOf(expr);
                 if (factor == nullptr) { return nullptr; }
-                const auto q = quotient(EvalConstantExpr(*factor, bitwidth));
-                if (!q) { return nullptr; }
-                return ApplyCoefficient(CloneExpr(*other), *q, bitwidth);
+                const uint64_t coefficient = EvalConstantExpr(*factor, bitwidth);
+                if (const auto q = quotient(coefficient)) {
+                    return ApplyCoefficient(CloneExpr(*other), *q, bitwidth);
+                }
+                // `3 * (2 * x)`: the factor of two is in the operand.
+                auto inner = DivideByPowerOfTwo(*other, shift, bitwidth, width);
+                if (!inner) { return nullptr; }
+                return ApplyCoefficient(std::move(inner), coefficient, bitwidth);
+            }
+            case Expr::Kind::kAnd: {
+                // `E & M` with the low `shift` bits of `M` clear is
+                // `((E >> shift) & (M >> shift)) * 2^shift`.
+                const Expr *mask_side = IsConstantSubtree(*expr.children[1])
+                    ? expr.children[1].get()
+                    : IsConstantSubtree(*expr.children[0]) ? expr.children[0].get()
+                                                           : nullptr;
+                if (mask_side == nullptr) { return nullptr; }
+                const Expr &operand =
+                    mask_side == expr.children[1].get() ? *expr.children[0] : *expr.children[1];
+                const uint64_t mask = EvalConstantExpr(*mask_side, bitwidth);
+                if ((mask & low) != 0) { return nullptr; }
+                return Expr::BitwiseAnd(
+                    Expr::LogicalShr(CloneExpr(operand), shift), Expr::Constant(mask >> shift)
+                );
             }
             default:
                 return nullptr;

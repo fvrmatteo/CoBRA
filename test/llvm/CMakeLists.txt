@@ -122,3 +122,20 @@ add_test(
 )
 set_tests_properties("LLVMPass.cobra_stats_reports" PROPERTIES LABELS "llvm")
 
+# What the pass makes of a function must not depend on whether workers solved
+# ahead of the loop: the same input with none and with four, compared whole.
+# The proof budget is far beyond what any question here needs, so no answer
+# rests on a timeout.
+foreach(PARITY_PIPELINE "cobra-simplify" "cobra-simplify<verified|timeout=60000|families=semilinear>")
+    string(MAKE_C_IDENTIFIER "${PARITY_PIPELINE}" PARITY_NAME)
+    string(REPLACE "|" "$<SEMICOLON>" PARITY_PASSES "${PARITY_PIPELINE}")
+    set(PARITY_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/inputs/parity.ll")
+    add_test(
+        NAME "LLVMPass.thread_parity.${PARITY_NAME}"
+        COMMAND sh -c "COBRA_THREADS=0 ${OPT_BIN} -load-pass-plugin=$<TARGET_FILE:CobraPass> -passes='${PARITY_PASSES}' -S '${PARITY_INPUT}' -o - > parity.${PARITY_NAME}.0.ll && COBRA_THREADS=4 ${OPT_BIN} -load-pass-plugin=$<TARGET_FILE:CobraPass> -passes='${PARITY_PASSES}' -S '${PARITY_INPUT}' -o - > parity.${PARITY_NAME}.4.ll && cmp parity.${PARITY_NAME}.0.ll parity.${PARITY_NAME}.4.ll"
+    )
+    set_tests_properties("LLVMPass.thread_parity.${PARITY_NAME}" PROPERTIES LABELS "llvm")
+    if(PARITY_PIPELINE MATCHES "verified" AND NOT COBRA_VERIFY_BACKEND)
+        set_tests_properties("LLVMPass.thread_parity.${PARITY_NAME}" PROPERTIES DISABLED TRUE)
+    endif()
+endforeach()
