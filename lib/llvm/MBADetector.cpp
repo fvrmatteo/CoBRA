@@ -746,16 +746,31 @@ namespace cobra {
                 return saturating->getType()->getIntegerBitWidth() == bw;
             }
 
-            // A `select` reads its condition as the 0/1 value it is, whatever
-            // computes it: a comparison the tree can read is read, and any
-            // other `i1` - an argument, a load, a comparison too wide for the
-            // tree - is a leaf, held as 0 or 1 by the same narrow-leaf mask
-            // every reading applies.
+            // A `select` is read with its condition, which takes a condition
+            // the tree reads: a constant, or a comparison at the tree's width
+            // (or, on the boolean cut, a narrower one it reads exactly). On any
+            // other condition the select stays a leaf, because it can be the
+            // answer: `2 * ((s - v) | v) - (v ^ (s - v))` is `s`, and read
+            // through `s` the tree holds its arms and condition instead, which
+            // no semilinear rewrite turns back into the select. Reading every
+            // select whatever its condition found more on some single-block
+            // functions of lifted code but less on whole replayed proof CFGs,
+            // and cost over a quarter of the pass's time on one and over half on
+            // another.
             if (inst->getOpcode() == llvm::Instruction::Select) {
                 if (!inst->getType()->isIntegerTy() || inst->getType()->getIntegerBitWidth() > bw) {
                     return false;
                 }
-                return inst->getOperand(0)->getType()->isIntegerTy(1);
+                const auto *cond = inst->getOperand(0);
+                if (llvm::isa< llvm::ConstantInt >(cond)) {
+                    return true;
+                }
+                const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(cond);
+                if (cmp != nullptr && narrow_comparisons && ComparesExactlyNarrow(*cmp, bw)) {
+                    return true;
+                }
+                return cmp != nullptr && IsTreeWidthInt(cmp->getOperand(0), bw)
+                    && IsSupportedPredicate(cmp->getPredicate());
             }
 
             // Everything else is held at its own width inside a tree evaluated
