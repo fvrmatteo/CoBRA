@@ -91,6 +91,33 @@ namespace cobra {
         void *previous_;
     };
 
+    // Adds the constants of `source` to the probes a full-width check of a
+    // constant candidate against an evaluator derives, on this thread, for as
+    // long as it lives.
+    //
+    // Such a check sees only the candidate's constants, and a constant
+    // candidate has none worth probing: an expression that is constant on every
+    // input but the one where a sum of its own constants wraps to zero passed
+    // every probe and reached the solver to be refuted - most refuted rewrites
+    // on a replayed proof CFG were exactly that. Its constants name that
+    // input. Simplify opens one over its input expression. More probes can
+    // only turn candidates down.
+    class ProbeConstantsScope
+    {
+      public:
+        explicit ProbeConstantsScope(const Expr &source);
+        ~ProbeConstantsScope();
+
+        ProbeConstantsScope(const ProbeConstantsScope &)            = delete;
+        ProbeConstantsScope &operator=(const ProbeConstantsScope &) = delete;
+        ProbeConstantsScope(ProbeConstantsScope &&)                 = delete;
+        ProbeConstantsScope &operator=(ProbeConstantsScope &&)      = delete;
+
+      private:
+        std::vector< uint64_t > constants_;
+        const std::vector< uint64_t > *previous_;
+    };
+
     // Evaluate an Expr tree at given variable values.
     uint64_t
     EvalExpr(const Expr &expr, const std::vector< uint64_t > &var_values, uint32_t bitwidth);

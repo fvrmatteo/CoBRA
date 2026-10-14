@@ -1,6 +1,7 @@
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/Expr.h"
+#include "cobra/core/ExprUtils.h"
 #include "cobra/core/Profile.h"
 #include "cobra/core/SignatureEval.h"
 #include "cobra/core/Trace.h"
@@ -86,6 +87,12 @@ namespace cobra {
             }
         }
 
+        // The constants of the innermost `ProbeConstantsScope`, if any.
+        const std::vector< uint64_t > *&ScopedProbeConstants() {
+            static thread_local const std::vector< uint64_t > *active = nullptr;
+            return active;
+        }
+
         std::vector< uint64_t >
         BuildExprDerivedProbes(const Expr *expr_a, const Expr *expr_b, uint32_t bitwidth) {
             const uint64_t kMask = Bitmask(bitwidth);
@@ -93,6 +100,14 @@ namespace cobra {
             std::vector< uint64_t > shifts;
             if (expr_a != nullptr) { CollectConstantsAndShifts(*expr_a, raw, shifts); }
             if (expr_b != nullptr) { CollectConstantsAndShifts(*expr_b, raw, shifts); }
+            // A candidate that is a constant brings no constant of its own worth
+            // probing; the input's stand in (`ProbeConstantsScope`). Any other
+            // candidate brings its own, and the input's would only slow every
+            // check down.
+            const auto *scoped = ScopedProbeConstants();
+            if (scoped != nullptr && expr_a == nullptr && expr_b != nullptr && !HasVarDep(*expr_b)) {
+                raw.insert(raw.end(), scoped->begin(), scoped->end());
+            }
 
             for (auto &c : raw) { c &= kMask; }
             std::sort(raw.begin(), raw.end());
@@ -103,10 +118,19 @@ namespace cobra {
             std::sort(shifts.begin(), shifts.end());
             shifts.erase(std::unique(shifts.begin(), shifts.end()), shifts.end());
 
+            // In order of how often an expression turns on the value: the
+            // constant itself (`x == c`) and its negation (`x + c` wrapping to
+            // zero - in a masked sum, the one input where a sign or carry
+            // flips), then their neighbours and shifts, then pairs. Kept in
+            // that order when there are more than the cap, so the cap drops the
+            // weakest rather than the largest.
             std::vector< uint64_t > derived;
-            derived.reserve(raw.size() * 6 + raw.size() * raw.size());
+            derived.reserve(raw.size() * 7 + raw.size() * raw.size());
             for (uint64_t c : raw) {
                 derived.push_back(c);
+                derived.push_back((0 - c) & kMask);
+            }
+            for (uint64_t c : raw) {
                 derived.push_back((c + 1) & kMask);
                 derived.push_back((c - 1) & kMask);
                 derived.push_back((~c) & kMask);
@@ -125,15 +149,30 @@ namespace cobra {
                 }
             }
 
-            std::sort(derived.begin(), derived.end());
-            derived.erase(std::unique(derived.begin(), derived.end()), derived.end());
-            std::erase(derived, 0ULL);
-            std::erase(derived, 1ULL);
-
+            // Each value once, at its first position, without 0 and 1 (the
+            // adversarial phases have them).
+            std::vector< std::pair< uint64_t, uint32_t > > ordered;
+            ordered.reserve(derived.size());
+            for (uint32_t index = 0; index < derived.size(); ++index) {
+                if (derived[index] > 1) { ordered.emplace_back(derived[index], index); }
+            }
+            std::sort(ordered.begin(), ordered.end());
+            ordered.erase(
+                std::unique(
+                    ordered.begin(), ordered.end(),
+                    [](const auto &a, const auto &b) { return a.first == b.first; }
+                ),
+                ordered.end()
+            );
+            std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) {
+                return a.second < b.second;
+            });
             constexpr size_t kMaxDerived = 128;
-            if (derived.size() > kMaxDerived) { derived.resize(kMaxDerived); }
-
-            return derived;
+            if (ordered.size() > kMaxDerived) { ordered.resize(kMaxDerived); }
+            std::vector< uint64_t > kept;
+            kept.reserve(ordered.size());
+            for (const auto &[value, index] : ordered) { kept.push_back(value); }
+            return kept;
         }
 
         template< typename ProbeFn >
@@ -250,6 +289,20 @@ namespace cobra {
         ActiveBaseline() = static_cast< ProbeBaseline * >(previous_);
         delete static_cast< ProbeBaseline * >(state_);
     }
+
+    ProbeConstantsScope::ProbeConstantsScope(const Expr &source)
+        : previous_(ScopedProbeConstants()) {
+        std::vector< uint64_t > shifts;
+        CollectConstantsAndShifts(source, constants_, shifts);
+        if (previous_ != nullptr) {
+            constants_.insert(constants_.end(), previous_->begin(), previous_->end());
+        }
+        std::sort(constants_.begin(), constants_.end());
+        constants_.erase(std::unique(constants_.begin(), constants_.end()), constants_.end());
+        ScopedProbeConstants() = &constants_;
+    }
+
+    ProbeConstantsScope::~ProbeConstantsScope() { ScopedProbeConstants() = previous_; }
 
     CheckResult FullWidthCheck(
         const Expr &original, uint32_t original_num_vars, const Expr &simplified,

@@ -270,3 +270,26 @@ TEST(FullWidthCheckEvalTest, UsesCompiledEvaluatorWithSparseRemapSpan) {
     auto result = FullWidthCheckEval(eval, 2, *simplified, 64);
     EXPECT_TRUE(result.passed);
 }
+
+// `((x & 0xFFFF) + 65446) & 0xFFFF` is zero only where x's low half is 90, so
+// the comparison below is 0 everywhere else. Checked against an evaluator, the
+// constant 0 brings no probe that finds 90; the input's constants do: 90 is
+// the negation of 65446 in the low half.
+TEST(SignatureCheckerTest, ProbeConstantsScopeFindsWhereASumWraps) {
+    auto input = Expr::CmpEq(
+        Expr::BitwiseAnd(
+            Expr::Add(Expr::BitwiseAnd(Expr::Variable(0), Expr::Constant(0xFFFF)),
+                      Expr::Constant(65446)),
+            Expr::Constant(0xFFFF)
+        ),
+        Expr::Constant(0)
+    );
+    const auto eval      = Evaluator(
+        [&](const std::vector< uint64_t > &values) { return EvalExpr(*input, values, 64); }, 1,
+        EvaluatorTraceKind::kNone
+    );
+    const auto zero = Expr::Constant(0);
+    EXPECT_TRUE(FullWidthCheckEval(eval, 1, *zero, 64).passed);
+    const ProbeConstantsScope scope(*input);
+    EXPECT_FALSE(FullWidthCheckEval(eval, 1, *zero, 64).passed);
+}

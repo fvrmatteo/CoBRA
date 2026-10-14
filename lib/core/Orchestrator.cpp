@@ -20,6 +20,7 @@
 #include "cobra/core/Trace.h"
 
 #include <algorithm>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1344,6 +1345,8 @@ namespace cobra {
         const std::vector< uint64_t > &sig, const std::vector< std::string > &vars,
         const Expr *input_expr, const Options &opts
     ) {
+        std::optional< ProbeConstantsScope > probes;
+        if (input_expr != nullptr) { probes.emplace(*input_expr); }
         auto result = SimplifyUnchecked(sig, vars, input_expr, opts);
         if (!result.has_value() || result.value().kind != SimplifyOutcome::Kind::kSimplified
             || result.value().expr == nullptr)
