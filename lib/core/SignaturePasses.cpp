@@ -793,6 +793,12 @@ namespace cobra {
 
     std::optional< CandidateRecord >
     TryReducedPolynomialFastPath(const WorkItem &item, OrchestratorContext &ctx) {
+        // A polynomial recovery like the passes `DisabledPassMask` withholds
+        // when the caller declines the family, taken ahead of them: declined
+        // with them, or the family selector does not hold.
+        if (!HasFamily(ctx.opts.enabled_families, TechniqueFamily::kPolynomial)) {
+            return std::nullopt;
+        }
         if (!std::holds_alternative< SignatureStatePayload >(item.payload)) {
             return std::nullopt;
         }

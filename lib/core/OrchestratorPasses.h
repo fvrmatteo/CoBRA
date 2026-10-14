@@ -72,7 +72,7 @@ namespace cobra {
     // Passes that belong to no family are always scheduled: they are the
     // classification, signature-building and verification steps every route
     // depends on, not techniques in their own right.
-    inline uint64_t DisabledPassMask(TechniqueFamily enabled) {
+    constexpr uint64_t DisabledPassMask(TechniqueFamily enabled) {
         const auto kBit = [](PassId id) { return uint64_t{ 1 } << static_cast< uint8_t >(id); };
 
         uint64_t mask = 0;
@@ -104,6 +104,17 @@ namespace cobra {
         }
         return mask;
     }
+
+    // The orchestrator declines a family by marking its passes attempted
+    // (`SelectNextPass`), which is only safe while no pass the tables name as
+    // a prerequisite belongs to a family: one that did would never run, and
+    // nothing gated on it would either.
+    static_assert(
+        (DisabledPassMask(TechniqueFamily::kNone)
+         & (uint64_t{ 1 } << static_cast< uint8_t >(PassId::kExtractProductCore)))
+            == 0,
+        "a prerequisite pass belongs to a disableable family"
+    );
 
     inline ExtractorKind ProjectExtractorKind(RemainderOrigin origin) {
         switch (origin) {

@@ -1707,7 +1707,8 @@ namespace cobra {
             // than checked separately, so every table in SelectNextPass skips
             // them by the rule it already has. Safe against the prerequisite
             // check there because the only prerequisite in the tables is
-            // kExtractProductCore, which belongs to no disableable family.
+            // kExtractProductCore, which belongs to no disableable family (a
+            // static_assert beside DisabledPassMask holds that).
             item.attempted_mask |= policy.disabled_passes;
             auto pass_id         = SelectNextPass(item, policy, verifications, cache);
             if (!pass_id) {
