@@ -3175,6 +3175,12 @@ namespace cobra {
             if (whole.empty() || !llvm::is_contained(whole.front().tree, whole.front().root)) {
                 continue;
             }
+            // Probes decide which extension the group is read as; the claim is
+            // proved later (`ExtensionClaim`), so a group without an expression
+            // has nothing to prove it over.
+            if (whole.front().expr == nullptr) {
+                continue;
+            }
             const auto read = is_extension(whole.front());
             if (!read || read->second == SliceExtension::kNone || read->first < 2
                 || read->first > kMaxSliceWidth || read->first >= bw)
@@ -3192,6 +3198,12 @@ namespace cobra {
             if (sliced.empty() || !llvm::is_contained(sliced.front().tree, sliced.front().root)) {
                 continue;
             }
+            const auto &claimed = whole.front();
+            sliced.front().extension_claim = std::make_shared< const ExtensionClaim >(ExtensionClaim{
+                .expr      = std::shared_ptr< const Expr >(CloneExpr(*claimed.expr)),
+                .bitwidth  = claimed.bitwidth,
+                .vars      = static_cast< uint32_t >(claimed.var_names.size()),
+                .tree_size = static_cast< uint32_t >(claimed.tree_size) });
             candidates.push_back(std::move(sliced.front()));
         }
         return candidates;

@@ -611,6 +611,7 @@ namespace cobra {
             into.slice_proved += run.slice_proved;
             into.slice_refuted += run.slice_refuted;
             into.slice_unknown += run.slice_unknown;
+            into.slice_claim_failed += run.slice_claim_failed;
             into.sum_group_nanoseconds += run.sum_group_nanoseconds;
             into.sum_group_roots += run.sum_group_roots;
             into.sum_group_split += run.sum_group_split;
@@ -2713,13 +2714,14 @@ namespace cobra {
         // How many times `z3_settings.timeout_ms` the proof of `cand` is given: one per
         // `kNodesPerBudget` instructions of its IR tree, at least one and at most
         // `kMaxBudgetScale`. See `VerifyCandidate` for why the budget grows with the tree.
-        uint32_t ProofBudgetScale(const MBACandidate &cand) {
+        uint32_t ProofBudgetScale(uint32_t tree_size) {
             constexpr uint32_t kNodesPerBudget = 8;
             constexpr uint32_t kMaxBudgetScale = 8;
-            return std::min(
-                kMaxBudgetScale,
-                std::max(1U, static_cast< uint32_t >(cand.tree_size) / kNodesPerBudget)
-            );
+            return std::min(kMaxBudgetScale, std::max(1U, tree_size / kNodesPerBudget));
+        }
+
+        uint32_t ProofBudgetScale(const MBACandidate &cand) {
+            return ProofBudgetScale(static_cast< uint32_t >(cand.tree_size));
         }
 
         // Prove `proposal` equal to the tree of `cand` on the bits its readers
@@ -2967,12 +2969,6 @@ namespace cobra {
                 .boolean_reading    = proposal.boolean_reading });
         }
 
-        // How many widths a root is asked about before the ladder moves on. The
-        // widths are the ones its own extensions name and they are tried
-        // narrowest first, so the first two are the ones a cross-width identity
-        // is written at; each one costs a proof.
-        constexpr unsigned kMaxSliceAttempts = 2;
-
         // The width at which `cand`'s root can be read as a narrower problem,
         // with how the root is recovered from those bits - or nothing, when it
         // cannot.
@@ -2999,9 +2995,14 @@ namespace cobra {
         // root a sign extension, and only something that reasons over the whole
         // expression can see it.
         //
-        // Probes come first and nearly always settle it: a root that is not an
-        // extension of its low bits says so on one of the first inputs, and
-        // then nothing is asked of the solver at all.
+        // Probes pick the reading: a root that is not an extension of its low
+        // bits says so on one of the first inputs. The proof waits
+        // (`ProveExtensionClaim`): it used to be asked of every root the probes
+        // let through, and nearly every such root is an extension - measured
+        // over a replayed function, 695 of 715 proofs succeeded, at a quarter
+        // of the pass's time - while a rewrite of the slice is rare. So the
+        // claim travels with the slice (`ExtensionClaim`) and is proved only
+        // once a rewrite of it fits the budget.
         std::optional< std::pair< uint32_t, SliceExtension > > SliceToRead(
             const MBACandidate &cand, const CobraPassOptions &options, CobraStatistics &stats
         ) {
@@ -3071,57 +3072,63 @@ namespace cobra {
                 });
             }
 
-            unsigned attempts = 0;
-            for (const auto &[width, extension] : hypotheses) {
-                if (attempts++ >= kMaxSliceAttempts) {
-                    break;
-                }
-                const uint64_t low  = Bitmask(width);
-                const uint64_t sign = uint64_t{ 1 } << (width - 1);
-                auto sliced = Expr::BitwiseAnd(CloneExpr(*cand.expr), Expr::Constant(low));
-                auto claimed = extension == SliceExtension::kZero
-                    ? std::move(sliced)
-                    : Expr::Add(
-                          Expr::BitwiseXor(std::move(sliced), Expr::Constant(sign)),
-                          Expr::Constant((~sign + 1) & mask)
-                      );
-                ++stats.slice_asked;
-
-                // By running the inputs where there are few enough of them,
-                // exactly as a rewrite is checked: that is a proof and a
-                // refutation both, and it costs less than the solver's
-                // start-up.
-                if (const auto decided = DecideByEnumeration(*cand.expr, *claimed, variables, bw)) {
-                    ++(*decided ? stats.slice_proved : stats.slice_refuted);
-                    if (*decided) {
-                        return std::make_pair(width, extension);
-                    }
-                    continue;
-                }
-#ifdef COBRA_HAS_Z3
-                auto settings = options.z3_settings;
-                settings.timeout_ms *= ProofBudgetScale(cand);
-                const auto result = VerifyExprsWithStrategy(
-                    *cand.expr, *claimed, cand.var_names, bw, settings
-                );
-                // A claim about the root is not a rewrite of it, so an unknown
-                // answer is never taken for a yes here, whatever the host's
-                // mode says: the bits above the slice are not probed by the
-                // signature, so there is nothing behind the bet, and a slice
-                // taken on silence would replace the root by a different value.
-                // Nor is it recorded as a refusal - the solver ran out of time,
-                // it did not answer.
-                if (result.unknown) {
-                    ++stats.slice_unknown;
-                    continue;
-                }
-                ++(result.equivalent ? stats.slice_proved : stats.slice_refuted);
-                if (result.equivalent) {
-                    return std::make_pair(width, extension);
-                }
-#endif
+            if (hypotheses.empty()) {
+                return std::nullopt;
             }
-            return std::nullopt;
+            return hypotheses.front();
+        }
+
+        enum class ClaimVerdict : uint8_t { kProved, kRefuted, kUnknown };
+
+        // Prove that `claim.expr` is the `extension` of its low `width` bits -
+        //
+        //     zero: E == E & low         sign: E == ((E & low) ^ H) - H
+        //
+        // with `H` the top bit of the slice - by running every input where
+        // there are few enough of them, and with the solver otherwise. An
+        // unknown is not a yes here, whatever the host's mode says: the bits
+        // above the slice are not probed by the slice's signature, so there is
+        // nothing behind the bet, and a slice taken on silence would replace
+        // the root by a different value.
+        ClaimVerdict ProveExtensionClaim(
+            const ExtensionClaim &claim, uint32_t width, SliceExtension extension,
+            const CobraPassOptions &options, CobraStatistics &stats
+        ) {
+            const uint32_t bw   = claim.bitwidth;
+            const uint64_t mask = Bitmask(bw);
+            const uint64_t low  = Bitmask(width);
+            const uint64_t sign = uint64_t{ 1 } << (width - 1);
+            auto sliced  = Expr::BitwiseAnd(CloneExpr(*claim.expr), Expr::Constant(low));
+            auto claimed = extension == SliceExtension::kZero
+                ? std::move(sliced)
+                : Expr::Add(
+                      Expr::BitwiseXor(std::move(sliced), Expr::Constant(sign)),
+                      Expr::Constant((~sign + 1) & mask)
+                  );
+            ++stats.slice_asked;
+            if (const auto decided = DecideByEnumeration(*claim.expr, *claimed, claim.vars, bw)) {
+                ++(*decided ? stats.slice_proved : stats.slice_refuted);
+                return *decided ? ClaimVerdict::kProved : ClaimVerdict::kRefuted;
+            }
+#ifdef COBRA_HAS_Z3
+            auto settings = options.z3_settings;
+            settings.timeout_ms *= ProofBudgetScale(claim.tree_size);
+            std::vector< std::string > names;
+            for (uint32_t index = 0; index < claim.vars; ++index) {
+                names.push_back("v" + std::to_string(index));
+            }
+            const auto result = VerifyExprsWithStrategy(*claim.expr, *claimed, names, bw, settings);
+            if (result.unknown) {
+                ++stats.slice_unknown;
+                return ClaimVerdict::kUnknown;
+            }
+            ++(result.equivalent ? stats.slice_proved : stats.slice_refuted);
+            return result.equivalent ? ClaimVerdict::kProved : ClaimVerdict::kRefuted;
+#else
+            (void) options;
+            ++stats.slice_unknown;
+            return ClaimVerdict::kUnknown;
+#endif
         }
 
         // How many instructions `ReconstructIr` emits for `expr` at the least.
@@ -3824,6 +3831,16 @@ namespace cobra {
                         cand, read->first, read->second, options_.min_ast_size, options_.max_vars,
                         options_tag, options_.cost_model, options_.max_tree_nodes, demanded
                     );
+                    if (!slices.empty()) {
+                        const auto claim = std::make_shared< const ExtensionClaim >(ExtensionClaim{
+                            .expr      = std::shared_ptr< const Expr >(CloneExpr(*cand.expr)),
+                            .bitwidth  = cand.bitwidth,
+                            .vars      = static_cast< uint32_t >(cand.var_names.size()),
+                            .tree_size = static_cast< uint32_t >(cand.tree_size) });
+                        for (auto &slice : slices) {
+                            slice.extension_claim = claim;
+                        }
+                    }
                 }
                 stats.slice_nanoseconds += since(slice_begin);
 
@@ -4533,6 +4550,31 @@ namespace cobra {
                 continue;
             }
 
+            // A slice stands on its claim about the root, proved now that a
+            // rewrite of it fits (`ExtensionClaim`). The claim is no rewrite,
+            // so its verdict is not cached against the slice's key: a later
+            // root with the same slice makes its own claim.
+            if (cand.slice_extension != SliceExtension::kNone) {
+                const auto claim_begin = std::chrono::steady_clock::now();
+                const auto claim       = cand.extension_claim == nullptr
+                          ? ClaimVerdict::kRefuted
+                          : ProveExtensionClaim(
+                          *cand.extension_claim, cand.bitwidth, cand.slice_extension, options_, stats
+                      );
+                const uint64_t claiming = since(claim_begin);
+                stats.slice_nanoseconds += claiming;
+                spent += claiming;
+                if (claim != ClaimVerdict::kProved) {
+                    discard_rewrite();
+                    stats.rebuild_nanoseconds += since(rebuild_begin) - claiming;
+                    ++stats.slice_claim_failed;
+                    left_for_later = claim == ClaimVerdict::kUnknown;
+                    account(false);
+                    requeue_retries();
+                    continue;
+                }
+            }
+
             // The rewrite fits, so it is worth proving now - once per key: the
             // verified rewrite replaces the proposal in the cache, and a failed
             // proof replaces it with the rejection it would always have been.
@@ -5037,9 +5079,9 @@ namespace cobra {
         cost("  ladder: inner roots", stats.inner_nanoseconds);
         cost("  ladder: slices", stats.slice_nanoseconds);
         if (stats.slice_asked != 0) {
-            out << "    slices asked " << stats.slice_asked << ", proved " << stats.slice_proved
+            out << "    slice claims asked " << stats.slice_asked << ", proved " << stats.slice_proved
                 << ", refuted " << stats.slice_refuted << ", unknown " << stats.slice_unknown
-                << "\n";
+                << " (a fitting rewrite dropped for it: " << stats.slice_claim_failed << ")\n";
         }
         cost("  ladder: sum groups", stats.sum_group_nanoseconds);
         if (stats.sum_group_roots != 0) {

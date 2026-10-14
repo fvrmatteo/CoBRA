@@ -103,6 +103,20 @@ namespace cobra {
     uint64_t
     CandidateDemand(uint64_t root_demand, uint32_t width, SliceExtension extension, bool sum_group);
 
+    // What a slice or a sum group is read on: that `expr` - the root, or its
+    // group, read at the root's width `bitwidth` over `vars` variables - is an
+    // extension of its own low bits. Which extension, and of how many bits, is
+    // the candidate's: `slice_extension` of its `bitwidth`. The driver proves
+    // it only once a rewrite of the slice fits the budget (`SliceToRead`).
+    struct ExtensionClaim
+    {
+        std::shared_ptr< const Expr > expr;
+        uint32_t bitwidth = 0;
+        uint32_t vars     = 0;
+        // Of the reading the claim is about, for its proof budget.
+        uint32_t tree_size = 0;
+    };
+
     struct MBACandidate
     {
         llvm::Instruction *root;
@@ -194,10 +208,16 @@ namespace cobra {
         bool holds_comparison = false;
 
         // For a slice: how the root is recovered from the `bitwidth` bits this
-        // candidate reads of it, proved before the candidate was built. A
-        // rewrite replaces the root with that extension of what the narrow bits
-        // were rewritten into, so the replacement has the root's own type.
+        // candidate reads of it. A rewrite replaces the root with that
+        // extension of what the narrow bits were rewritten into, so the
+        // replacement has the root's own type.
         SliceExtension slice_extension = SliceExtension::kNone;
+
+        // The claim `slice_extension` stands on, until it is proved. A slice
+        // is read on probes saying its root is an extension of its low bits,
+        // and the proof waits for a rewrite of the slice to fit: most slices
+        // find none, and the proof was most of what reading one cost.
+        std::shared_ptr< const ExtensionClaim > extension_claim;
 
         // For a candidate that reads one group of the root's sum: the root's
         // other summands, each with the sign it stands at in that sum (see
@@ -439,8 +459,9 @@ namespace cobra {
     llvm::SmallVector< uint32_t, 4 > SliceWidthsOf(const MBACandidate &cand);
 
     // The same root as `cand`, collected at `width` bits instead of the width
-    // of its type, for a root the caller has *proved* to be the `extension` of
-    // its low `width` bits.
+    // of its type, for a root the caller claims to be the `extension` of its
+    // low `width` bits - a claim proved before any rewrite of it is made
+    // (`ExtensionClaim`).
     //
     // Reading a wide value at a narrower width is something the collection
     // already does wherever a reader looks at nothing else - a truncation, or

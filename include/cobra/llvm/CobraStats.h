@@ -254,6 +254,8 @@ namespace cobra {
         uint64_t slice_proved         = 0;
         uint64_t slice_refuted        = 0;
         uint64_t slice_unknown        = 0;
+        // Slices whose rewrite fit but whose claim about the root was not proved.
+        uint64_t slice_claim_failed = 0;
         // The sum-group rung: what splitting a root's sum into groups that
         // share no leaf cost, how many roots came apart, how many groups the
         // splits held and how many of those groups turned out to be an

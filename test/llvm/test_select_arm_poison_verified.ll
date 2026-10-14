@@ -1,3 +1,6 @@
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: timeout=20000
+
 ; A `select` reads only the arm it takes, so the tree is defined when %c is
 ; false whatever x and y are. The rewrite, `(x + y) & -c`, reads them on every
 ; path, so the ones that may be poison are frozen first.
