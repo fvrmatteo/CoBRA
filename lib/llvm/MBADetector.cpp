@@ -805,6 +805,17 @@ namespace cobra {
                 return AShrSignBit(inst, bw) != 0;
             }
 
+            // The model shifts by constants only. A shift by a variable amount
+            // collected into the tree leaves the tree with no expression at all
+            // - and so with nothing to prove a rewrite against - where as a leaf
+            // it is one more variable.
+            if ((inst->getOpcode() == llvm::Instruction::Shl
+                 || inst->getOpcode() == llvm::Instruction::LShr)
+                && !llvm::isa< llvm::ConstantInt >(inst->getOperand(1)))
+            {
+                return false;
+            }
+
             return true;
         }
 
@@ -949,17 +960,6 @@ namespace cobra {
 
                 if ((inst != nullptr) && IsMbaInstruction(inst)
                     && FitsTreeWidth(inst, bw, narrow_comparisons)) {
-                    // LShr with variable shift amount is unsupported —
-                    // treat the whole instruction as a leaf.
-                    if (inst->getOpcode() == llvm::Instruction::LShr
-                        && !llvm::isa< llvm::ConstantInt >(inst->getOperand(1)))
-                    {
-                        if (std::find(leaves.begin(), leaves.end(), v) == leaves.end()) {
-                            leaves.push_back(v);
-                        }
-                        continue;
-                    }
-
                     if (cut_arith_under_bitwise && from_bitwise
                         && IsArithmeticOpcode(inst->getOpcode()))
                     {
@@ -2796,10 +2796,7 @@ namespace cobra {
                 // twice the cost per variable of hope. The absolute ceiling
                 // stays as a guard against a caller asking for 2^40 entries.
                 constexpr uint32_t kPreElimCap = 20;
-                if (leaves.size() > std::min(max_vars, kPreElimCap)) {
-                    DeclinedRoot(inst, "more leaves than max_vars", tree_insts.size(), leaves.size());
-                    continue;
-                }
+                const auto over_cap = [&] { return leaves.size() > std::min(max_vars, kPreElimCap); };
 
                 // Verify transparent phis first: if any arm is not the same
                 // computation as the one followed, the tree is collected again
@@ -2820,7 +2817,13 @@ namespace cobra {
                         return llvm::isa< llvm::PHINode >(entry.first);
                     });
                 };
-                if (has_phi_redirect() && !VerifyPhiArms(&inst, phi_redirects, tree_insts, leaves, bw)) {
+                //
+                // A tree past the leaf cap is collected again the same way when
+                // it read through a phi: the arms' cones bring their own leaves,
+                // and with the phi a leaf the tree may well fit.
+                if (has_phi_redirect()
+                    && (over_cap() || !VerifyPhiArms(&inst, phi_redirects, tree_insts, leaves, bw)))
+                {
                     tree_insts.clear();
                     leaves.clear();
                     phi_redirects.clear();
@@ -2829,9 +2832,10 @@ namespace cobra {
                         /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
                         max_tree_nodes, opaque, reads_as, /*narrow_comparisons=*/boolean_cut
                     );
-                    if (leaves.size() > std::min(max_vars, kPreElimCap)) {
-                        continue;
-                    }
+                }
+                if (over_cap()) {
+                    DeclinedRoot(inst, "more leaves than max_vars", tree_insts.size(), leaves.size());
+                    continue;
                 }
 
                 // What is known of the leaves' bits is read into the tree as a
@@ -2889,6 +2893,26 @@ namespace cobra {
                     }
                 }
 
+                // `min_ast_size` is meant to keep the solver away from
+                // expressions too small to be worth its time. Measured on the
+                // collected tree it says the wrong thing about a root that reads
+                // values the rest of the block also needs: the tree is large,
+                // but replacing the root removes one instruction, so no rewrite
+                // can repay the search. What has to clear the bar is the number
+                // of instructions actually at stake.
+                //
+                // Unless the caller prices the whole tree, in which case a root
+                // with shared operands is exactly what it means to keep, and the
+                // bar has already been cleared by the tree itself.
+                //
+                // Asked before the root claims its tree: a root this declines is
+                // not examined, so the roots inside it have to be.
+                if (cost_model == MbaCostModel::kDyingInstructions
+                    && dying.size() < min_ast_size)
+                {
+                    continue;
+                }
+
                 for (auto *ti : dying) {
                     already_in_tree.insert(ti);
                 }
@@ -2928,23 +2952,6 @@ namespace cobra {
                             already_in_tree.insert(ti);
                         }
                     }
-                    continue;
-                }
-
-                // `min_ast_size` is meant to keep the solver away from
-                // expressions too small to be worth its time. Measured on the
-                // collected tree it says the wrong thing about a root that reads
-                // values the rest of the block also needs: the tree is large,
-                // but replacing the root removes one instruction, so no rewrite
-                // can repay the search. What has to clear the bar is the number
-                // of instructions actually at stake.
-                //
-                // Unless the caller prices the whole tree, in which case a root
-                // with shared operands is exactly what it means to keep, and the
-                // bar has already been cleared by the tree itself.
-                if (cost_model == MbaCostModel::kDyingInstructions
-                    && dying.size() < min_ast_size)
-                {
                     continue;
                 }
 
