@@ -1,4 +1,5 @@
-; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified>' -S %s | FileCheck %s
+; RUN: opt -load-pass-plugin=%cobra_pass -passes='cobra-simplify<verified;timeout=20000>' -S %s | FileCheck %s
+; COBRA_PARAMS: timeout=20000
 
 ; A saturating addition or subtraction is the wrapped result or the bound it
 ; clamps to, chosen by its overflow test: a `select` over a comparison, which
