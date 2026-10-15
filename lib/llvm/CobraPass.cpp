@@ -1694,16 +1694,23 @@ namespace cobra {
 
         } // namespace boolean_reading
 
+        // Whether `cand` holds as a leaf a comparison, or a `select` on one: a
+        // narrow comparison the exact reading takes in where this collection
+        // did not (`ExactNarrowReadingMbaCandidate`).
+        bool HoldsComparisonLeaf(const MBACandidate &cand) {
+            return llvm::any_of(cand.leaf_values, [](const llvm::Value *leaf) {
+                if (const auto *select = llvm::dyn_cast< llvm::SelectInst >(leaf)) {
+                    return llvm::isa< llvm::ICmpInst >(select->getCondition());
+                }
+                return llvm::isa< llvm::ICmpInst >(leaf);
+            });
+        }
+
         // Whether the boolean reading has anything to read in `cand`: a
         // condition in its tree, or a comparison it reads as a leaf, which the
-        // boolean cut takes in - alone, or as the condition of a `select` the
-        // ordinary cut left a leaf because it could not read the comparison (a
-        // narrower one, `ComparesExactlyNarrow`).
+        // boolean cut takes in.
         bool ReadsConditions(const MBACandidate &cand) {
             if (llvm::any_of(cand.leaf_values, [](const llvm::Value *leaf) {
-                    if (const auto *select = llvm::dyn_cast< llvm::SelectInst >(leaf)) {
-                        return llvm::isa< llvm::ICmpInst >(select->getCondition());
-                    }
                     return llvm::isa< llvm::ICmpInst >(leaf);
                 }))
             {
@@ -3852,36 +3859,31 @@ namespace cobra {
                 // by a proof about the root rather than by a search for a
                 // rewrite, so a root that is not an extension of its low bits
                 // costs probes and nothing else.
-                // The boolean cut (`boolean_variables`): the root with its
-                // narrow comparisons taken in, so that the reading of its
-                // conditions as variables can prove one of them the same as a
-                // sign computed from the values it compares. Collected before
-                // the slice, which asks its question of it too.
-                std::vector< MBACandidate > boolean;
+                const auto slice_begin = std::chrono::steady_clock::now();
+                std::vector< MBACandidate > slices;
+                // The question is asked of the root as collected, and then of
+                // its exact reading: a sign extension written as a `select` on
+                // the sign of the narrow value is no extension of anything
+                // while that `select` is a free leaf, and one exactly when its
+                // narrow comparison is read (`SliceToRead`). The exact reading
+                // only answers the question; it is never searched itself, so
+                // no rewrite spells a narrow condition anew at the tree width,
+                // apart from the very `icmp` the rest of the function shares.
+                const MBACandidate *claimed = &cand;
+                auto read                   = SliceToRead(cand, options_, stats);
+                std::vector< MBACandidate > exact;
 #ifdef COBRA_HAS_Z3
-                if (options_.boolean_variables && options_.z3_verify && ReadsConditions(cand)) {
-                    boolean = BooleanCutMbaCandidate(
+                if (!read && options_.boolean_variables && options_.z3_verify && HoldsComparisonLeaf(cand)) {
+                    exact = ExactNarrowReadingMbaCandidate(
                         cand, options_.min_ast_size, options_.max_vars, options_tag,
                         options_.cost_model, options_.max_tree_nodes, demanded
                     );
                 }
 #endif
-
-                const auto slice_begin = std::chrono::steady_clock::now();
-                std::vector< MBACandidate > slices;
-                // The question is asked of the root as collected, and then of
-                // its boolean cut: a sign extension written as a `select` on the
-                // sign of the narrow value is no extension of anything while
-                // that `select` is a free leaf, and one exactly when its narrow
-                // comparison is read (`SliceToRead`).
-                const MBACandidate *claimed = &cand;
-                auto read                   = SliceToRead(cand, options_, stats);
-                for (const auto &reading : boolean) {
-                    if (read) {
-                        break;
-                    }
+                for (const auto &reading : exact) {
                     if ((read = SliceToRead(cand, options_, stats, &reading))) {
                         claimed = &reading;
+                        break;
                     }
                 }
                 if (read) {
@@ -3932,6 +3934,20 @@ namespace cobra {
                     }
                 }
                 stats.sum_group_nanoseconds += since(sum_begin);
+
+                // The boolean cut (`boolean_variables`): the root with its
+                // narrow comparisons taken in, so that the reading of its
+                // conditions as variables can prove one of them the same as a
+                // sign computed from the values it compares.
+                std::vector< MBACandidate > boolean;
+#ifdef COBRA_HAS_Z3
+                if (options_.boolean_variables && options_.z3_verify && ReadsConditions(cand)) {
+                    boolean = BooleanCutMbaCandidate(
+                        cand, options_.min_ast_size, options_.max_vars, options_tag,
+                        options_.cost_model, options_.max_tree_nodes, demanded
+                    );
+                }
+#endif
 
                 // The boundary cut: it is the one reading of the root
                 // the ladder below cannot reach, and it costs a single solve.

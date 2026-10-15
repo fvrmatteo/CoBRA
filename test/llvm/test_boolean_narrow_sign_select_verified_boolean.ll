@@ -8,7 +8,7 @@
 ;
 ; Read whole, the `select` is a leaf - its condition is a comparison of a value
 ; narrower than the tree - and with it free the root is the extension of nothing.
-; The boolean cut reads the comparison exactly, as the signed comparison of the
+; The exact reading takes the comparison in, as the signed comparison of the
 ; operand's sign extension at the tree width, so asked of that reading the root
 ; *is* the sign extension of its low 32 bits; the claim is proved over it, and the
 ; 32-bit slice, where the `select` contributes no bit, is `x`.

@@ -370,6 +370,23 @@ namespace cobra {
     // candidate the boolean reading searches, so it is built for a full
     // collection whether or not it takes a comparison in; empty when `cand` is
     // not a full collection.
+    // Which comparisons of operands narrower than the tree a collection takes
+    // in (`ComparesExactlyNarrow`): none, the ones exact on zero-extended
+    // values, or those and the signed ones read on their sign extensions.
+    enum class NarrowReading : uint8_t { kNone, kUnsigned, kSigned };
+
+    // The root read with every narrow comparison taken in exactly, the signed
+    // ones included (`NarrowSignBit`). Not a candidate the search is given: it
+    // is the expression the slice question is asked of when the root as
+    // collected is no extension of its low bits - a `select` on the sign of a
+    // narrow value is a free leaf to that collection (`SliceToRead`). Empty
+    // when `cand` is not a full collection.
+    std::vector< MBACandidate > ExactNarrowReadingMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
+        uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
+    );
+
     std::vector< MBACandidate > BooleanCutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,

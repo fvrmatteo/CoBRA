@@ -702,18 +702,22 @@ namespace cobra {
         // half of it is the shape this is for. One wider than the tree is left
         // to `WideNodeFitsTreeWidth`, which does not take it.
         //
-        // `narrow_comparisons` (the boolean cut, see `BooleanCutMbaCandidate`)
-        // also takes a comparison of narrower operands, in a `select` condition
-        // as well. Held zero-extended, two values are equal, and ordered without
-        // regard to sign, exactly as they are at their own width. A signed
-        // predicate reads the operands' own top bit, which is not the tree's:
-        // it is read as the same signed comparison of the operands' sign
-        // extensions to the tree width (`NarrowSignBit`), which keep the signed
-        // order - the `(v ^ 2^(n-1)) - 2^(n-1)` a `sext` is read as.
-        bool ComparesExactlyNarrow(const llvm::ICmpInst &cmp, uint32_t bw) {
+        // A collection with narrow comparisons taken in (`NarrowReading`) also
+        // takes a comparison of narrower operands, in a `select` condition as
+        // well. Held zero-extended, two values are equal, and ordered without
+        // regard to sign, exactly as they are at their own width: the boolean
+        // cut (`BooleanCutMbaCandidate`) takes those. A signed predicate reads
+        // the operands' own top bit, which is not the tree's; the exact reading
+        // (`ExactNarrowReadingMbaCandidate`) takes it too, as the same signed
+        // comparison of the operands' sign extensions to the tree width
+        // (`NarrowSignBit`), which keep the signed order - the
+        // `(v ^ 2^(n-1)) - 2^(n-1)` a `sext` is read as.
+        bool ComparesExactlyNarrow(const llvm::ICmpInst &cmp, uint32_t bw, NarrowReading narrow) {
             const auto *ty = cmp.getOperand(0)->getType();
-            return ty->isIntegerTy() && ty->getIntegerBitWidth() <= bw
-                && (cmp.isEquality() || cmp.isUnsigned() || cmp.isSigned());
+            if (narrow == NarrowReading::kNone || !ty->isIntegerTy() || ty->getIntegerBitWidth() > bw) {
+                return false;
+            }
+            return cmp.isEquality() || cmp.isUnsigned() || (narrow == NarrowReading::kSigned && cmp.isSigned());
         }
 
         // The operands' own sign bit, `2^(n-1)`, of a signed comparison of `n`-bit
@@ -733,12 +737,14 @@ namespace cobra {
             return uint64_t{ 1 } << (ty->getIntegerBitWidth() - 1);
         }
 
-        bool FitsTreeWidth(const llvm::Instruction *inst, uint32_t bw, bool narrow_comparisons = false) {
+        bool FitsTreeWidth(
+            const llvm::Instruction *inst, uint32_t bw, NarrowReading narrow_comparisons = NarrowReading::kNone
+        ) {
             if (const auto *gep = ByteGepOf(inst)) {
                 return bw == gep->getOperand(1)->getType()->getIntegerBitWidth();
             }
             if (const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
-                if (narrow_comparisons && ComparesExactlyNarrow(*cmp, bw)) {
+                if (ComparesExactlyNarrow(*cmp, bw, narrow_comparisons)) {
                     return true;
                 }
                 return IsTreeWidthInt(cmp->getOperand(0), bw)
@@ -786,7 +792,7 @@ namespace cobra {
                     return true;
                 }
                 const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(cond);
-                if (cmp != nullptr && narrow_comparisons && ComparesExactlyNarrow(*cmp, bw)) {
+                if (cmp != nullptr && ComparesExactlyNarrow(*cmp, bw, narrow_comparisons)) {
                     return true;
                 }
                 return cmp != nullptr && IsTreeWidthInt(cmp->getOperand(0), bw)
@@ -953,7 +959,7 @@ namespace cobra {
             bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
             const llvm::DenseSet< const llvm::Value * > *opaque = nullptr,
             const llvm::DenseMap< llvm::Value *, llvm::Value * > *reads_as = nullptr,
-            bool narrow_comparisons = false
+            NarrowReading narrow_comparisons = NarrowReading::kNone
         ) {
             // A re-cut's budget and the cap on any collection are both
             // budgets on the same walk; the tighter one applies.
@@ -2770,7 +2776,7 @@ namespace cobra {
             bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
             const DemandedMaskFn &demanded = {}, const SharedCut *shared_cut = nullptr,
             const Slice *slice = nullptr, const SumGroup *sum_group = nullptr,
-            bool boolean_cut = false
+            bool boolean_cut = false, NarrowReading narrow = NarrowReading::kNone
         ) {
             const auto *opaque = shared_cut != nullptr ? &shared_cut->opaque : nullptr;
             // The summands this group leaves out, read as zero wherever the
@@ -2823,7 +2829,7 @@ namespace cobra {
                 CollectTree(
                     &inst, bw, tree_insts, leaves, phi_redirects,
                     /*try_phi_transparency=*/true, max_nodes, cut_arith_under_bitwise,
-                    max_tree_nodes, opaque, reads_as, /*narrow_comparisons=*/boolean_cut
+                    max_tree_nodes, opaque, reads_as, narrow
                 );
 
                 // The sweep below is 2^leaves, so every leaf doubles the price
@@ -2869,7 +2875,7 @@ namespace cobra {
                     CollectTree(
                         &inst, bw, tree_insts, leaves, phi_redirects,
                         /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
-                        max_tree_nodes, opaque, reads_as, /*narrow_comparisons=*/boolean_cut
+                        max_tree_nodes, opaque, reads_as, narrow
                     );
                 }
                 if (over_cap()) {
@@ -3458,7 +3464,24 @@ namespace cobra {
         BuildCandidates(
             { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0,
             /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded, nullptr, nullptr, nullptr,
-            /*boolean_cut=*/true
+            /*boolean_cut=*/true, NarrowReading::kUnsigned
+        );
+        return candidates;
+    }
+
+    std::vector< MBACandidate > ExactNarrowReadingMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model, uint32_t max_tree_nodes,
+        const DemandedMaskFn &demanded
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr || cand.node_limit != 0) {
+            return candidates;
+        }
+        BuildCandidates(
+            { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0,
+            /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded, nullptr, nullptr, nullptr,
+            /*boolean_cut=*/true, NarrowReading::kSigned
         );
         return candidates;
     }
