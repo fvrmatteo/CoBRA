@@ -2604,6 +2604,77 @@ namespace cobra {
             return true;
         }
 
+        // Whether `value` is never `undef` - it may still be poison - however
+        // far beneath it the values that settle the question are. LLVM's own
+        // answer (`isGuaranteedNotToBeUndef`) gives up six operands down, and
+        // a leaf CoBRA reads is often deeper than that above them: a hash of
+        // two loads the host marks `!noundef` is a dozen operations over them,
+        // each of which only passes `undef` on. A leaf that is not `undef`
+        // never needed the freeze the depth limit made it pay for - and a
+        // frozen leaf matches nothing the function already computes from it,
+        // so the rewrite is built afresh beside what is there and is priced
+        // out, or kept as a second copy no pass relates to the first.
+        //
+        // The walk goes through the instructions that make no `undef` of
+        // operands that are not - arithmetic, casts, comparisons, `select`,
+        // `getelementptr`, and phis - and asks LLVM about every other value:
+        // constants, `noundef` arguments, `!noundef` loads, `noundef` call
+        // results and `freeze` answer yes there, any other load or call no.
+        // The answer is for the whole cone at once: one value in it that may
+        // be `undef` makes the leaf one that may be, since every instruction
+        // walked through passes it on.
+        //
+        // A phi is asked about all of its incoming values, and a value met
+        // again on its own path - the back edge of a loop counter - is taken
+        // to be what the rest of its cycle shows. That is sound because the
+        // answer covers the whole cone: whenever the program computes a value
+        // of it, the operands read were computed before (an instruction's
+        // operands dominate it, and a phi reads the value of the edge just
+        // taken), so by induction over the run, if every value the cone reads
+        // from outside itself is defined, every value in it is - the first
+        // value of a cycle the program computes reads the cycle's entry from
+        // outside. An instruction in a block nothing reaches, one reading
+        // itself say, is never computed, and nothing is claimed of it.
+        //
+        // `proved` holds what earlier walks answered yes for - each value of a
+        // cone that answers yes is itself never `undef` - and one walk visits
+        // at most `kNeverUndefBudget` values: past that the answer is no, as
+        // LLVM's is past its depth.
+        constexpr size_t kNeverUndefBudget = 4096;
+
+        bool NeverUndef(const llvm::Value *value, llvm::SmallPtrSetImpl< const llvm::Value * > &proved) {
+            if (proved.contains(value)) {
+                return true;
+            }
+            llvm::SmallPtrSet< const llvm::Value *, 32 > visited;
+            llvm::SmallVector< const llvm::Value *, 32 > pending{ value };
+            while (!pending.empty()) {
+                const llvm::Value *current = pending.pop_back_val();
+                if (proved.contains(current) || !visited.insert(current).second) {
+                    continue;
+                }
+                if (visited.size() > kNeverUndefBudget) {
+                    return false;
+                }
+                const auto *inst = llvm::dyn_cast< llvm::Instruction >(current);
+                const bool passes_on = inst != nullptr
+                    && (llvm::isa< llvm::BinaryOperator >(inst) || llvm::isa< llvm::CastInst >(inst)
+                        || llvm::isa< llvm::CmpInst >(inst) || llvm::isa< llvm::SelectInst >(inst)
+                        || llvm::isa< llvm::GetElementPtrInst >(inst) || llvm::isa< llvm::PHINode >(inst));
+                if (!passes_on) {
+                    if (!llvm::isGuaranteedNotToBeUndef(current)) {
+                        return false;
+                    }
+                    continue;
+                }
+                for (const llvm::Value *operand : inst->operands()) {
+                    pending.push_back(operand);
+                }
+            }
+            proved.insert(visited.begin(), visited.end());
+            return true;
+        }
+
         // The leaves whose poison is the root's poison: reached from the root
         // along operands that pass poison on - every operand of every
         // operation, except a `select`'s arms (only the arm taken is read), a
@@ -4345,7 +4416,8 @@ namespace cobra {
             // could; read once, the leaf is one value and the proof covers it.
             // Frozen, it is one value however often it is read. Loads the host
             // marks `!noundef` and `noundef` arguments are known not to be
-            // `undef`, so this rarely costs anything.
+            // `undef`, and so is whatever is computed from them alone, however
+            // deep (`NeverUndef`), so this rarely costs anything.
             std::vector< uint32_t > reads(cand.leaf_values.size(), 0);
             if (outcome->boolean_reading) {
                 // Built with each distinct sub-expression once (`ReconstructIr`'s
@@ -4437,11 +4509,13 @@ namespace cobra {
             leaf_supply.values     = cand.leaf_values;
             leaf_supply.freeze_on_use.reserve(cand.leaf_values.size());
             bool freeze_leaves = false;
+            llvm::SmallPtrSet< const llvm::Value *, 32 > never_undef;
             for (size_t index = 0; index < cand.leaf_values.size(); ++index) {
                 auto *leaf        = cand.leaf_values[index];
                 const bool poison = poison_owed && !poisoning.contains(leaf)
                     && !llvm::isGuaranteedNotToBePoison(leaf);
-                const bool undef  = reads[index] > 1 && !llvm::isGuaranteedNotToBeUndef(leaf);
+                const bool undef  = reads[index] > 1 && !llvm::isGuaranteedNotToBeUndef(leaf)
+                    && !NeverUndef(leaf, never_undef);
                 const bool freeze = options_.leaf_freezing == LeafFreezing::kAcrossFreeze
                     ? cand.spans_freeze && !llvm::isGuaranteedNotToBePoison(leaf)
                     : poison || undef;
