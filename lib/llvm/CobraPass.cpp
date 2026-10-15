@@ -1696,9 +1696,14 @@ namespace cobra {
 
         // Whether the boolean reading has anything to read in `cand`: a
         // condition in its tree, or a comparison it reads as a leaf, which the
-        // boolean cut takes in.
+        // boolean cut takes in - alone, or as the condition of a `select` the
+        // ordinary cut left a leaf because it could not read the comparison (a
+        // narrower one, `ComparesExactlyNarrow`).
         bool ReadsConditions(const MBACandidate &cand) {
             if (llvm::any_of(cand.leaf_values, [](const llvm::Value *leaf) {
+                    if (const auto *select = llvm::dyn_cast< llvm::SelectInst >(leaf)) {
+                        return llvm::isa< llvm::ICmpInst >(select->getCondition());
+                    }
                     return llvm::isa< llvm::ICmpInst >(leaf);
                 }))
             {
@@ -3014,14 +3019,24 @@ namespace cobra {
         // of the pass's time - while a rewrite of the slice is rare. So the
         // claim travels with the slice (`ExtensionClaim`) and is proved only
         // once a rewrite of it fits the budget.
+        //
+        // `reading`, when given, is another collection of the same root that
+        // reads more of it exactly - the boolean cut, which takes in the narrow
+        // comparisons every other collection keeps as leaves. The widths are
+        // still the ones `cand` crosses, and the probes and the claim are about
+        // `reading`'s expression: a `select` on a narrow comparison is a free
+        // leaf to `cand`, and with it free the root is the extension of
+        // nothing, while read through its condition it may be.
         std::optional< std::pair< uint32_t, SliceExtension > > SliceToRead(
-            const MBACandidate &cand, const CobraPassOptions &options, CobraStatistics &stats
+            const MBACandidate &cand, const CobraPassOptions &options, CobraStatistics &stats,
+            const MBACandidate *reading = nullptr
         ) {
+            const MBACandidate &model = reading != nullptr ? *reading : cand;
             // Without an expression there is nothing to prove the claim over,
             // and without a solver nothing to prove it with: the probes are
             // evidence, not a proof, and a slice rewritten on them alone would
             // be a guess about every bit above the slice.
-            if (cand.expr == nullptr || !options.z3_verify) {
+            if (model.expr == nullptr || !options.z3_verify || model.bitwidth != cand.bitwidth) {
                 return std::nullopt;
             }
             const auto widths = SliceWidthsOf(cand);
@@ -3029,9 +3044,9 @@ namespace cobra {
                 return std::nullopt;
             }
 
-            const uint32_t bw   = cand.bitwidth;
+            const uint32_t bw   = model.bitwidth;
             const uint64_t mask = Bitmask(bw);
-            const auto variables = static_cast< uint32_t >(cand.var_names.size());
+            const auto variables = static_cast< uint32_t >(model.var_names.size());
 
             // Both readings of every candidate width, narrowest and zero
             // extension first: the narrowest slice is the smallest problem, and
@@ -3056,7 +3071,7 @@ namespace cobra {
             // Random and boundary inputs, as the ring check uses: a sign
             // extension is decided by the top bit of the slice, so the values
             // that have it set and clear are the ones that decide.
-            uint64_t state  = 0x9E3779B97F4A7C15ULL ^ cand.fingerprint.structure;
+            uint64_t state  = 0x9E3779B97F4A7C15ULL ^ model.fingerprint.structure;
             const auto next = [&] {
                 state ^= state << 13;
                 state ^= state >> 7;
@@ -3077,7 +3092,7 @@ namespace cobra {
                 for (auto &value : values) {
                     value = (round < 16 ? kBoundary[next() % 8] : next()) & mask;
                 }
-                const uint64_t value = EvalExpr(*cand.expr, values, bw);
+                const uint64_t value = EvalExpr(*model.expr, values, bw);
                 llvm::erase_if(hypotheses, [&](const std::pair< uint32_t, SliceExtension > &one) {
                     return !holds(value, one.first, one.second);
                 });
@@ -3837,9 +3852,39 @@ namespace cobra {
                 // by a proof about the root rather than by a search for a
                 // rewrite, so a root that is not an extension of its low bits
                 // costs probes and nothing else.
+                // The boolean cut (`boolean_variables`): the root with its
+                // narrow comparisons taken in, so that the reading of its
+                // conditions as variables can prove one of them the same as a
+                // sign computed from the values it compares. Collected before
+                // the slice, which asks its question of it too.
+                std::vector< MBACandidate > boolean;
+#ifdef COBRA_HAS_Z3
+                if (options_.boolean_variables && options_.z3_verify && ReadsConditions(cand)) {
+                    boolean = BooleanCutMbaCandidate(
+                        cand, options_.min_ast_size, options_.max_vars, options_tag,
+                        options_.cost_model, options_.max_tree_nodes, demanded
+                    );
+                }
+#endif
+
                 const auto slice_begin = std::chrono::steady_clock::now();
                 std::vector< MBACandidate > slices;
-                if (const auto read = SliceToRead(cand, options_, stats)) {
+                // The question is asked of the root as collected, and then of
+                // its boolean cut: a sign extension written as a `select` on the
+                // sign of the narrow value is no extension of anything while
+                // that `select` is a free leaf, and one exactly when its narrow
+                // comparison is read (`SliceToRead`).
+                const MBACandidate *claimed = &cand;
+                auto read                   = SliceToRead(cand, options_, stats);
+                for (const auto &reading : boolean) {
+                    if (read) {
+                        break;
+                    }
+                    if ((read = SliceToRead(cand, options_, stats, &reading))) {
+                        claimed = &reading;
+                    }
+                }
+                if (read) {
                     slices = SliceMbaCandidate(
                         cand, read->first, read->second, options_.min_ast_size, options_.max_vars,
                         options_tag, options_.cost_model, options_.max_tree_nodes, demanded
@@ -3847,10 +3892,10 @@ namespace cobra {
                     if (!slices.empty()) {
                         const auto claim =
                             std::make_shared< const ExtensionClaim >(ExtensionClaim{
-                                .expr = std::shared_ptr< const Expr >(CloneExpr(*cand.expr)),
-                                .bitwidth  = cand.bitwidth,
-                                .vars      = static_cast< uint32_t >(cand.var_names.size()),
-                                .tree_size = static_cast< uint32_t >(cand.tree_size) });
+                                .expr = std::shared_ptr< const Expr >(CloneExpr(*claimed->expr)),
+                                .bitwidth  = claimed->bitwidth,
+                                .vars      = static_cast< uint32_t >(claimed->var_names.size()),
+                                .tree_size = static_cast< uint32_t >(claimed->tree_size) });
                         for (auto &slice : slices) {
                             slice.extension_claim = claim;
                         }
@@ -3887,20 +3932,6 @@ namespace cobra {
                     }
                 }
                 stats.sum_group_nanoseconds += since(sum_begin);
-
-                // The boolean cut (`boolean_variables`): the root with its
-                // narrow comparisons taken in, so that the reading of its
-                // conditions as variables can prove one of them the same as a
-                // sign computed from the values it compares.
-                std::vector< MBACandidate > boolean;
-#ifdef COBRA_HAS_Z3
-                if (options_.boolean_variables && options_.z3_verify && ReadsConditions(cand)) {
-                    boolean = BooleanCutMbaCandidate(
-                        cand, options_.min_ast_size, options_.max_vars, options_tag,
-                        options_.cost_model, options_.max_tree_nodes, demanded
-                    );
-                }
-#endif
 
                 // The boundary cut: it is the one reading of the root
                 // the ladder below cannot reach, and it costs a single solve.

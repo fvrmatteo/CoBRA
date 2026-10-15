@@ -10,6 +10,7 @@
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/bit.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
@@ -702,15 +703,34 @@ namespace cobra {
         // to `WideNodeFitsTreeWidth`, which does not take it.
         //
         // `narrow_comparisons` (the boolean cut, see `BooleanCutMbaCandidate`)
-        // also takes an equality or unsigned comparison of narrower operands,
-        // in a `select` condition as well. Held zero-extended, two values are
-        // equal, and ordered without regard to sign, exactly as they are at
-        // their own width; only a signed predicate reads the bit that is not
-        // there, and it stays a leaf.
+        // also takes a comparison of narrower operands, in a `select` condition
+        // as well. Held zero-extended, two values are equal, and ordered without
+        // regard to sign, exactly as they are at their own width. A signed
+        // predicate reads the operands' own top bit, which is not the tree's:
+        // it is read as the same signed comparison of the operands' sign
+        // extensions to the tree width (`NarrowSignBit`), which keep the signed
+        // order - the `(v ^ 2^(n-1)) - 2^(n-1)` a `sext` is read as.
         bool ComparesExactlyNarrow(const llvm::ICmpInst &cmp, uint32_t bw) {
             const auto *ty = cmp.getOperand(0)->getType();
             return ty->isIntegerTy() && ty->getIntegerBitWidth() <= bw
-                && (cmp.isEquality() || cmp.isUnsigned());
+                && (cmp.isEquality() || cmp.isUnsigned() || cmp.isSigned());
+        }
+
+        // The operands' own sign bit, `2^(n-1)`, of a signed comparison of `n`-bit
+        // values in a wider tree (`ComparesExactlyNarrow`): each operand, held
+        // zero-extended, is read as its sign extension `(v ^ 2^(n-1)) - 2^(n-1)`
+        // and the comparison is made at the tree width, where sign extension
+        // keeps the signed order. Zero for a comparison at the tree width, or
+        // one that is not signed.
+        //
+        // One answer for the readings of a tree - the probe plan and the Expr -
+        // as `SignBitOfExtensionSource` is.
+        uint64_t NarrowSignBit(const llvm::ICmpInst &cmp, uint32_t bw) {
+            const auto *ty = cmp.getOperand(0)->getType();
+            if (!cmp.isSigned() || !ty->isIntegerTy() || ty->getIntegerBitWidth() >= bw) {
+                return 0;
+            }
+            return uint64_t{ 1 } << (ty->getIntegerBitWidth() - 1);
         }
 
         bool FitsTreeWidth(const llvm::Instruction *inst, uint32_t bw, bool narrow_comparisons = false) {
@@ -1314,8 +1334,16 @@ namespace cobra {
             // gt/ge become lt/le with the operands swapped.
             template< typename LowerFn >
             uint32_t LowerCompare(llvm::ICmpInst &cmp, LowerFn &&lower) {
-                const uint32_t a = Emit(Op::kMask, lower(cmp.getOperand(0)), 0);
-                const uint32_t b = Emit(Op::kMask, lower(cmp.getOperand(1)), 0);
+                uint32_t a = Emit(Op::kMask, lower(cmp.getOperand(0)), 0);
+                uint32_t b = Emit(Op::kMask, lower(cmp.getOperand(1)), 0);
+                // A signed comparison narrower than the tree, read as the same
+                // signed comparison of the operands' sign extensions to the tree
+                // width, `(v ^ 2^(n-1)) - 2^(n-1)` as a `sext` is read.
+                if (const uint64_t sign = NarrowSignBit(cmp, bits_); sign != 0) {
+                    const uint32_t bit = ConstSlot(sign);
+                    a = Emit(Op::kMask, Emit(Op::kSub, Emit(Op::kXor, a, bit), bit), 0);
+                    b = Emit(Op::kMask, Emit(Op::kSub, Emit(Op::kXor, b, bit), bit), 0);
+                }
 
                 switch (cmp.getPredicate()) { // NOLINT(hicpp-multiway-paths-covered)
                     case llvm::CmpInst::ICMP_EQ:
@@ -1924,6 +1952,18 @@ namespace cobra {
                 );
                 if (lhs == nullptr || rhs == nullptr) {
                     return nullptr;
+                }
+                // As the probe plan reads it (`TreeEvalPlan::LowerCompare`).
+                const uint32_t bw = static_cast< uint32_t >(llvm::countr_one(mask));
+                if (const uint64_t sign = NarrowSignBit(*cmp, bw); sign != 0) {
+                    const auto extend = [&](std::unique_ptr< Expr > operand) {
+                        auto flipped = Expr::BitwiseXor(std::move(operand), Expr::Constant(sign));
+                        return Expr::BitwiseAnd(
+                            Expr::Add(std::move(flipped), Expr::Constant((~sign + 1) & mask)), Expr::Constant(mask)
+                        );
+                    };
+                    lhs = extend(std::move(lhs));
+                    rhs = extend(std::move(rhs));
                 }
                 return BuildComparison(cmp->getPredicate(), std::move(lhs), std::move(rhs));
             }
