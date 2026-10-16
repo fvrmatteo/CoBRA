@@ -3565,6 +3565,78 @@ namespace cobra {
         return candidates;
     }
 
+    std::vector< MBACandidate > ShiftedLeafCutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model, uint32_t max_tree_nodes,
+        const DemandedMaskFn &demanded
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr || cand.node_limit != 0) {
+            return candidates;
+        }
+        const llvm::DenseSet< const llvm::Instruction * > tree(cand.tree.begin(), cand.tree.end());
+        const auto shifts = [](const llvm::Value *v) {
+            const auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
+            if (inst == nullptr
+                || (inst->getOpcode() != llvm::Instruction::LShr
+                    && inst->getOpcode() != llvm::Instruction::AShr))
+            {
+                return false;
+            }
+            const auto *amount = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(1));
+            return amount != nullptr && !amount->isZero();
+        };
+        // The innermost shifts: the ones nothing below them in the tree shifts. A shift above
+        // another is the tree's own arithmetic over it - the halvings of a mixing step shift
+        // what the step's own shift took part in - and holding it opaque would hide the
+        // identity rather than expose it.
+        SharedCut cut;
+        cut.node_limit = kShiftedLeafCutLimit;
+        for (auto *node : cand.tree) {
+            if (!shifts(node)) {
+                continue;
+            }
+            bool innermost = true;
+            llvm::SmallVector< const llvm::Value *, 32 > below{ node->getOperand(0) };
+            llvm::DenseSet< const llvm::Value * > seen;
+            while (!below.empty() && innermost) {
+                const auto *v = below.pop_back_val();
+                if (!seen.insert(v).second) {
+                    continue;
+                }
+                if (shifts(v)) {
+                    innermost = false;
+                    break;
+                }
+                const auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
+                if (inst == nullptr || !tree.contains(inst)) {
+                    continue;
+                }
+                for (const auto &operand : inst->operands()) {
+                    below.push_back(operand.get());
+                }
+            }
+            if (!innermost) {
+                continue;
+            }
+            // The shift and what it shifts: two variables, which is what the shift makes them.
+            cut.opaque.insert(node);
+            if (const auto *shifted = llvm::dyn_cast< llvm::Instruction >(node->getOperand(0));
+                shifted != nullptr && tree.contains(shifted))
+            {
+                cut.opaque.insert(shifted);
+            }
+        }
+        if (cut.opaque.empty()) {
+            return candidates;
+        }
+        BuildCandidates(
+            { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0,
+            /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded, &cut
+        );
+        return candidates;
+    }
+
     std::vector< MBACandidate > BooleanCutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint64_t options_tag, MbaCostModel cost_model, uint32_t max_tree_nodes,

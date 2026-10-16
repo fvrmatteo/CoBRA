@@ -286,6 +286,11 @@ namespace cobra {
     // below the boolean cut, a partial view of its own.
     constexpr uint32_t kExtensionCutLimit = kBooleanCutLimit - 1;
 
+    // The `node_limit` the shifted-leaf cut carries
+    // (`ShiftedLeafCutMbaCandidate`): below the extension cut, a partial view
+    // of its own.
+    constexpr uint32_t kShiftedLeafCutLimit = kExtensionCutLimit - 1;
+
     constexpr bool IsWholeSumGroupLimit(uint32_t node_limit) {
         return IsSumGroupLimit(node_limit)
             && (kSumGroupLimit - node_limit) % (kMaxSliceWidth + 1) == 0;
@@ -399,6 +404,33 @@ namespace cobra {
     // as the leaf, instead of the narrower value under it. Empty when `cand` is
     // not a full collection or its tree extends nothing.
     std::vector< MBACandidate > ExtensionCutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
+        uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
+    );
+
+    // The same root as `cand`, re-collected with each innermost shift by a
+    // constant, and the value it shifts, kept as leaves of their own.
+    //
+    // A right shift moves bits from one position to another, so it is no
+    // bitwise function of what it shifts: an atom of the semilinear reading can
+    // hold `x >> k` only as a variable, exactly as it can hold `a + b` only as
+    // one. The boundary cut keeps an arithmetic value under a bitwise operator
+    // opaque for that reason, and a shift is not arithmetic to it; expanded,
+    // `(x >> k) ^ x` is a tree over the one variable `x`, and the identity the
+    // shift takes part in is gone. A mixing function is written this way -
+    // `y ^= y >> 47`, and the halvings that put a carry back around it - and
+    // with the shift a variable of its own the solver answers at once.
+    //
+    // Only the innermost shifts, each with the value it shifts: those two are
+    // the variables the shift makes of one value. A shift above another is the
+    // tree's own arithmetic over it - the halvings that put a carry back shift
+    // what the mixing shift already took part in - and holding one of those
+    // opaque would hide the identity rather than expose it.
+    //
+    // Returns nothing for a candidate that is itself a cut, and for a tree that
+    // shifts no leaf.
+    std::vector< MBACandidate > ShiftedLeafCutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
         uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
