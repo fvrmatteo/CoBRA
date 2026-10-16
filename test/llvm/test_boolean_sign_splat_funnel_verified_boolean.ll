@@ -12,13 +12,14 @@
 ; variable that is 0 or 1, `f` is `-c` and `f + 1` is `1 - c`, and both are built
 ; from the sign the function already computes.
 ;
+; The comparison of `f` with -1 is then read on its own
+; (`ReadComparisonsAsEqualities`): true exactly when `y` is not zero.
+;
 ; CHECK-LABEL: @sign_splat(
-; CHECK-NOT: @llvm.fshl
-; CHECK: %[[S:.*]] = ashr i64 %o, 63
 ; CHECK-NOT: @llvm.fshl
 ; CHECK: {{(lshr i64 %o, 63|add i64 1, %s)}}
 ; CHECK: store i64
-; CHECK: icmp eq i64 %[[S]], -1
+; CHECK: icmp ne i64 %y, 0
 define i1 @sign_splat(i64 noundef %y, ptr %p) {
   %n = sub i64 0, %y
   %o = or i64 %y, %n

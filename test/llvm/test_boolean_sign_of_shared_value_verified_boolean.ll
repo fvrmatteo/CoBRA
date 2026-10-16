@@ -11,11 +11,14 @@
 ; function already holds. So the reading of conditions is tried on every reading
 ; of a root the search turned down, not only on the boolean cut.
 ;
+; The comparison the shift then feeds is read once more on its own
+; (`ReadComparisonsAsEqualities`): `ashr(o, 63) == -1` is the sign of
+; `(m + k) | (-k - m)`, which is set exactly when `m != -k`.
+;
 ; CHECK-LABEL: @sign_of_shared_value(
 ; CHECK-NOT: @llvm.fshl
 ; CHECK-NOT: freeze
-; CHECK: %s = ashr i64 %o, 63
-; CHECK-NEXT: icmp eq i64 %s, -1
+; CHECK: icmp ne i64 %m, -4937148438292785925
 define i1 @sign_of_shared_value(i64 %x, i64 %y) {
   %h1 = xor i64 %x, %y
   %h2 = add i64 %h1, %x

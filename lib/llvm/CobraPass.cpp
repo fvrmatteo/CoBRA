@@ -36,6 +36,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/Debug.h"
 
@@ -3946,6 +3947,226 @@ namespace cobra {
             return changed;
         }
 
+#ifdef COBRA_HAS_Z3
+        // The fingerprint of the tree a comparison was last read over
+        // (`ReadComparisonsAsEqualities`), kept on the comparison so that a run
+        // over an unchanged tree asks nothing.
+        constexpr const char *kEqualityReadMD = "cobra.equality";
+
+        uint64_t EqualityReadKey(const MbaFingerprint &fp, uint64_t tag) {
+            uint64_t key = 1469598103934665603ULL;
+            for (const uint64_t part : { fp.structure, uint64_t{ fp.depth }, uint64_t{ fp.num_vars }, tag }) {
+                key = (key ^ part) * 1099511628211ULL;
+            }
+            return key;
+        }
+
+        // A comparison of a tree over one value with a constant, true for exactly
+        // one value of it, is the equality with that value; false for exactly one,
+        // the inequality. Protectors compare a value with a constant this way so
+        // that no `icmp eq` shows it: `(x - k) | (k - x)` has a clear sign bit
+        // exactly when `x == k`, the lowest set bit of `(x + k) & (-k - x)` is zero
+        // exactly when `x == -k`, and either is tested through a `select`, a
+        // `smax` or a decrement. The value under the comparison is no simpler as
+        // a word, and an `i1` is no root of the search, so neither reading of the
+        // tree folds it.
+        //
+        // The value the test turns at cannot be found by probing - an equality
+        // turns at one input of the whole range - and is not searched for either:
+        // it is one of the constants the tree is built from, or its negation, or
+        // the constant compared with. Each is asked of the solver, as an
+        // equivalence of the comparison with `x == v` (and `x != v`) over every
+        // value of `x`, and the comparison is rewritten only on that proof. A tree
+        // over more than one value is read again with what it reads more than once
+        // held whole (`SharedCutMbaCandidate`), which is how `(f - l - 32) |
+        // (32 - (f - l))` is a test of the one value `f - l`.
+        bool ReadComparisonsAsEqualities(
+            llvm::Function &f, const CobraPassOptions &options, uint64_t options_tag,
+            const DemandedMaskFn &demanded
+        ) {
+            if (!options.z3_verify) {
+                return false;
+            }
+            std::vector< llvm::ICmpInst * > comparisons;
+            for (auto &inst : llvm::instructions(f)) {
+                if (auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(&inst)) {
+                    comparisons.push_back(cmp);
+                }
+            }
+            if (comparisons.empty()) {
+                return false;
+            }
+            // A reading of its own, so that a root the search already turned down
+            // is collected again.
+            const uint64_t tag = options_tag ^ 0x45514C5245414447ULL;
+            llvm::DominatorTree dominators(f);
+            bool changed = false;
+            for (auto *cmp : comparisons) {
+                auto predicate = cmp->getPredicate();
+                auto *constant = llvm::dyn_cast< llvm::ConstantInt >(cmp->getOperand(1));
+                auto *tested   = llvm::dyn_cast< llvm::Instruction >(cmp->getOperand(0));
+                if (constant == nullptr) {
+                    constant  = llvm::dyn_cast< llvm::ConstantInt >(cmp->getOperand(0));
+                    tested    = llvm::dyn_cast< llvm::Instruction >(cmp->getOperand(1));
+                    predicate = llvm::CmpInst::getSwappedPredicate(predicate);
+                }
+                if (constant == nullptr || tested == nullptr || !tested->getType()->isIntegerTy()
+                    || tested->getType()->getIntegerBitWidth() > 64)
+                {
+                    continue;
+                }
+                auto candidates = ExpandMbaCandidate(
+                    { tested }, 1, 2, tag, options.cost_model, options.max_tree_nodes, demanded
+                );
+                const MBACandidate *reading = nullptr;
+                std::vector< MBACandidate > shared;
+                for (const auto &candidate : candidates) {
+                    if (candidate.root == tested && candidate.node_limit == 0) {
+                        reading = &candidate;
+                        break;
+                    }
+                }
+                if (reading != nullptr && reading->var_names.size() != 1) {
+                    shared = SharedCutMbaCandidate(
+                        *reading, 1, 1, options.max_shared_cuts, tag, options.cost_model,
+                        options.max_tree_nodes, demanded
+                    );
+                    reading = nullptr;
+                    for (const auto &candidate : shared) {
+                        if (candidate.root == tested && candidate.var_names.size() == 1) {
+                            reading = &candidate;
+                            break;
+                        }
+                    }
+                }
+                // A tree of one instruction is the comparison already.
+                if (reading == nullptr || reading->expr == nullptr || reading->var_names.size() != 1
+                    || reading->tree.size() < 2 || reading->leaf_values.size() != 1)
+                {
+                    continue;
+                }
+                auto *leaf = reading->leaf_values.front();
+                if (!leaf->getType()->isIntegerTy()) {
+                    continue;
+                }
+                if (const auto *leaf_inst = llvm::dyn_cast< llvm::Instruction >(leaf);
+                    leaf_inst != nullptr && !dominators.dominates(leaf_inst, cmp))
+                {
+                    continue;
+                }
+                const uint64_t key = EqualityReadKey(reading->fingerprint, tag);
+                if (auto *node = cmp->getMetadata(kEqualityReadMD); node != nullptr && node->getNumOperands() == 1) {
+                    if (auto *seen = llvm::mdconst::dyn_extract< llvm::ConstantInt >(node->getOperand(0));
+                        seen != nullptr && seen->getZExtValue() == key)
+                    {
+                        continue;
+                    }
+                }
+                cmp->setMetadata(
+                    kEqualityReadMD,
+                    llvm::MDNode::get(
+                        cmp->getContext(),
+                        { llvm::ConstantAsMetadata::get(
+                            llvm::ConstantInt::get(llvm::Type::getInt64Ty(cmp->getContext()), key)
+                        ) }
+                    )
+                );
+
+                const uint32_t bw   = reading->bitwidth;
+                const uint64_t mask = Bitmask(bw);
+                const uint64_t k    = constant->getValue().zextOrTrunc(64).getZExtValue() & mask;
+                auto condition      = [&]() -> std::unique_ptr< Expr > {
+                    auto value = CloneExpr(*reading->expr);
+                    auto other = Expr::Constant(k);
+                    const auto negate = [](std::unique_ptr< Expr > e) {
+                        return Expr::BitwiseXor(std::move(e), Expr::Constant(1));
+                    };
+                    switch (predicate) { // NOLINT(hicpp-multiway-paths-covered)
+                        case llvm::CmpInst::ICMP_EQ:
+                            return Expr::CmpEq(std::move(value), std::move(other));
+                        case llvm::CmpInst::ICMP_NE:
+                            return negate(Expr::CmpEq(std::move(value), std::move(other)));
+                        case llvm::CmpInst::ICMP_ULT:
+                            return Expr::CmpUlt(std::move(value), std::move(other));
+                        case llvm::CmpInst::ICMP_UGT:
+                            return Expr::CmpUlt(std::move(other), std::move(value));
+                        case llvm::CmpInst::ICMP_ULE:
+                            return negate(Expr::CmpUlt(std::move(other), std::move(value)));
+                        case llvm::CmpInst::ICMP_UGE:
+                            return negate(Expr::CmpUlt(std::move(value), std::move(other)));
+                        case llvm::CmpInst::ICMP_SLT:
+                            return Expr::CmpSlt(std::move(value), std::move(other));
+                        case llvm::CmpInst::ICMP_SGT:
+                            return Expr::CmpSlt(std::move(other), std::move(value));
+                        case llvm::CmpInst::ICMP_SLE:
+                            return negate(Expr::CmpSlt(std::move(other), std::move(value)));
+                        case llvm::CmpInst::ICMP_SGE:
+                            return negate(Expr::CmpSlt(std::move(value), std::move(other)));
+                        default:
+                            return nullptr;
+                    }
+                }();
+                if (condition == nullptr) {
+                    continue;
+                }
+                // The constants the tree is built from, with their negations and
+                // the constant compared with: where an obfuscated equality turns.
+                llvm::SmallVector< uint64_t, 16 > points;
+                const auto offer = [&](uint64_t v) {
+                    v &= mask;
+                    if (points.size() < 16 && !llvm::is_contained(points, v)) {
+                        points.push_back(v);
+                    }
+                };
+                offer(k);
+                offer(~k + 1);
+                for (const auto *ti : reading->tree) {
+                    for (const auto &operand : ti->operands()) {
+                        if (const auto *c = llvm::dyn_cast< llvm::ConstantInt >(operand.get());
+                            c != nullptr && c->getBitWidth() <= 64)
+                        {
+                            const uint64_t v = static_cast< uint64_t >(c->getValue().getSExtValue());
+                            offer(v);
+                            offer(~v + 1);
+                        }
+                    }
+                }
+                const uint32_t leaf_width = leaf->getType()->getIntegerBitWidth();
+                bool rewritten            = false;
+                for (const uint64_t point : points) {
+                    if (leaf_width < 64 && (point >> leaf_width) != 0) {
+                        continue;
+                    }
+                    for (const bool unequal : { false, true }) {
+                        auto test = Expr::CmpEq(Expr::Variable(0), Expr::Constant(point));
+                        if (unequal) {
+                            test = Expr::BitwiseXor(std::move(test), Expr::Constant(1));
+                        }
+                        const auto proof =
+                            VerifyExprsWithStrategy(*condition, *test, reading->var_names, bw, options.z3_settings);
+                        if (!proof.equivalent || proof.unknown) {
+                            continue;
+                        }
+                        llvm::IRBuilder<> builder(cmp);
+                        auto *replacement = builder.CreateICmp(
+                            unequal ? llvm::CmpInst::ICMP_NE : llvm::CmpInst::ICMP_EQ, leaf,
+                            llvm::ConstantInt::get(leaf->getType(), point), "cobra.equality"
+                        );
+                        cmp->replaceAllUsesWith(replacement);
+                        replacement->takeName(cmp);
+                        llvm::RecursivelyDeleteTriviallyDeadInstructions(cmp);
+                        rewritten = changed = true;
+                        break;
+                    }
+                    if (rewritten) {
+                        break;
+                    }
+                }
+            }
+            return changed;
+        }
+#endif
+
     } // namespace
 
     llvm::PreservedAnalyses
@@ -3971,7 +4192,9 @@ namespace cobra {
         const uint64_t options_tag = OptionsTag(options_);
 
         // Before anything reads the function: the rewrite changes no block.
-        if (WidenExtendedBitwise(f) | HoistConstantFactors(f)) {
+        const bool widened = WidenExtendedBitwise(f);
+        const bool hoisted = HoistConstantFactors(f);
+        if (widened || hoisted) {
             changed = true;
             llvm::PreservedAnalyses kept;
             kept.preserveSet< llvm::CFGAnalyses >();
@@ -5239,6 +5462,16 @@ namespace cobra {
             }
             llvm::RecursivelyDeleteTriviallyDeadInstructions(dead);
         }
+
+#ifdef COBRA_HAS_Z3
+        // Last, over what the rewrites above left: the comparisons that test a
+        // tree over one value for equality in disguise. Every bit of the tested
+        // value is taken as read - the demanded bits were taken before the
+        // rewrites.
+        if (ReadComparisonsAsEqualities(f, options_, options_tag, {})) {
+            changed = true;
+        }
+#endif
 
         if (speculation.Enabled()) {
             speculation.Drain(run_id, stats);
