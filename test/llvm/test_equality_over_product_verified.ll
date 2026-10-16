@@ -55,15 +55,31 @@ define i1 @negated_product_only(i64 %x) {
   ret i1 %r
 }
 
-; The control: a product compared with a range is no equality, and stays.
+; A product compared with a range is no equality with one value: `m ^ -m` is below
+; 1000 only where it is zero, for `m` 0 or 2^63 - and for an odd factor that is `x` 0
+; or 2^63, every bit but the sign clear: a test of some of `x`'s bits.
 ;
 ; CHECK-LABEL: @product_range(
-; CHECK: icmp ult i64
-; CHECK: ret i1
+; CHECK: [[B:%.*]] = and i64 %x, 9223372036854775807
+; CHECK-NEXT: [[R:%.*]] = icmp eq i64 [[B]], 0
+; CHECK-NEXT: ret i1 [[R]]
 define i1 @product_range(i64 %x) {
   %m = mul i64 %x, 1099511628211
   %n = mul i64 %x, -1099511628211
   %a = xor i64 %m, %n
+  %r = icmp ult i64 %a, 1000
+  ret i1 %r
+}
+
+; The control: a product in a range of a thousand values is no test of its bits, and
+; stays.
+;
+; CHECK-LABEL: @product_in_a_range(
+; CHECK: icmp ult i64
+; CHECK: ret i1
+define i1 @product_in_a_range(i64 %x) {
+  %m = mul i64 %x, 1099511628211
+  %a = add i64 %m, 7
   %r = icmp ult i64 %a, 1000
   ret i1 %r
 }
@@ -87,15 +103,32 @@ define i1 @lowest_bit_against_the_rest(i64 %x) {
   ret i1 %r
 }
 
-; The control: two trees equal for many values are no equality in disguise.
+; Two trees equal for many values are no equality with one value: `x & 5` and `x & 3`
+; agree exactly when bits 1 and 2 are clear - a test of those bits.
 ;
 ; CHECK-LABEL: @trees_equal_often(
-; CHECK: icmp eq i64 %a, %b
-; CHECK: ret i1
+; CHECK: [[B:%.*]] = and i64 %x, 6
+; CHECK-NEXT: [[R:%.*]] = icmp eq i64 [[B]], 0
+; CHECK-NEXT: ret i1 [[R]]
 define i1 @trees_equal_often(i64 %x) {
   %a = and i64 %x, 5
   %b = and i64 %x, 3
   %r = icmp eq i64 %a, %b
+  ret i1 %r
+}
+
+; The control: two trees that agree on a set no test of bits describes stay a
+; comparison of the two.
+;
+; CHECK-LABEL: @trees_equal_on_no_pattern(
+; CHECK: icmp eq i64
+; CHECK: ret i1
+define i1 @trees_equal_on_no_pattern(i64 %x) {
+  %a = mul i64 %x, 3
+  %b = add i64 %x, 1000
+  %c = lshr i64 %a, 4
+  %d = lshr i64 %b, 4
+  %r = icmp eq i64 %c, %d
   ret i1 %r
 }
 

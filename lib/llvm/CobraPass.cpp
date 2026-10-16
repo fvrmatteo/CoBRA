@@ -4731,6 +4731,60 @@ namespace cobra {
             return ((~c0 + 1) * OddInverse(c1, bw)) & mask;
         }
 
+        // The masked equality a condition over one value is, when it is one: true (or
+        // false) exactly when `x & m == k`. Read off the condition: its rare value - the one
+        // it takes for fewer of a few random inputs - is found at one of `candidates` or at a
+        // corner of the word, and each bit of that point is flipped: a bit whose flip keeps
+        // the rare value is one the condition ignores. The bits that change it are `m`, the
+        // point's bits under them `k`. `(x & 0x7fff...) != 0` written as `x >s (x & (x - 1))`
+        // is read this way, and so is a single equality (`m` all ones). Only a candidate: the
+        // solver decides.
+        struct MaskedEquality {
+            uint64_t mask  = 0;
+            uint64_t value = 0;
+            bool equal     = true; // the condition is `(x & mask) == value`, else `!=`
+        };
+
+        std::optional< MaskedEquality > ReadMaskedEquality(
+            const Expr &condition, llvm::ArrayRef< uint64_t > candidates, uint32_t bw, std::mt19937_64 &random
+        ) {
+            const uint64_t mask = Bitmask(bw);
+            std::vector< uint64_t > values(1);
+            const auto holds = [&](uint64_t x) {
+                values[0] = x & mask;
+                return EvalExpr(condition, values, bw) != 0;
+            };
+            unsigned trues = 0;
+            for (int probe = 0; probe < 64; ++probe) {
+                trues += holds(random()) ? 1 : 0;
+            }
+            const bool common = trues * 2 >= 64;
+            llvm::SmallVector< uint64_t, 24 > tried(candidates.begin(), candidates.end());
+            const uint64_t top = uint64_t{ 1 } << (bw - 1);
+            for (const uint64_t corner : { uint64_t{ 0 }, uint64_t{ 1 }, mask, top, top - 1 }) {
+                tried.push_back(corner);
+            }
+            std::optional< uint64_t > rare;
+            for (const uint64_t point : tried) {
+                if (holds(point) != common) {
+                    rare = point & mask;
+                    break;
+                }
+            }
+            if (!rare) {
+                return std::nullopt;
+            }
+            MaskedEquality reading;
+            for (uint32_t bit = 0; bit < bw; ++bit) {
+                if (holds(*rare ^ (uint64_t{ 1 } << bit)) == common) {
+                    reading.mask |= uint64_t{ 1 } << bit;
+                }
+            }
+            reading.value = *rare & reading.mask;
+            reading.equal = !common;
+            return reading;
+        }
+
         // A comparison of a tree over two values with a constant, true exactly on
         // one line of them - `a - b == p` or `a + b == p` - is that equality.
         // `f - l == 32` is tested as `(f - l - 32) | ((l + 32) - f)` with `f - l`
@@ -4891,8 +4945,9 @@ namespace cobra {
             }
             // A reading of its own, so that a root the search already turned down
             // is collected again - and one of its own since the affine turning
-            // point, so that a comparison read before it is read again.
-            const uint64_t tag = options_tag ^ 0x45514C5245414448ULL;
+            // point and the masked equalities, so that a comparison read before
+            // them is read again.
+            const uint64_t tag = options_tag ^ 0x45514C5245414449ULL;
             llvm::DominatorTree dominators(f);
             std::mt19937_64 random(0x4C494E4553ULL);
             bool changed = false;
@@ -4925,6 +4980,24 @@ namespace cobra {
                     tested    = difference;
                     constant  = llvm::ConstantInt::get(llvm::cast< llvm::IntegerType >(difference->getType()), 0);
                     predicate = cmp->getPredicate();
+                }
+                // Two trees in any other comparison are read as the 0 or 1 it yields, tested
+                // against zero: what that reading can be rewritten to is a masked equality of
+                // the one value both are over (`ReadMaskedEquality`).
+                llvm::Instruction *yielded = nullptr;
+                if (constant == nullptr && difference == nullptr && !cmp->isEquality()
+                    && cmp->getOperand(0)->getType()->isIntegerTy()
+                    && (llvm::isa< llvm::Instruction >(cmp->getOperand(0))
+                        || llvm::isa< llvm::Instruction >(cmp->getOperand(1))))
+                {
+                    yielded = cmp->clone();
+                    yielded->insertBefore(cmp);
+                    difference = llvm::CastInst::CreateZExtOrBitCast(
+                        yielded, cmp->getOperand(0)->getType(), "cobra.condition", cmp
+                    );
+                    tested    = difference;
+                    constant  = llvm::ConstantInt::get(llvm::cast< llvm::IntegerType >(difference->getType()), 0);
+                    predicate = llvm::CmpInst::ICMP_NE;
                 }
                 if (constant == nullptr || tested == nullptr || !tested->getType()->isIntegerTy()
                     || tested->getType()->getIntegerBitWidth() > 64)
@@ -5184,6 +5257,65 @@ namespace cobra {
                     }
                     if (rewritten) {
                         break;
+                    }
+                }
+                // A condition true on more than one value may still be one test of some of
+                // its bits: `x & m == k`.
+                if (!rewritten && leaf_width == bw && bw <= 64) {
+                    // Worth it only when more of the tree goes with the comparison than the
+                    // `and` it adds: a tree something else still reads stays, and a mask in
+                    // place of what InstCombine would fold anyway is one instruction more.
+                    llvm::SmallPtrSet< llvm::Instruction *, 16 > dying(reading->tree.begin(), reading->tree.end());
+                    dying.erase(difference);
+                    dying.erase(yielded);
+                    for (bool shrunk = true; shrunk;) {
+                        shrunk = false;
+                        for (auto *inst : llvm::make_early_inc_range(dying)) {
+                            const bool kept = llvm::any_of(inst->users(), [&](const llvm::User *user) {
+                                const auto *reader = llvm::dyn_cast< llvm::Instruction >(user);
+                                return reader != cmp && reader != difference && reader != yielded
+                                    && (reader == nullptr || !dying.contains(reader));
+                            });
+                            if (kept) {
+                                dying.erase(inst);
+                                shrunk = true;
+                            }
+                        }
+                    }
+                    const auto masked = ReadMaskedEquality(*condition, points, bw, random);
+                    if (masked.has_value() && masked->mask != 0
+                        && dying.size() > (masked->mask == mask ? 0U : 1U))
+                    {
+                        auto test = Expr::CmpEq(
+                            masked->mask == mask ? Expr::Variable(0)
+                                                 : Expr::BitwiseAnd(Expr::Variable(0), Expr::Constant(masked->mask)),
+                            Expr::Constant(masked->value)
+                        );
+                        if (!masked->equal) {
+                            test = Expr::BitwiseXor(std::move(test), Expr::Constant(1));
+                        }
+                        const auto proof =
+                            VerifyExprsWithStrategy(*condition, *test, reading->var_names, bw, options.z3_settings);
+                        if (proof.equivalent && !proof.unknown) {
+                            llvm::IRBuilder<> builder(cmp);
+                            llvm::Value *bits = leaf;
+                            if (masked->mask != mask) {
+                                bits = builder.CreateAnd(
+                                    leaf, llvm::ConstantInt::get(leaf->getType(), masked->mask), "cobra.bits"
+                                );
+                            }
+                            auto *replacement = builder.CreateICmp(
+                                masked->equal ? llvm::CmpInst::ICMP_EQ : llvm::CmpInst::ICMP_NE, bits,
+                                llvm::ConstantInt::get(leaf->getType(), masked->value), "cobra.equality"
+                            );
+                            if (DetectDebug()) {
+                                llvm::errs() << "cobra: masked equality " << *cmp << " -> " << *replacement << "\n";
+                            }
+                            cmp->replaceAllUsesWith(replacement);
+                            replacement->takeName(cmp);
+                            llvm::RecursivelyDeleteTriviallyDeadInstructions(cmp);
+                            changed = true;
+                        }
                     }
                 }
             }
