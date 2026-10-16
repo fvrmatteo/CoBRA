@@ -12,9 +12,12 @@
 ; `select` it is - spelled out in xors and masks it would cost more than the funnel
 ; shift it replaces.
 ;
+; In `@sign_select` the comparison left is then one of a tree over `h` with a
+; constant, which the equality reading takes over `m = h*P`: `m != -K`.
+;
 ; CHECK-LABEL: @sign_select(
 ; CHECK-NOT: @llvm.fshl
-; CHECK: sext i1 %lt to i64
+; CHECK: icmp ne i64 %m, -2212647683481811901
 ;
 ; CHECK-LABEL: @selected_operand(
 ; CHECK-NOT: @llvm.fshl

@@ -471,6 +471,17 @@ namespace cobra {
         uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
     );
 
+    // The tree at `root` collected with each value of `opaque` held whole, a
+    // variable in its own right, for a caller that knows which values its
+    // question is about - what both arms of a `select` read, say, where the
+    // ladder above expands a value both arms share before the ones only one
+    // arm reads twice. A rung of no ladder.
+    std::vector< MBACandidate > CutMbaCandidate(
+        llvm::Instruction *root, llvm::ArrayRef< const llvm::Value * > opaque, uint32_t min_ast_size,
+        uint32_t max_vars, uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
+        uint32_t max_tree_nodes = 0
+    );
+
     // The widths at which the tree of `cand` could be read as a slice of its
     // root: the source widths of the extensions it holds, narrowest first.
     //

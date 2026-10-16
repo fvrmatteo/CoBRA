@@ -3554,6 +3554,23 @@ namespace cobra {
         return candidates;
     }
 
+    std::vector< MBACandidate > CutMbaCandidate(
+        llvm::Instruction *root, llvm::ArrayRef< const llvm::Value * > opaque, uint32_t min_ast_size,
+        uint32_t max_vars, uint64_t options_tag, MbaCostModel cost_model, uint32_t max_tree_nodes
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (root == nullptr) {
+            return candidates;
+        }
+        SharedCut cut;
+        cut.opaque.insert(opaque.begin(), opaque.end());
+        BuildCandidates(
+            { root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false, max_tree_nodes, {},
+            &cut
+        );
+        return candidates;
+    }
+
     std::vector< MBACandidate > SharedCutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint32_t max_shared_cuts, uint64_t options_tag, MbaCostModel cost_model,

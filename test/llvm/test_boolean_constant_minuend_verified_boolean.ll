@@ -6,12 +6,15 @@
 ; comparison of it with -1 is `d != 0`. The rewrite reads that sign as the function
 ; already computes it, which needs `-K + -(h*P)` built as the `sub` it is: built as
 ; a negation and an add it matches no instruction, the whole cone is spelled again
-; and the rewrite costs more than the funnel shift it replaces.
+; and the rewrite costs more than the funnel shift it replaces. What is left is
+; the comparison of a tree over `h` with a constant, which the equality reading
+; takes over `m = h*P` (the change of variable through the odd product): `m` is
+; tested against `-K`.
 ;
 ; CHECK-LABEL: @hash_compare(
 ; CHECK-NOT: @llvm.fshl
-; CHECK: %s = ashr i64 %o, 63
-; CHECK: icmp eq i64 %s, -1
+; CHECK: [[M:%.*]] = mul i64 %h, 1099511628211
+; CHECK-NEXT: icmp ne i64 [[M]], -4937148438292785925
 define i1 @hash_compare(i64 noundef %h) {
   %m = mul i64 %h, 1099511628211
   %a = add i64 %m, 4937148438292785925

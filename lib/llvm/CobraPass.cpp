@@ -62,6 +62,7 @@
 #include <ctime>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -4522,6 +4523,139 @@ namespace cobra {
         }
 
 #ifdef COBRA_HAS_Z3
+        // A change of variable that takes products out of a question.
+        //
+        // A variable read only as `v * k`, for constants `k` one of which, `p`,
+        // is odd, is `w * p^-1` for `w = v * p`. A product by an odd constant
+        // maps the words one to one, so a statement holds for every `v` exactly
+        // when it holds for every `w`, and over `w` each `v * k` is
+        // `w * (k * p^-1)`: `w` itself, `-w`, or a product by a constant. A value
+        // `m = x * P` that is also computed as `x * -P` (InstCombine's form of
+        // `-m`) is then one word read twice, and the solver no longer has to
+        // relate two products it bit-blasts. The variables of a question are
+        // words of the full width, never narrowed, so the map is one to one
+        // over all of them.
+        struct ProductVariable
+        {
+            uint32_t var    = 0;
+            uint64_t factor = 0; // the odd `p`
+        };
+
+        // The inverse of an odd `a` modulo 2^bitwidth: each Newton step doubles
+        // the low bits that are right, and `a` is its own inverse modulo 8.
+        uint64_t OddInverse(uint64_t a, uint32_t bitwidth) {
+            uint64_t x = a;
+            for (int step = 0; step < 5; ++step) {
+                x *= 2 - a * x;
+            }
+            return x & Bitmask(bitwidth);
+        }
+
+        // The constant `e` multiplies the variable `var` by, when `e` is that
+        // product.
+        std::optional< uint64_t > ProductFactor(const Expr &e, uint32_t var) {
+            if (e.kind != Expr::Kind::kMul || e.children.size() != 2) {
+                return std::nullopt;
+            }
+            for (size_t side = 0; side < 2; ++side) {
+                const Expr &operand = *e.children[side];
+                const Expr &other   = *e.children[1 - side];
+                if (operand.kind == Expr::Kind::kVariable && operand.var_index == var
+                    && other.kind == Expr::Kind::kConstant)
+                {
+                    return other.constant_val;
+                }
+            }
+            return std::nullopt;
+        }
+
+        // Whether `e` reads `var` only as an operand of products with
+        // constants; the constants are collected.
+        bool ReadOnlyInProducts(const Expr &e, uint32_t var, llvm::SmallVectorImpl< uint64_t > &factors) {
+            if (const auto factor = ProductFactor(e, var)) {
+                factors.push_back(*factor);
+                return true;
+            }
+            if (e.kind == Expr::Kind::kVariable) {
+                return e.var_index != var;
+            }
+            return llvm::all_of(e.children, [&](const std::unique_ptr< Expr > &child) {
+                return ReadOnlyInProducts(*child, var, factors);
+            });
+        }
+
+        // The variables of `e`, of the first `vars`, the change applies to.
+        std::vector< ProductVariable > ProductVariables(const Expr &e, size_t vars) {
+            std::vector< ProductVariable > result;
+            for (uint32_t var = 0; var < vars; ++var) {
+                llvm::SmallVector< uint64_t, 4 > factors;
+                if (!ReadOnlyInProducts(e, var, factors)) {
+                    continue;
+                }
+                const auto *odd = llvm::find_if(factors, [](uint64_t k) { return (k & 1) != 0; });
+                if (odd != factors.end()) {
+                    result.push_back({ var, *odd });
+                }
+            }
+            return result;
+        }
+
+        // `e` read over `w = var * p`, with `inverse` the inverse of `p`.
+        std::unique_ptr< Expr > OverProduct(const Expr &e, uint32_t var, uint64_t inverse, uint32_t bitwidth) {
+            if (const auto factor = ProductFactor(e, var)) {
+                const uint64_t mask = Bitmask(bitwidth);
+                const uint64_t k    = (*factor * inverse) & mask;
+                if (k == 1) {
+                    return Expr::Variable(var);
+                }
+                if (k == mask) {
+                    return Expr::Negate(Expr::Variable(var));
+                }
+                return Expr::Mul(Expr::Constant(k), Expr::Variable(var));
+            }
+            auto node = CloneNode(e);
+            for (const auto &child : e.children) {
+                node->children.push_back(OverProduct(*child, var, inverse, bitwidth));
+            }
+            return node;
+        }
+
+        std::unique_ptr< Expr >
+        OverProducts(const Expr &e, const std::vector< ProductVariable > &changed, uint32_t bitwidth) {
+            auto result = CloneExpr(e);
+            for (const auto &change : changed) {
+                result = OverProduct(*result, change.var, OddInverse(change.factor, bitwidth), bitwidth);
+            }
+            return result;
+        }
+
+        // Whether `lhs` and `rhs` agree for every value of their variables:
+        // asked as they are, and asked again over the products of what they read
+        // when the solver had no answer. A refutation is final: the change is
+        // one to one, so the statement is false over the products too.
+        bool ProvedEqual(
+            const Expr &lhs, const Expr &rhs, const std::vector< std::string > &var_names, uint32_t bitwidth,
+            const CobraPassOptions &options
+        ) {
+            const auto direct = VerifyExprsWithStrategy(lhs, rhs, var_names, bitwidth, options.z3_settings);
+            if (direct.equivalent && !direct.unknown) {
+                return true;
+            }
+            if (!direct.unknown) {
+                return false;
+            }
+            const auto both    = Expr::BitwiseXor(CloneExpr(lhs), CloneExpr(rhs));
+            const auto changed = ProductVariables(*both, var_names.size());
+            if (changed.empty()) {
+                return false;
+            }
+            const auto proof = VerifyExprsWithStrategy(
+                *OverProducts(lhs, changed, bitwidth), *OverProducts(rhs, changed, bitwidth), var_names, bitwidth,
+                options.z3_settings
+            );
+            return proof.equivalent && !proof.unknown;
+        }
+
         // The fingerprint of the tree a comparison was last read over
         // (`ReadComparisonsAsEqualities`), kept on the comparison so that a run
         // over an unchanged tree asks nothing.
@@ -4533,6 +4667,160 @@ namespace cobra {
                 key = (key ^ part) * 1099511628211ULL;
             }
             return key;
+        }
+
+        // `value <predicate> k`, as an `Expr` that is 0 or 1.
+        std::unique_ptr< Expr > ComparedWith(const Expr &tree, llvm::CmpInst::Predicate predicate, uint64_t k) {
+            auto value        = CloneExpr(tree);
+            auto other        = Expr::Constant(k);
+            const auto negate = [](std::unique_ptr< Expr > e) {
+                return Expr::BitwiseXor(std::move(e), Expr::Constant(1));
+            };
+            switch (predicate) { // NOLINT(hicpp-multiway-paths-covered)
+                case llvm::CmpInst::ICMP_EQ:
+                    return Expr::CmpEq(std::move(value), std::move(other));
+                case llvm::CmpInst::ICMP_NE:
+                    return negate(Expr::CmpEq(std::move(value), std::move(other)));
+                case llvm::CmpInst::ICMP_ULT:
+                    return Expr::CmpUlt(std::move(value), std::move(other));
+                case llvm::CmpInst::ICMP_UGT:
+                    return Expr::CmpUlt(std::move(other), std::move(value));
+                case llvm::CmpInst::ICMP_ULE:
+                    return negate(Expr::CmpUlt(std::move(other), std::move(value)));
+                case llvm::CmpInst::ICMP_UGE:
+                    return negate(Expr::CmpUlt(std::move(value), std::move(other)));
+                case llvm::CmpInst::ICMP_SLT:
+                    return Expr::CmpSlt(std::move(value), std::move(other));
+                case llvm::CmpInst::ICMP_SGT:
+                    return Expr::CmpSlt(std::move(other), std::move(value));
+                case llvm::CmpInst::ICMP_SLE:
+                    return negate(Expr::CmpSlt(std::move(other), std::move(value)));
+                case llvm::CmpInst::ICMP_SGE:
+                    return negate(Expr::CmpSlt(std::move(value), std::move(other)));
+                default:
+                    return nullptr;
+            }
+        }
+
+        // A comparison of a tree over two values with a constant, true exactly on
+        // one line of them - `a - b == p` or `a + b == p` - is that equality.
+        // `f - l == 32` is tested as `(f - l - 32) | ((l + 32) - f)` with `f - l`
+        // and `l - f` computed apart, so the tree reads nothing twice and no cut
+        // makes it a tree over one value. The lines are those through the
+        // constants the tree is built from, as for one value; each is evaluated
+        // at points on it and off it, and only one that fits is asked of the
+        // solver. The comparison is written over the difference or sum the tree
+        // computes, or one built beside it.
+        bool ReadComparisonAsLine(
+            llvm::ICmpInst *cmp, const MBACandidate &reading, const Expr &condition, uint64_t k,
+            const CobraPassOptions &options, std::mt19937_64 &random
+        ) {
+            const uint32_t bw   = reading.bitwidth;
+            const uint64_t mask = Bitmask(bw);
+            auto *first         = reading.leaf_values[0];
+            auto *second        = reading.leaf_values[1];
+            if (!first->getType()->isIntegerTy(bw) || !second->getType()->isIntegerTy(bw)) {
+                return false;
+            }
+            llvm::SmallVector< uint64_t, 16 > points;
+            const auto offer = [&](uint64_t v) {
+                v &= mask;
+                if (points.size() < 16 && !llvm::is_contained(points, v)) {
+                    points.push_back(v);
+                }
+            };
+            offer(k);
+            offer(~k + 1);
+            for (const auto *ti : reading.tree) {
+                for (const auto &operand : ti->operands()) {
+                    if (const auto *c = llvm::dyn_cast< llvm::ConstantInt >(operand.get());
+                        c != nullptr && c->getBitWidth() <= 64)
+                    {
+                        const uint64_t v = static_cast< uint64_t >(c->getValue().getSExtValue());
+                        offer(v);
+                        offer(~v + 1);
+                    }
+                }
+            }
+            const auto line = [&](bool sum, uint64_t a, uint64_t b) { return (sum ? a + b : a - b) & mask; };
+            std::vector< uint64_t > values(2);
+            for (const bool sum : { false, true }) {
+                for (const uint64_t point : points) {
+                    // Which of `==` and `!=` the comparison is on the line, if
+                    // either: the same at every point of it, the other off it.
+                    std::optional< bool > unequal;
+                    bool fits = true;
+                    for (int probe = 0; probe < 16 && fits; ++probe) {
+                        values[1] = random() & mask;
+                        values[0] = (sum ? point - values[1] : point + values[1]) & mask;
+                        const bool on = EvalExpr(condition, values, bw) != 0;
+                        if (!unequal.has_value()) {
+                            unequal = !on;
+                        }
+                        fits = on != *unequal;
+                    }
+                    for (int probe = 0; probe < 16 && fits; ++probe) {
+                        values[0] = random() & mask;
+                        values[1] = random() & mask;
+                        if (line(sum, values[0], values[1]) == point) {
+                            continue;
+                        }
+                        fits = (EvalExpr(condition, values, bw) != 0) == *unequal;
+                    }
+                    if (!fits) {
+                        continue;
+                    }
+                    auto form = sum ? Expr::Add(Expr::Variable(0), Expr::Variable(1))
+                                    : Expr::Add(Expr::Variable(0), Expr::Negate(Expr::Variable(1)));
+                    auto test = Expr::CmpEq(std::move(form), Expr::Constant(point));
+                    if (*unequal) {
+                        test = Expr::BitwiseXor(std::move(test), Expr::Constant(1));
+                    }
+                    const auto proof =
+                        VerifyExprsWithStrategy(condition, *test, reading.var_names, bw, options.z3_settings);
+                    if (!proof.equivalent || proof.unknown) {
+                        continue;
+                    }
+                    // The value on the line, as the tree computes it if it does:
+                    // `first - second`, `second - first` against `-point`, or the sum.
+                    llvm::BinaryOperator *computed = nullptr;
+                    uint64_t at                    = point;
+                    for (auto *ti : reading.tree) {
+                        auto *op = llvm::dyn_cast< llvm::BinaryOperator >(ti);
+                        if (op == nullptr || computed != nullptr) {
+                            continue;
+                        }
+                        const bool forward = op->getOperand(0) == first && op->getOperand(1) == second;
+                        const bool reverse = op->getOperand(0) == second && op->getOperand(1) == first;
+                        if (sum && op->getOpcode() == llvm::Instruction::Add && (forward || reverse)) {
+                            computed = op;
+                        } else if (!sum && op->getOpcode() == llvm::Instruction::Sub && (forward || reverse)) {
+                            computed = op;
+                            at       = forward ? point : (~point + 1) & mask;
+                        }
+                    }
+                    llvm::IRBuilder<> builder(cmp);
+                    llvm::Value *value = computed;
+                    if (computed != nullptr) {
+                        computed->dropPoisonGeneratingFlags();
+                    } else {
+                        value = sum ? builder.CreateAdd(first, second, "cobra.line")
+                                    : builder.CreateSub(first, second, "cobra.line");
+                    }
+                    auto *replacement = builder.CreateICmp(
+                        *unequal ? llvm::CmpInst::ICMP_NE : llvm::CmpInst::ICMP_EQ, value,
+                        llvm::ConstantInt::get(first->getType(), at), "cobra.equality"
+                    );
+                    if (DetectDebug()) {
+                        llvm::errs() << "cobra: equality on a line " << *cmp << " -> " << *replacement << "\n";
+                    }
+                    cmp->replaceAllUsesWith(replacement);
+                    replacement->takeName(cmp);
+                    llvm::RecursivelyDeleteTriviallyDeadInstructions(cmp);
+                    return true;
+                }
+            }
+            return false;
         }
 
         // A comparison of a tree over one value with a constant, true for exactly
@@ -4574,6 +4862,7 @@ namespace cobra {
             // is collected again.
             const uint64_t tag = options_tag ^ 0x45514C5245414447ULL;
             llvm::DominatorTree dominators(f);
+            std::mt19937_64 random(0x4C494E4553ULL);
             bool changed = false;
             for (auto *cmp : comparisons) {
                 auto predicate = cmp->getPredicate();
@@ -4583,6 +4872,27 @@ namespace cobra {
                     constant  = llvm::dyn_cast< llvm::ConstantInt >(cmp->getOperand(0));
                     tested    = llvm::dyn_cast< llvm::Instruction >(cmp->getOperand(1));
                     predicate = llvm::CmpInst::getSwappedPredicate(predicate);
+                }
+                // Two trees tested for equality are their exclusive or tested
+                // against zero: `(y & -y) == -(y & (y - 1))` is `y == 0`. Read
+                // through a difference built for the question and taken away
+                // after it, with what the comparison read when it is rewritten.
+                llvm::Instruction *difference = nullptr;
+                const auto drop_difference    = llvm::make_scope_exit([&] {
+                    if (difference != nullptr) {
+                        llvm::RecursivelyDeleteTriviallyDeadInstructions(difference);
+                    }
+                });
+                if (constant == nullptr && cmp->isEquality() && cmp->getOperand(0)->getType()->isIntegerTy()
+                    && llvm::isa< llvm::Instruction >(cmp->getOperand(0))
+                    && llvm::isa< llvm::Instruction >(cmp->getOperand(1)))
+                {
+                    difference = llvm::BinaryOperator::CreateXor(
+                        cmp->getOperand(0), cmp->getOperand(1), "cobra.difference", cmp
+                    );
+                    tested    = difference;
+                    constant  = llvm::ConstantInt::get(llvm::cast< llvm::IntegerType >(difference->getType()), 0);
+                    predicate = cmp->getPredicate();
                 }
                 if (constant == nullptr || tested == nullptr || !tested->getType()->isIntegerTy()
                     || tested->getType()->getIntegerBitWidth() > 64)
@@ -4600,6 +4910,13 @@ namespace cobra {
                         break;
                     }
                 }
+                // The whole tree, when it reads two values: a line of them may
+                // be what the comparison tests (`ReadComparisonAsLine`).
+                const MBACandidate *pair = reading != nullptr && reading->expr != nullptr
+                        && reading->var_names.size() == 2 && reading->leaf_values.size() == 2
+                        && reading->tree.size() >= 2
+                    ? reading
+                    : nullptr;
                 if (reading != nullptr && reading->var_names.size() != 1) {
                     shared = SharedCutMbaCandidate(
                         *reading, 1, 1, options.max_shared_cuts, tag, options.cost_model,
@@ -4617,6 +4934,35 @@ namespace cobra {
                 if (reading == nullptr || reading->expr == nullptr || reading->var_names.size() != 1
                     || reading->tree.size() < 2 || reading->leaf_values.size() != 1)
                 {
+                    if (pair == nullptr) {
+                        continue;
+                    }
+                    const uint64_t key = EqualityReadKey(pair->fingerprint, tag ^ 2);
+                    if (auto *node = cmp->getMetadata(kEqualityReadMD);
+                        node != nullptr && node->getNumOperands() == 1)
+                    {
+                        if (auto *seen = llvm::mdconst::dyn_extract< llvm::ConstantInt >(node->getOperand(0));
+                            seen != nullptr && seen->getZExtValue() == key)
+                        {
+                            continue;
+                        }
+                    }
+                    cmp->setMetadata(
+                        kEqualityReadMD,
+                        llvm::MDNode::get(
+                            cmp->getContext(),
+                            { llvm::ConstantAsMetadata::get(
+                                llvm::ConstantInt::get(llvm::Type::getInt64Ty(cmp->getContext()), key)
+                            ) }
+                        )
+                    );
+                    const uint64_t pair_k =
+                        constant->getValue().zextOrTrunc(64).getZExtValue() & Bitmask(pair->bitwidth);
+                    if (auto condition = ComparedWith(*pair->expr, predicate, pair_k);
+                        condition != nullptr && ReadComparisonAsLine(cmp, *pair, *condition, pair_k, options, random))
+                    {
+                        changed = true;
+                    }
                     continue;
                 }
                 auto *leaf = reading->leaf_values.front();
@@ -4649,37 +4995,7 @@ namespace cobra {
                 const uint32_t bw   = reading->bitwidth;
                 const uint64_t mask = Bitmask(bw);
                 const uint64_t k    = constant->getValue().zextOrTrunc(64).getZExtValue() & mask;
-                auto condition      = [&]() -> std::unique_ptr< Expr > {
-                    auto value = CloneExpr(*reading->expr);
-                    auto other = Expr::Constant(k);
-                    const auto negate = [](std::unique_ptr< Expr > e) {
-                        return Expr::BitwiseXor(std::move(e), Expr::Constant(1));
-                    };
-                    switch (predicate) { // NOLINT(hicpp-multiway-paths-covered)
-                        case llvm::CmpInst::ICMP_EQ:
-                            return Expr::CmpEq(std::move(value), std::move(other));
-                        case llvm::CmpInst::ICMP_NE:
-                            return negate(Expr::CmpEq(std::move(value), std::move(other)));
-                        case llvm::CmpInst::ICMP_ULT:
-                            return Expr::CmpUlt(std::move(value), std::move(other));
-                        case llvm::CmpInst::ICMP_UGT:
-                            return Expr::CmpUlt(std::move(other), std::move(value));
-                        case llvm::CmpInst::ICMP_ULE:
-                            return negate(Expr::CmpUlt(std::move(other), std::move(value)));
-                        case llvm::CmpInst::ICMP_UGE:
-                            return negate(Expr::CmpUlt(std::move(value), std::move(other)));
-                        case llvm::CmpInst::ICMP_SLT:
-                            return Expr::CmpSlt(std::move(value), std::move(other));
-                        case llvm::CmpInst::ICMP_SGT:
-                            return Expr::CmpSlt(std::move(other), std::move(value));
-                        case llvm::CmpInst::ICMP_SLE:
-                            return negate(Expr::CmpSlt(std::move(other), std::move(value)));
-                        case llvm::CmpInst::ICMP_SGE:
-                            return negate(Expr::CmpSlt(std::move(value), std::move(other)));
-                        default:
-                            return nullptr;
-                    }
-                }();
+                auto condition      = ComparedWith(*reading->expr, predicate, k);
                 if (condition == nullptr) {
                     continue;
                 }
@@ -4707,7 +5023,96 @@ namespace cobra {
                 }
                 const uint32_t leaf_width = leaf->getType()->getIntegerBitWidth();
                 bool rewritten            = false;
+                // Over the products of the value first (`OverProducts`): a hash
+                // `m = x * P` tested through `x * -P` turns at `x == v * P^-1`
+                // for a `v` the tree over `m` holds, which no constant of the tree
+                // over `x` is, and the question over `m` holds no product. The
+                // comparison is then written over `m` where the tree computes it.
+                if (const auto products = ProductVariables(*condition, 1);
+                    !products.empty() && leaf_width == bw && bw <= 64)
+                {
+                    const uint64_t factor  = products.front().factor;
+                    const uint64_t inverse = OddInverse(factor, bw);
+                    const auto over        = OverProducts(*condition, products, bw);
+                    llvm::SmallVector< uint64_t, 16 > over_points;
+                    const auto offer_over = [&](uint64_t v) {
+                        v &= mask;
+                        if (over_points.size() < 16 && !llvm::is_contained(over_points, v)) {
+                            over_points.push_back(v);
+                        }
+                    };
+                    offer_over(k);
+                    offer_over(~k + 1);
+                    llvm::SmallVector< const Expr *, 32 > nodes{ over.get() };
+                    while (!nodes.empty()) {
+                        const Expr *node = nodes.pop_back_val();
+                        if (node->kind == Expr::Kind::kConstant) {
+                            offer_over(node->constant_val);
+                            offer_over(~node->constant_val + 1);
+                        }
+                        for (const auto &child : node->children) {
+                            nodes.push_back(child.get());
+                        }
+                    }
+                    // The product the tree already computes, when it does: its
+                    // poison is the comparison's, once its own flags are gone.
+                    llvm::Instruction *product = nullptr;
+                    for (auto *ti : reading->tree) {
+                        auto *mul = llvm::dyn_cast< llvm::BinaryOperator >(ti);
+                        if (mul == nullptr || mul->getOpcode() != llvm::Instruction::Mul) {
+                            continue;
+                        }
+                        for (unsigned side = 0; side < 2; ++side) {
+                            const auto *c = llvm::dyn_cast< llvm::ConstantInt >(mul->getOperand(1 - side));
+                            if (mul->getOperand(side) == leaf && c != nullptr
+                                && (c->getValue().zextOrTrunc(64).getZExtValue() & mask) == factor)
+                            {
+                                product = mul;
+                            }
+                        }
+                    }
+                    for (const uint64_t point : over_points) {
+                        for (const bool unequal : { false, true }) {
+                            auto test = Expr::CmpEq(Expr::Variable(0), Expr::Constant(point));
+                            if (unequal) {
+                                test = Expr::BitwiseXor(std::move(test), Expr::Constant(1));
+                            }
+                            const auto proof =
+                                VerifyExprsWithStrategy(*over, *test, reading->var_names, bw, options.z3_settings);
+                            if (!proof.equivalent || proof.unknown) {
+                                continue;
+                            }
+                            llvm::IRBuilder<> builder(cmp);
+                            llvm::Value *tested_value = leaf;
+                            uint64_t at               = (point * inverse) & mask;
+                            if (product != nullptr) {
+                                product->dropPoisonGeneratingFlags();
+                                tested_value = product;
+                                at           = point;
+                            }
+                            auto *replacement = builder.CreateICmp(
+                                unequal ? llvm::CmpInst::ICMP_NE : llvm::CmpInst::ICMP_EQ, tested_value,
+                                llvm::ConstantInt::get(leaf->getType(), at), "cobra.equality"
+                            );
+                            if (DetectDebug()) {
+                                llvm::errs() << "cobra: equality over a product " << *cmp << " -> " << *replacement
+                                             << "\n";
+                            }
+                            cmp->replaceAllUsesWith(replacement);
+                            replacement->takeName(cmp);
+                            llvm::RecursivelyDeleteTriviallyDeadInstructions(cmp);
+                            rewritten = changed = true;
+                            break;
+                        }
+                        if (rewritten) {
+                            break;
+                        }
+                    }
+                }
                 for (const uint64_t point : points) {
+                    if (rewritten) {
+                        break;
+                    }
                     if (leaf_width < 64 && (point >> leaf_width) != 0) {
                         continue;
                     }
@@ -4736,6 +5141,288 @@ namespace cobra {
                         break;
                     }
                 }
+            }
+            return changed;
+        }
+
+        // The fingerprint of the arms a `select` was last compared over
+        // (`ReadSelectsUnderTheirDemandedBits`), kept on the `select`.
+        constexpr const char *kArmsReadMD = "cobra.arms";
+
+        // The instructions of `cand`'s tree from `start` down, and the leaves
+        // they reach. A `select`'s arms are followed only `through_selects`:
+        // otherwise only its condition, whose poison is the `select`'s whatever
+        // it chooses. A `freeze` or a phi ends the walk.
+        void ConeOf(
+            const MBACandidate &cand, llvm::Value *start, bool through_selects,
+            llvm::SmallPtrSetImpl< llvm::Instruction * > &instructions, llvm::SmallPtrSetImpl< llvm::Value * > &leaves
+        ) {
+            const llvm::DenseSet< const llvm::Value * > tree(cand.tree.begin(), cand.tree.end());
+            const llvm::DenseSet< const llvm::Value * > leaf_set(cand.leaf_values.begin(), cand.leaf_values.end());
+            llvm::SmallPtrSet< llvm::Value *, 32 > seen;
+            llvm::SmallVector< llvm::Value *, 32 > pending{ start };
+            while (!pending.empty()) {
+                llvm::Value *value = pending.pop_back_val();
+                if (!seen.insert(value).second) {
+                    continue;
+                }
+                if (leaf_set.contains(value)) {
+                    leaves.insert(value);
+                    continue;
+                }
+                auto *inst = llvm::dyn_cast< llvm::Instruction >(value);
+                if (inst == nullptr || !tree.contains(inst)) {
+                    continue;
+                }
+                instructions.insert(inst);
+                if (llvm::isa< llvm::FreezeInst >(inst) || llvm::isa< llvm::PHINode >(inst)) {
+                    continue;
+                }
+                if (auto *inner = llvm::dyn_cast< llvm::SelectInst >(inst); inner != nullptr && !through_selects) {
+                    pending.push_back(inner->getCondition());
+                    continue;
+                }
+                for (llvm::Value *operand : inst->operands()) {
+                    pending.push_back(operand);
+                }
+            }
+        }
+
+        // Whether an instruction of an arm computes nothing undefined once its
+        // flags are gone: no division, no shift by an amount that may reach the
+        // width, no call. What is left of its poison is its operands'.
+        bool PoisonOnlyFromOperands(const llvm::Instruction &inst) {
+            if (llvm::isa< llvm::CastInst >(inst) || llvm::isa< llvm::CmpInst >(inst)
+                || llvm::isa< llvm::SelectInst >(inst) || llvm::isa< llvm::FreezeInst >(inst))
+            {
+                return true;
+            }
+            const auto *binary = llvm::dyn_cast< llvm::BinaryOperator >(&inst);
+            if (binary == nullptr || binary->isIntDivRem()) {
+                return false;
+            }
+            if (binary->isShift()) {
+                const auto *amount = llvm::dyn_cast< llvm::ConstantInt >(binary->getOperand(1));
+                return amount != nullptr && amount->getValue().ult(binary->getType()->getScalarSizeInBits());
+            }
+            return true;
+        }
+
+        // A `select` whose readers look at some of its bits only, when its arms
+        // agree on those bits, is either arm: `c ? a : b` and `b` then differ
+        // nowhere a reader looks. A 32-bit step held in 64 bits and masked after
+        // it reads this way when one arm is a rewrite of the other that agrees
+        // with it in the low half only - its condition then decides nothing.
+        //
+        // The bits are LLVM's `DemandedBits`, and the agreement is a proof that
+        // `(a ^ b) & demanded` is zero over every value of the leaves, asked of
+        // the tree over both arms, then of its shared cuts (where a value both
+        // arms read is one variable, which the change of variable needs), each
+        // with the products taken out when the solver has no answer. A random
+        // evaluation refutes most `select`s before any question is asked.
+        //
+        // The arm kept is read where the condition chose the other. So its
+        // leaves must never be `undef` (an arm reads its own copy of one), its
+        // instructions lose the flags that make them poison, and none of them
+        // may compute anything undefined of their own (`PoisonOnlyFromOperands`);
+        // each leaf it reads must be poison-free or poison the other arm
+        // whatever that arm chooses, so the arm kept is poison only where the
+        // `select` was.
+        bool ReadSelectsUnderTheirDemandedBits(
+            llvm::Function &f, const CobraPassOptions &options, uint64_t options_tag
+        ) {
+            if (!options.z3_verify) {
+                return false;
+            }
+            llvm::SmallVector< llvm::WeakVH, 32 > selects;
+            for (auto &inst : llvm::instructions(f)) {
+                if (auto *select = llvm::dyn_cast< llvm::SelectInst >(&inst); select != nullptr
+                    && select->getType()->isIntegerTy() && select->getType()->getIntegerBitWidth() <= 64
+                    && select->getType()->getIntegerBitWidth() > 1 && select->getTrueValue() != select->getFalseValue()
+                    && llvm::isa< llvm::Instruction >(select->getTrueValue())
+                    && llvm::isa< llvm::Instruction >(select->getFalseValue()))
+                {
+                    selects.emplace_back(select);
+                }
+            }
+            if (selects.empty()) {
+                return false;
+            }
+            const uint64_t tag = options_tag ^ 0x41524D5352454144ULL;
+            llvm::AssumptionCache assumptions(f);
+            llvm::DominatorTree dominators(f);
+            std::optional< llvm::DemandedBits > demanded;
+            llvm::SmallPtrSet< const llvm::Value *, 32 > never_undef;
+            std::mt19937_64 random(0x434F4252414D53ULL);
+            bool changed = false;
+            for (const llvm::WeakVH &handle : selects) {
+                auto *select = llvm::dyn_cast_or_null< llvm::SelectInst >(handle);
+                if (select == nullptr || select->use_empty() || !dominators.isReachableFromEntry(select->getParent())) {
+                    continue;
+                }
+                if (!demanded.has_value()) {
+                    demanded.emplace(f, assumptions, dominators);
+                }
+                const uint32_t bw   = select->getType()->getIntegerBitWidth();
+                const uint64_t mask = Bitmask(bw);
+                const uint64_t bits = demanded->getDemandedBits(select).getZExtValue() & mask;
+                if (bits == mask || bits == 0) {
+                    continue;
+                }
+                auto *on_true  = select->getTrueValue();
+                auto *on_false = select->getFalseValue();
+                llvm::Instruction *both = llvm::BinaryOperator::CreateXor(on_true, on_false, "cobra.arms", select);
+                auto candidates         = ExpandMbaCandidate(
+                    { both }, 1, options.max_vars, tag, options.cost_model, options.max_tree_nodes, {}
+                );
+                const MBACandidate *full = nullptr;
+                for (const auto &candidate : candidates) {
+                    if (candidate.root == both && candidate.node_limit == 0 && candidate.expr != nullptr) {
+                        full = &candidate;
+                        break;
+                    }
+                }
+                const auto discard = [&] {
+                    both->eraseFromParent();
+                    both = nullptr;
+                };
+                if (full == nullptr) {
+                    discard();
+                    continue;
+                }
+                // Asked once per tree and demanded bits.
+                const uint64_t key = EqualityReadKey(full->fingerprint, tag ^ bits);
+                if (auto *node = select->getMetadata(kArmsReadMD); node != nullptr && node->getNumOperands() == 1) {
+                    if (auto *seen = llvm::mdconst::dyn_extract< llvm::ConstantInt >(node->getOperand(0));
+                        seen != nullptr && seen->getZExtValue() == key)
+                    {
+                        discard();
+                        continue;
+                    }
+                }
+                select->setMetadata(
+                    kArmsReadMD,
+                    llvm::MDNode::get(
+                        select->getContext(),
+                        { llvm::ConstantAsMetadata::get(
+                            llvm::ConstantInt::get(llvm::Type::getInt64Ty(select->getContext()), key)
+                        ) }
+                    )
+                );
+                // What both arms read, held whole where neither arm reads past
+                // it on its own: the arms agree as functions of it, and a value
+                // both multiply is one variable the change of variable can take.
+                llvm::SmallPtrSet< llvm::Instruction *, 32 > true_insts;
+                llvm::SmallPtrSet< llvm::Instruction *, 32 > false_insts;
+                llvm::SmallPtrSet< llvm::Value *, 16 > unused_leaves;
+                ConeOf(*full, on_true, /*through_selects=*/true, true_insts, unused_leaves);
+                ConeOf(*full, on_false, /*through_selects=*/true, false_insts, unused_leaves);
+                llvm::SmallVector< const llvm::Value *, 8 > common;
+                for (llvm::Instruction *inst : true_insts) {
+                    if (!false_insts.contains(inst)) {
+                        continue;
+                    }
+                    const bool outermost = llvm::none_of(inst->users(), [&](const llvm::User *user) {
+                        const auto *reader = llvm::dyn_cast< llvm::Instruction >(user);
+                        return reader != nullptr && true_insts.contains(reader) && false_insts.contains(reader);
+                    });
+                    if (outermost) {
+                        common.push_back(inst);
+                    }
+                }
+                std::vector< MBACandidate > common_cut;
+                if (!common.empty()) {
+                    common_cut = CutMbaCandidate(
+                        both, common, 1, options.max_vars, tag, options.cost_model, options.max_tree_nodes
+                    );
+                }
+                std::vector< MBACandidate > cuts = SharedCutMbaCandidate(
+                    *full, 1, options.max_vars, options.max_shared_cuts, tag, options.cost_model,
+                    options.max_tree_nodes, {}
+                );
+                llvm::SmallVector< const MBACandidate *, 8 > readings{ full };
+                for (const auto *source : { &common_cut, &cuts }) {
+                    for (const auto &cut : *source) {
+                        if (cut.root == both && cut.expr != nullptr) {
+                            readings.push_back(&cut);
+                        }
+                    }
+                }
+                const MBACandidate *proved = nullptr;
+                for (const MBACandidate *reading : readings) {
+                    if (!llvm::all_of(reading->leaf_values, [&](const llvm::Value *leaf) {
+                            return NeverUndef(leaf, never_undef);
+                        }))
+                    {
+                        continue;
+                    }
+                    bool refuted = false;
+                    std::vector< uint64_t > values(reading->var_names.size());
+                    for (int probe = 0; probe < 32 && !refuted; ++probe) {
+                        for (auto &value : values) {
+                            value = random() & mask;
+                        }
+                        refuted = (EvalExpr(*reading->expr, values, bw) & bits) != 0;
+                    }
+                    if (refuted) {
+                        // Every cut reads more values as free than the whole tree:
+                        // what the tree over the true leaves refutes, they do too.
+                        if (reading == full) {
+                            break;
+                        }
+                        continue;
+                    }
+                    const auto masked = Expr::BitwiseAnd(CloneExpr(*reading->expr), Expr::Constant(bits));
+                    if (ProvedEqual(*masked, *Expr::Constant(0), reading->var_names, bw, options)) {
+                        proved = reading;
+                        break;
+                    }
+                }
+                if (proved == nullptr) {
+                    discard();
+                    continue;
+                }
+                // Which arm to keep: the one whose companion takes more with it.
+                discard();
+                const auto dying = [&](llvm::Value *arm) {
+                    llvm::SmallPtrSet< llvm::Instruction *, 16 > dead{ select };
+                    CollectDead(arm, dead);
+                    return dead.size();
+                };
+                const bool keep_true = dying(on_false) > dying(on_true);
+                llvm::Value *keep    = keep_true ? on_true : on_false;
+                llvm::Value *other   = keep_true ? on_false : on_true;
+                llvm::SmallPtrSet< llvm::Instruction *, 32 > keep_insts;
+                llvm::SmallPtrSet< llvm::Value *, 16 > keep_leaves;
+                ConeOf(*proved, keep, /*through_selects=*/true, keep_insts, keep_leaves);
+                llvm::SmallPtrSet< llvm::Instruction *, 32 > other_insts;
+                llvm::SmallPtrSet< llvm::Value *, 16 > other_leaves;
+                ConeOf(*proved, other, /*through_selects=*/false, other_insts, other_leaves);
+                const bool defined_ops = llvm::all_of(keep_insts, [](const llvm::Instruction *inst) {
+                    return PoisonOnlyFromOperands(*inst);
+                });
+                const bool covered = llvm::all_of(keep_leaves, [&](llvm::Value *leaf) {
+                    return other_leaves.contains(leaf) || llvm::isGuaranteedNotToBePoison(leaf);
+                });
+                if (!defined_ops || !covered) {
+                    continue;
+                }
+                for (llvm::Instruction *inst : keep_insts) {
+                    inst->dropPoisonGeneratingFlags();
+                    inst->dropPoisonGeneratingMetadata();
+                }
+                if (DetectDebug()) {
+                    llvm::errs() << "cobra: arms agree on the bits read " << *select << " (demanded 0x"
+                                 << llvm::utohexstr(bits) << ", kept the " << (keep_true ? "true" : "false")
+                                 << " arm)\n";
+                }
+                select->replaceAllUsesWith(keep);
+                select->eraseFromParent();
+                llvm::RecursivelyDeleteTriviallyDeadInstructions(other, nullptr, nullptr, [&](llvm::Value *gone) {
+                    never_undef.erase(gone);
+                });
+                demanded.reset();
+                changed = true;
             }
             return changed;
         }
@@ -6039,8 +6726,13 @@ namespace cobra {
         }
 
 #ifdef COBRA_HAS_Z3
-        // Last, over what the rewrites above left: the comparisons that test a
-        // tree over one value for equality in disguise. Every bit of the tested
+        // Over what the rewrites above left: a `select` whose arms agree on the
+        // bits its readers read is either arm.
+        if (ReadSelectsUnderTheirDemandedBits(f, options_, options_tag)) {
+            changed = true;
+        }
+        // Last: the comparisons that test a tree over one value for equality
+        // in disguise. Every bit of the tested
         // value is taken as read - the demanded bits were taken before the
         // rewrites.
         if (ReadComparisonsAsEqualities(f, options_, options_tag, {})) {
