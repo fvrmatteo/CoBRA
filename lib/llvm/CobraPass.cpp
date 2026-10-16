@@ -1065,6 +1065,7 @@ namespace cobra {
             key += options.z3_settings.sweep ? ",s," : ",,";
             key += std::to_string(static_cast< uint64_t >(options.enabled_families));
             key += options.boolean_variables ? "|b" : "|";
+            key += options.read_conditions ? "c" : "";
             // The boolean cut is searched by the boolean reading alone, so its
             // verdict is not the one an identical tree read the ordinary way has.
             key += cand.node_limit == kBooleanCutLimit ? "B" : "";
@@ -1349,6 +1350,7 @@ namespace cobra {
             tag = mix(tag, StableHash(options.z3_settings.llvm_passes));
             tag = mix(tag, static_cast< uint64_t >(options.leaf_freezing));
             tag = mix(tag, options.boolean_variables ? 1 : 0);
+            tag = mix(tag, options.read_conditions ? 1 : 0);
             // What the records mean changes with the pass itself as well as
             // with its settings: a host that keeps `!cobra.mba` on IR it saves
             // and loads again must not read a verdict an older build wrote
@@ -5471,7 +5473,7 @@ namespace cobra {
         const auto detect_begin = std::chrono::steady_clock::now();
         auto candidates = DetectMbaCandidates(
             f, options_.min_ast_size, options_.max_vars, options_tag, options_.cost_model,
-            options_.max_tree_nodes, demanded
+            options_.max_tree_nodes, demanded, options_.read_conditions
         );
         stats.detect_nanoseconds += since(detect_begin);
         stats.detected = candidates.size();
@@ -6609,6 +6611,26 @@ namespace cobra {
                     }
                 }
             }
+            // A condition root (`read_conditions`) was read as the 0 or 1 its
+            // comparison yields, at the width of what it compares, and proved on
+            // that one bit. What goes back is a condition again: the comparison
+            // the expression ends in where it ends in one, and the bit itself
+            // otherwise.
+            llvm::Instruction *widened = nullptr;
+            if (cand.root->getType()->isIntegerTy(1) && !new_val->getType()->isIntegerTy(1)) {
+                llvm::IRBuilder<> rebuild(cand.root);
+                llvm::Value *bit = nullptr;
+                if (auto *cast = llvm::dyn_cast< llvm::CastInst >(new_val);
+                    cast != nullptr
+                    && (cast->getOpcode() == llvm::Instruction::ZExt
+                        || cast->getOpcode() == llvm::Instruction::SExt)
+                    && cast->getOperand(0)->getType()->isIntegerTy(1))
+                {
+                    bit     = cast->getOperand(0);
+                    widened = cast;
+                }
+                new_val = bit != nullptr ? bit : rebuild.CreateTrunc(new_val, cand.root->getType());
+            }
             // Proved on the demanded bits only: the root's readers whose flags
             // read the rest must lose them (see `DropAssumptionsOfReaders`).
             llvm::SmallVector< llvm::Instruction *, 8 > root_readers;
@@ -6621,6 +6643,13 @@ namespace cobra {
             }
             cand.root->replaceAllUsesWith(new_val);
             replaced_roots.insert(cand.root);
+            // The condition came out of a widening the rewrite built only to
+            // hold it; with the condition itself taken out of it, nobody reads
+            // it. Left behind it would be the one instruction of the rewrite
+            // that computes nothing.
+            if (widened != nullptr && widened->use_empty()) {
+                widened->eraseFromParent();
+            }
             // What the oracle knew described the function before the
             // replacement; the walk below asks about the readers after it.
             demanded_bits.Invalidate();

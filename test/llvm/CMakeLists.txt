@@ -22,7 +22,9 @@ message(STATUS "LLVM pass tests: opt=${OPT_BIN} FileCheck=${FILECHECK_BIN}")
 # `test_*_verified_boolean.ll` reads a tree's conditions as variables, with every
 # rewrite proved by the solver (`cobra-simplify<verified;boolean>`); one named
 # `test_*_unverified_boolean.ll` asks for that reading without the solver, which
-# must then change nothing (`cobra-simplify<boolean>`).
+# must then change nothing (`cobra-simplify<boolean>`). One named
+# `test_*_verified_conditions.ll` roots at the conditions nothing but a branch
+# reads, each rewrite proved (`cobra-simplify<verified;conditions>`).
 #
 # A test may also add pass parameters of its own, next to the test itself:
 #
@@ -55,6 +57,11 @@ function(cobra_add_ll_test TEST_FILE)
         set(PARAMS "verified|boolean")
     elseif(TEST_NAME MATCHES "_unverified_boolean$")
         set(PARAMS "boolean")
+    elseif(TEST_NAME MATCHES "_verified_conditions$")
+        if(NOT COBRA_VERIFY_BACKEND)
+            return()
+        endif()
+        set(PARAMS "verified|conditions")
     elseif(TEST_NAME MATCHES "_verified$")
         if(NOT COBRA_VERIFY_BACKEND)
             return()

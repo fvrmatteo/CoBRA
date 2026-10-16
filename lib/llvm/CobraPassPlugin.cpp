@@ -42,6 +42,7 @@ namespace {
     //   verified                 z3_verify
     //   sweep                    z3_settings.sweep
     //   boolean                  boolean_variables
+    //   conditions               read_conditions
     //   dying-cost               cost_model = kDyingInstructions
     //   skip-loop-carried-phis   skip_loop_carried_phis
     //   across-freeze            leaf_freezing = kAcrossFreeze
@@ -53,7 +54,8 @@ namespace {
     //   timeout=<ms>  rewrite-level=<n>  max-vars=<n>  min-ast-size=<n>
     //   max-tree-nodes=<n>  max-shared-cuts=<n>  max-recut-nodes=<n>  max-recut-vars=<n>
     //
-    // `verified-sweep` and `verified-boolean` stand for the two together. A test
+    // `verified-sweep`, `verified-boolean` and `verified-conditions` stand for
+    // the two together. A test
     // that is about what the search cannot do pins `families`, or it passes
     // because a family the consumer never enables answered; one about a rewrite
     // that needs a proof pins `timeout`, or how fast the machine happened to be
@@ -75,6 +77,11 @@ namespace {
                     options.z3_settings.sweep = true;
                 } else if (name == "boolean") {
                     options.boolean_variables = true;
+                } else if (name == "conditions") {
+                    options.read_conditions = true;
+                } else if (name == "verified-conditions") {
+                    options.z3_verify       = true;
+                    options.read_conditions = true;
                 } else if (name == "verified-boolean") {
                     options.z3_verify         = true;
                     options.boolean_variables = true;

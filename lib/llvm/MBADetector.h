@@ -310,10 +310,14 @@ namespace cobra {
     //
     // `demanded`, when given, says which bits of a root its readers look at;
     // the candidate carries the answer and its fingerprint is taken under it.
+    //
+    // `read_conditions` (`CobraPassOptions::read_conditions`) also takes as a
+    // root a comparison nothing but a terminator reads: it is the top of its own
+    // tree, read at the width of its operands and on its one bit.
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
         MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,
-        const DemandedMaskFn &demanded = {}
+        const DemandedMaskFn &demanded = {}, bool read_conditions = false
     );
 
     // Candidates for `inner_roots`, to be used once the tree enclosing them has

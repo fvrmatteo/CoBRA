@@ -549,6 +549,40 @@ namespace cobra {
             return ty->isIntegerTy() && ty->getIntegerBitWidth() == bw;
         }
 
+        // A comparison that is the top of its own tree
+        // (`CobraPassOptions::read_conditions`): nothing wider reads it, so no
+        // root covers the arithmetic it compares unless it is one itself. It is
+        // rooted at the width of its operands, where its value is the 0 or 1 it
+        // yields, as a comparison inside a tree already is.
+        //
+        // A reader that is another comparison, a `select` or any integer value
+        // is a tree of its own and reads this one as part of it, which is the
+        // better root: the condition is taken only when every reader is a
+        // terminator. A `select` is left out for that reason and not for want of
+        // a reading.
+        const llvm::ICmpInst *ConditionRootOf(const llvm::Instruction *inst) {
+            const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst);
+            if (cmp == nullptr || !IsSupportedPredicate(cmp->getPredicate())) {
+                return nullptr;
+            }
+            auto *operand = cmp->getOperand(0)->getType();
+            if (!operand->isIntegerTy() || operand->getIntegerBitWidth() > 64
+                || operand->getIntegerBitWidth() == 0)
+            {
+                return nullptr;
+            }
+            if (cmp->use_empty()) {
+                return nullptr;
+            }
+            for (const llvm::User *user : cmp->users()) {
+                const auto *reader = llvm::dyn_cast< llvm::Instruction >(user);
+                if (reader == nullptr || !reader->isTerminator()) {
+                    return nullptr;
+                }
+            }
+            return cmp;
+        }
+
         // A value wider than the tree normally has no reading at the tree's
         // width and stays a leaf. A logical shift by a constant is the one
         // exception worth making.
@@ -2869,6 +2903,9 @@ namespace cobra {
 
                 const auto *gep   = ByteGepOf(&inst);
                 const bool ptradd = gep != nullptr;
+                // A condition the caller rooted at (`ConditionRootOf`): it is
+                // one bit wide, and read at the width of what it compares.
+                const auto *condition = llvm::dyn_cast< llvm::ICmpInst >(&inst);
                 if (!ptradd && !inst.getType()->isIntegerTy()) {
                     DeclinedRoot(inst, "not an integer", 0, 0);
                     continue;
@@ -2876,14 +2913,19 @@ namespace cobra {
                 // A slice reads the root at the width the caller proved it to
                 // be an extension of, not at the width of its type.
                 const uint32_t bw = slice != nullptr ? slice->width
-                    : ptradd ? gep->getOperand(1)->getType()->getIntegerBitWidth()
-                             : inst.getType()->getIntegerBitWidth();
+                    : ptradd    ? gep->getOperand(1)->getType()->getIntegerBitWidth()
+                    : condition ? condition->getOperand(0)->getType()->getIntegerBitWidth()
+                                : inst.getType()->getIntegerBitWidth();
                 if (bw > 64 || bw == 0) {
                     continue;
                 }
                 // A `ptradd`'s readers are pointers: every bit of the index is
-                // live, so there is no narrower mask to read it under.
-                const uint64_t demanded_mask = (!ptradd && demanded)
+                // live, so there is no narrower mask to read it under. A
+                // condition's readers read the answer, which is its lowest bit
+                // and nothing else - the bits above it are not the tree's to
+                // agree on, they are zero because a comparison yields 0 or 1.
+                const uint64_t demanded_mask = condition != nullptr ? uint64_t{ 1 }
+                    : (!ptradd && demanded)
                     ? CandidateDemand(
                           demanded(&inst), bw,
                           slice != nullptr ? slice->extension : SliceExtension::kNone,
@@ -3201,7 +3243,8 @@ namespace cobra {
 
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
-        MbaCostModel cost_model, uint32_t max_tree_nodes, const DemandedMaskFn &demanded
+        MbaCostModel cost_model, uint32_t max_tree_nodes, const DemandedMaskFn &demanded,
+        bool read_conditions
     ) {
         // Post-order: process uses before defs across blocks. Within each block,
         // reverse iteration hits outermost roots first, so the largest MBA tree
@@ -3209,7 +3252,9 @@ namespace cobra {
         std::vector< llvm::Instruction * > roots;
         for (auto *bb : post_order(&f)) {
             for (auto &inst : llvm::reverse(*bb)) {
-                if (IsMbaRoot(&inst)) {
+                if (IsMbaRoot(&inst)
+                    || (read_conditions && ConditionRootOf(&inst) != nullptr))
+                {
                     roots.push_back(&inst);
                 }
             }

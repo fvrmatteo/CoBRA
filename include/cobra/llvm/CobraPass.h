@@ -136,6 +136,31 @@ namespace cobra {
         // Off by default.
         bool boolean_variables = false;
 
+        // Read a condition nothing but a branch looks at as a root of its own.
+        //
+        // The pass rewrites integer-valued roots: a condition is `i1`, worth
+        // following into a wider tree but never a candidate itself, because
+        // rewriting a value one bit wide into another says nothing. That holds
+        // only while something wider reads it. A comparison whose readers are
+        // branches is the top of its own tree, and the arithmetic under it -
+        // the obfuscator's, with the comparison its last step - is then read by
+        // nobody: a rotate of a sign-extended condition, a sum tested against a
+        // constant, a product whose top bit a jump looks at. The tree is there
+        // and the search can answer it; what is missing is a root.
+        //
+        // Such a comparison is rooted at the width of its operands, where its
+        // value is the 0 or 1 the comparison yields, and only that bit is read
+        // (`demanded_mask` of 1): what the rewrite has to agree on is the answer,
+        // not a word. A rewrite is written back as a condition again - the
+        // comparison the expression ends in, or the bit itself - so the branch
+        // reads what it always read, one bit, computed by less.
+        //
+        // The reading costs what it adds: a comparison per branch is a root per
+        // branch, and a function of nothing but tests pays for a tree at each
+        // one. It is off by default, for a consumer that reads its output rather
+        // than its speed.
+        bool read_conditions = false;
+
         // Hold a turned-down root's fingerprint until every slice, sum group
         // and cut queued from it has decided.
         //
