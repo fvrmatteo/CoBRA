@@ -375,6 +375,25 @@ namespace cobra {
             }
         }
 
+        // An absolute value, which is the `select` over a sign test it stands for:
+        // `abs(x) = x <s 0 ? 0 - x : x`, written in the operators a minimum or
+        // maximum is. A protector spells a multiplication by a constant as the
+        // product of the magnitude with the sign put back
+        // (`x <s 0 ? -(abs(x) * k) : abs(x) * k`, which is `x * k`), and left as a
+        // leaf the magnitude is a variable apart from the `x` the sign test
+        // reads, so the identity cannot be seen. The minimum's `INT_MIN` is
+        // `0 - INT_MIN`, which is what the operators compute; the form that makes
+        // it poison is refined to that value, which a rewrite may do.
+        const llvm::IntrinsicInst *AbsOf(const llvm::Value *v) {
+            const auto *intrinsic = llvm::dyn_cast< llvm::IntrinsicInst >(v);
+            if (intrinsic == nullptr || intrinsic->getIntrinsicID() != llvm::Intrinsic::abs
+                || !intrinsic->getType()->isIntegerTy())
+            {
+                return nullptr;
+            }
+            return intrinsic;
+        }
+
         // A saturating addition or subtraction, which is the wrapped result or
         // the bound it clamps to, chosen by its overflow test - a `select` over
         // a comparison, which the model already writes, as it does for a
@@ -428,7 +447,7 @@ namespace cobra {
 
         bool IsMbaInstruction(const llvm::Instruction *inst) {
             return IsMbaOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
-                || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr
+                || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr || AbsOf(inst) != nullptr
                 || SaturatingOf(inst) != nullptr || IsTransparentFreeze(inst)
                 || ByteGepOf(inst) != nullptr;
         }
@@ -463,7 +482,7 @@ namespace cobra {
 
         bool IsMbaRoot(const llvm::Instruction *inst) {
             return IsMbaRootOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
-                || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr
+                || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr || AbsOf(inst) != nullptr
                 || SaturatingOf(inst) != nullptr || IsPtrAddChain(inst);
         }
 
@@ -765,6 +784,12 @@ namespace cobra {
                 return minmax->getType()->getIntegerBitWidth() == bw;
             }
 
+            // An absolute value tests the sign bit of its own width: exact at the
+            // width the tree is evaluated at, as a minimum or maximum is.
+            if (const auto *abs = AbsOf(inst)) {
+                return abs->getType()->getIntegerBitWidth() == bw;
+            }
+
             // A saturating operation overflows at its own width, and a signed
             // one reads the sign bit there: exact at the width the tree is
             // evaluated at, and only there, as a minimum or maximum is.
@@ -1064,6 +1089,13 @@ namespace cobra {
                     if (const auto *minmax = MinMaxOf(inst)) {
                         work.push({ minmax->getArgOperand(0), from_bitwise });
                         work.push({ minmax->getArgOperand(1), from_bitwise });
+                        continue;
+                    }
+                    // An absolute value negates its operand on one arm, which
+                    // reads it the way a subtraction does. The poison flag is
+                    // not a value to follow.
+                    if (const auto *abs = AbsOf(inst)) {
+                        work.push({ abs->getArgOperand(0), false });
                         continue;
                     }
                     // A saturating operation adds or subtracts its operands
@@ -1536,6 +1568,15 @@ namespace cobra {
                             break;
                     }
                     return Emit(Op::kMask, Emit3(Op::kSelect, cond, a, b), 0);
+                }
+
+                // An absolute value as the choice it is: the negation on the sign
+                // test, `x <s 0 ? 0 - x : x`.
+                if (const auto *abs = AbsOf(inst)) {
+                    const uint32_t a        = Emit(Op::kMask, lower(abs->getArgOperand(0)), 0);
+                    const uint32_t negative = Emit(Op::kCmpSlt, a, kZeroSlot);
+                    const uint32_t negated  = Emit(Op::kMask, Emit(Op::kSub, kZeroSlot, a), 0);
+                    return Emit(Op::kMask, Emit3(Op::kSelect, negative, negated, a), 0);
                 }
 
                 // A saturating operation as the choice it is: the wrapped
@@ -2161,6 +2202,33 @@ namespace cobra {
                 auto diff   = Expr::BitwiseXor(std::move(a), std::move(b_again));
                 auto masked = Expr::BitwiseAnd(std::move(diff), Expr::Negate(std::move(cond)));
                 return Expr::BitwiseXor(std::move(b), std::move(masked));
+            }
+
+            // An absolute value: `x <s 0 ? 0 - x : x`, written the way the
+            // minimum's `select` is.
+            if (const auto *abs = AbsOf(inst)) {
+                auto a = BuildExprFromIRImpl(
+                    abs->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget,
+                    leaf_bits
+                );
+                if (a == nullptr) {
+                    return nullptr;
+                }
+                auto tested  = ChargedClone(*a, budget);
+                auto negated = tested != nullptr ? ChargedClone(*a, budget) : nullptr;
+                auto kept    = negated != nullptr ? ChargedClone(*a, budget) : nullptr;
+                if (kept == nullptr) {
+                    return nullptr;
+                }
+                auto cond = BuildComparison(llvm::CmpInst::ICMP_SLT, std::move(tested), Expr::Constant(0));
+                if (cond == nullptr) {
+                    return nullptr;
+                }
+                negated = Expr::Negate(std::move(negated));
+                // `select(c, A, B) == B ^ ((A ^ B) & -c)`, as above.
+                auto diff   = Expr::BitwiseXor(std::move(negated), std::move(kept));
+                auto masked = Expr::BitwiseAnd(std::move(diff), Expr::Negate(std::move(cond)));
+                return Expr::BitwiseXor(std::move(a), std::move(masked));
             }
 
             // A saturating operation: the wrapped result, and the bound it is
