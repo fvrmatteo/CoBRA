@@ -3875,6 +3875,77 @@ namespace cobra {
             return changed;
         }
 
+        // An extension of a bitwise operation of a narrow value and a constant,
+        // where the same extension of the value itself is already computed:
+        // `sext(b ^ k)` is `sext(b) ^ sext(k)`, and likewise for `and` and `or`,
+        // and for `zext` with the zero extension of the constant - an extension
+        // copies a bit into the bits above it, and a bitwise operation does the
+        // same to every bit. Written over the extension the function already
+        // holds, the tree reads one leaf where it read two: `sext(b)` and
+        // `sext(~b)` are independent variables to the search, and no rewrite of
+        // the tree holds for every pair of them.
+        //
+        // Only over an extension that dominates the one rewritten, so nothing is
+        // computed that was not; the rewrite trades an extension for the bitwise
+        // operation it had under it.
+        bool WidenExtendedBitwise(llvm::Function &f) {
+            bool changed = false;
+            llvm::DominatorTree dominators(f);
+            for (auto &block : f) {
+                for (auto it = block.begin(); it != block.end();) {
+                    auto *ext = llvm::dyn_cast< llvm::CastInst >(&*it++);
+                    if (ext == nullptr
+                        || (ext->getOpcode() != llvm::Instruction::SExt
+                            && ext->getOpcode() != llvm::Instruction::ZExt))
+                    {
+                        continue;
+                    }
+                    auto *op = llvm::dyn_cast< llvm::BinaryOperator >(ext->getOperand(0));
+                    if (op == nullptr || !op->hasOneUse()
+                        || (op->getOpcode() != llvm::Instruction::Xor
+                            && op->getOpcode() != llvm::Instruction::And
+                            && op->getOpcode() != llvm::Instruction::Or))
+                    {
+                        continue;
+                    }
+                    auto *constant = llvm::dyn_cast< llvm::ConstantInt >(op->getOperand(1));
+                    llvm::Value *narrow = op->getOperand(0);
+                    if (constant == nullptr) {
+                        constant = llvm::dyn_cast< llvm::ConstantInt >(op->getOperand(0));
+                        narrow   = op->getOperand(1);
+                    }
+                    if (constant == nullptr) {
+                        continue;
+                    }
+                    llvm::Instruction *existing = nullptr;
+                    for (auto *user : narrow->users()) {
+                        auto *other = llvm::dyn_cast< llvm::CastInst >(user);
+                        if (other != nullptr && other != ext && other->getOpcode() == ext->getOpcode()
+                            && other->getType() == ext->getType() && dominators.dominates(other, ext))
+                        {
+                            existing = other;
+                            break;
+                        }
+                    }
+                    if (existing == nullptr) {
+                        continue;
+                    }
+                    const llvm::APInt wide = ext->getOpcode() == llvm::Instruction::SExt
+                        ? constant->getValue().sext(ext->getType()->getIntegerBitWidth())
+                        : constant->getValue().zext(ext->getType()->getIntegerBitWidth());
+                    llvm::IRBuilder<> builder(ext);
+                    auto *rebuilt = builder.CreateBinOp(
+                        op->getOpcode(), existing, llvm::ConstantInt::get(ext->getType(), wide), "cobra.widened"
+                    );
+                    ext->replaceAllUsesWith(rebuilt);
+                    rebuilt->takeName(ext);
+                    llvm::RecursivelyDeleteTriviallyDeadInstructions(ext);
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
     } // namespace
 
     llvm::PreservedAnalyses
@@ -3900,7 +3971,7 @@ namespace cobra {
         const uint64_t options_tag = OptionsTag(options_);
 
         // Before anything reads the function: the rewrite changes no block.
-        if (HoistConstantFactors(f)) {
+        if (WidenExtendedBitwise(f) | HoistConstantFactors(f)) {
             changed = true;
             llvm::PreservedAnalyses kept;
             kept.preserveSet< llvm::CFGAnalyses >();
