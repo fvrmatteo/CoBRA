@@ -4704,6 +4704,33 @@ namespace cobra {
             }
         }
 
+        // Where `a - b` is zero - `b` the constant `k` when it is null - when the
+        // difference is affine in the one value with an odd slope: interpolated
+        // from its values at 0 and 1, and checked at a few more. An equality a
+        // protector disguises is often linear in what it tests - `(h ^ c) + 1 ==
+        // -2 * (h & c)` is `h + c + 1 == 0` - and turns where none of its
+        // constants is. It is only a point to ask about: the solver decides.
+        std::optional< uint64_t > AffineZero(const Expr &a, const Expr *b, uint64_t k, uint32_t bw) {
+            const uint64_t mask = Bitmask(bw);
+            std::vector< uint64_t > values(1);
+            const auto difference = [&](uint64_t x) {
+                values[0]            = x & mask;
+                const uint64_t right = b != nullptr ? EvalExpr(*b, values, bw) : k;
+                return (EvalExpr(a, values, bw) - right) & mask;
+            };
+            const uint64_t c0 = difference(0);
+            const uint64_t c1 = (difference(1) - c0) & mask;
+            if ((c1 & 1) == 0) {
+                return std::nullopt;
+            }
+            for (const uint64_t x : { uint64_t{ 2 }, uint64_t{ 0x5DEECE66DULL }, mask, mask >> 1 }) {
+                if (difference(x) != ((c0 + c1 * x) & mask)) {
+                    return std::nullopt;
+                }
+            }
+            return ((~c0 + 1) * OddInverse(c1, bw)) & mask;
+        }
+
         // A comparison of a tree over two values with a constant, true exactly on
         // one line of them - `a - b == p` or `a + b == p` - is that equality.
         // `f - l == 32` is tested as `(f - l - 32) | ((l + 32) - f)` with `f - l`
@@ -4838,7 +4865,9 @@ namespace cobra {
         // The value the test turns at cannot be found by probing - an equality
         // turns at one input of the whole range - and is not searched for either:
         // it is one of the constants the tree is built from, or its negation, or
-        // the constant compared with. Each is asked of the solver, as an
+        // the constant compared with, or where the tested value meets the one it is
+        // compared with when their difference is affine in `x` (`AffineZero`). Each
+        // is asked of the solver, as an
         // equivalence of the comparison with `x == v` (and `x != v`) over every
         // value of `x`, and the comparison is rewritten only on that proof. A tree
         // over more than one value is read again with what it reads more than once
@@ -4861,8 +4890,9 @@ namespace cobra {
                 return false;
             }
             // A reading of its own, so that a root the search already turned down
-            // is collected again.
-            const uint64_t tag = options_tag ^ 0x45514C5245414447ULL;
+            // is collected again - and one of its own since the affine turning
+            // point, so that a comparison read before it is read again.
+            const uint64_t tag = options_tag ^ 0x45514C5245414448ULL;
             llvm::DominatorTree dominators(f);
             std::mt19937_64 random(0x4C494E4553ULL);
             bool changed = false;
@@ -5010,6 +5040,19 @@ namespace cobra {
                         points.push_back(v);
                     }
                 };
+                // Two trees compared are read as their exclusive or: what meets is its
+                // operands.
+                const Expr *left  = reading->expr.get();
+                const Expr *right = nullptr;
+                if (difference != nullptr && left->kind == Expr::Kind::kXor && left->children.size() == 2) {
+                    right = left->children[1].get();
+                    left  = left->children[0].get();
+                }
+                if (difference == nullptr || right != nullptr) {
+                    if (const auto zero = AffineZero(*left, right, k, bw)) {
+                        offer(*zero);
+                    }
+                }
                 offer(k);
                 offer(~k + 1);
                 for (const auto *ti : reading->tree) {
