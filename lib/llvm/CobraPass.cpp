@@ -3063,6 +3063,45 @@ namespace cobra {
                 .boolean_reading    = proposal.boolean_reading });
         }
 
+        // `VerifyCandidate`, and when the rewrite it was asked about came from the
+        // reading of the tree's conditions and the solver did not prove it, the
+        // ordinary reading of the same tree, proposed and proved in its place.
+        //
+        // A tree that compares is read with its conditions as variables first
+        // (`ProposeRewriteAsRead`), and when that reading answers the ordinary
+        // search is never asked. The answer is the right one, but it is proved
+        // with the conditions put back over the values they compare, which can be
+        // far harder for the solver than the same rewrite found by the ordinary
+        // search: a step `x <s 0 ? -(-x * k) : x * k` masked to 32 bits read
+        // either way is `x * k`, and the proof of the reading's rewrite outlived
+        // five seconds where the ordinary one is immediate. An unproved answer was
+        // the candidate's last word, and the tree stayed as written. The ordinary
+        // rewrite is proved as any other is; nothing is taken without its proof.
+        //
+        // Returns the proved rewrite - the one asked about, or the ordinary one,
+        // whose `boolean_reading` says which - or null. `unknown` is the first
+        // proof's: an unfinished proof of the reading is not turned into a
+        // refutation by a refuted ordinary rewrite.
+        OutcomeCache::Entry VerifyCandidateOrOrdinary(
+            const MBACandidate &cand, const CandidateOutcome &proposal,
+            const CobraPassOptions &options, CobraStatistics &stats, bool *unknown = nullptr
+        ) {
+            auto verified = VerifyCandidate(cand, proposal, options, stats, unknown);
+            if (verified != nullptr || !proposal.boolean_reading || cand.node_limit == kBooleanCutLimit) {
+                return verified;
+            }
+            auto verdict  = SolveVerdict::kUnsolved;
+            auto ordinary = ProposeOrdinaryRewrite(cand, options, verdict, stats);
+            if (ordinary == nullptr || ordinary->boolean_reading) {
+                return nullptr;
+            }
+            auto proved = VerifyCandidate(cand, *ordinary, options, stats);
+            if (proved != nullptr && unknown != nullptr) {
+                *unknown = false;
+            }
+            return proved;
+        }
+
         // The width at which `cand`'s root can be read as a narrower problem,
         // with how the root is recovered from those bits - or nothing, when it
         // cannot.
@@ -3642,7 +3681,7 @@ namespace cobra {
                         bool unknown  = false;
                         const auto verify_begin = std::chrono::steady_clock::now();
                         const uint64_t cpu_begin = ThreadCpuNanoseconds();
-                        auto verified = VerifyCandidate(
+                        auto verified = VerifyCandidateOrOrdinary(
                             task.input, *proposal, task.options, stats, &unknown
                         );
                         // A proof the solver could not finish is not a refutation:
@@ -3803,8 +3842,11 @@ namespace cobra {
             // root whose ladder holds such a rung keeps no fingerprint under
             // `retry_undecided_roots`, so the next run collects it again.
             bool left_for_later = false;
+            // Set when the candidate is taken again at once (`VerifyCandidateOrOrdinary`):
+            // the pass that builds the rewrite finishes it.
+            bool taken_again = false;
             const auto finished = llvm::make_scope_exit([&] {
-                if (!options_.retry_undecided_roots) {
+                if (!options_.retry_undecided_roots || taken_again) {
                     return;
                 }
                 if (const auto head = deferred.Finish(index, left_for_later)) {
@@ -4719,7 +4761,7 @@ namespace cobra {
                 const auto verify_begin  = std::chrono::steady_clock::now();
                 const uint64_t cpu_begin = ThreadCpuNanoseconds();
                 bool unknown             = false;
-                auto verified            = VerifyCandidate(cand, *outcome, options_, stats, &unknown);
+                auto verified            = VerifyCandidateOrOrdinary(cand, *outcome, options_, stats, &unknown);
                 // A proof that did not finish says nothing about the rewrite,
                 // so it leaves no trace: neither a null in the cache nor a
                 // fingerprint on the root. Both would turn "the solver ran out
@@ -4764,6 +4806,14 @@ namespace cobra {
                     );
                 }
                 if (verified == nullptr) {
+                    // Like a rewrite priced out, one the proof turned down read as
+                    // "solved" in the trace and then never reached the function.
+                    if (DetectDebug()) {
+                        llvm::errs() << "cobra: proof " << (proof_unknown ? "unknown" : "refuted")
+                                     << *cand.root << "  [cut " << cand.node_limit << "]"
+                                     << (outcome->boolean_reading ? " (boolean reading)" : "")
+                                     << " after " << verifying / 1000000 << " ms\n";
+                    }
                     discard_rewrite();
                     const uint64_t rebuilding = since(rebuild_begin) - verifying;
                     stats.rebuild_nanoseconds += rebuilding;
@@ -4779,6 +4829,21 @@ namespace cobra {
                     continue;
                 }
                 stats.solved_nanoseconds += verifying;
+                // The ordinary reading answered in place of the reading of the
+                // conditions (`VerifyCandidateOrOrdinary`), so what was built is
+                // the other rewrite. The candidate is taken again, and served the
+                // proved one from the cache.
+                if (verified->boolean_reading != outcome->boolean_reading) {
+                    if (DetectDebug()) {
+                        llvm::errs() << "cobra: proof of the reading unknown or refuted, ordinary rewrite proved"
+                                     << *cand.root << "  [cut " << cand.node_limit << "]\n";
+                    }
+                    discard_rewrite();
+                    stats.solve_nanoseconds += since(rebuild_begin) - verifying;
+                    taken_again = true;
+                    --index;
+                    continue;
+                }
                 outcome = std::move(verified);
             }
 
