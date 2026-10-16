@@ -39,6 +39,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/Debug.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -56,6 +57,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <ctime>
 #include <mutex>
@@ -2620,7 +2622,10 @@ namespace cobra {
         //
         // The walk goes through the instructions that make no `undef` of
         // operands that are not - arithmetic, casts, comparisons, `select`,
-        // `getelementptr`, and phis - and asks LLVM about every other value:
+        // `getelementptr`, phis, and the intrinsics that compute from their
+        // operands alone (`abs`, the minima and maxima, funnel shifts, byte and
+        // bit counts and reversals, saturating arithmetic) - and asks LLVM
+        // about every other value:
         // constants, `noundef` arguments, `!noundef` loads, `noundef` call
         // results and `freeze` answer yes there, any other load or call no.
         // The answer is for the whole cone at once: one value in it that may
@@ -2645,6 +2650,32 @@ namespace cobra {
         // LLVM's is past its depth.
         constexpr size_t kNeverUndefBudget = 4096;
 
+        // An intrinsic whose result is a function of its operands' values, with
+        // no `undef` made of operands that are not.
+        bool ComputesFromOperandsAlone(llvm::Intrinsic::ID id) {
+            switch (id) {
+                case llvm::Intrinsic::abs:
+                case llvm::Intrinsic::smax:
+                case llvm::Intrinsic::smin:
+                case llvm::Intrinsic::umax:
+                case llvm::Intrinsic::umin:
+                case llvm::Intrinsic::fshl:
+                case llvm::Intrinsic::fshr:
+                case llvm::Intrinsic::bswap:
+                case llvm::Intrinsic::bitreverse:
+                case llvm::Intrinsic::ctpop:
+                case llvm::Intrinsic::ctlz:
+                case llvm::Intrinsic::cttz:
+                case llvm::Intrinsic::sadd_sat:
+                case llvm::Intrinsic::ssub_sat:
+                case llvm::Intrinsic::uadd_sat:
+                case llvm::Intrinsic::usub_sat:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         bool NeverUndef(const llvm::Value *value, llvm::SmallPtrSetImpl< const llvm::Value * > &proved) {
             if (proved.contains(value)) {
                 return true;
@@ -2660,6 +2691,14 @@ namespace cobra {
                     return false;
                 }
                 const auto *inst = llvm::dyn_cast< llvm::Instruction >(current);
+                if (const auto *intrinsic = llvm::dyn_cast_or_null< llvm::IntrinsicInst >(inst);
+                    intrinsic != nullptr && ComputesFromOperandsAlone(intrinsic->getIntrinsicID()))
+                {
+                    for (const llvm::Value *operand : intrinsic->args()) {
+                        pending.push_back(operand);
+                    }
+                    continue;
+                }
                 const bool passes_on = inst != nullptr
                     && (llvm::isa< llvm::BinaryOperator >(inst) || llvm::isa< llvm::CastInst >(inst)
                         || llvm::isa< llvm::CmpInst >(inst) || llvm::isa< llvm::SelectInst >(inst)
@@ -4037,9 +4076,9 @@ namespace cobra {
             return std::nullopt;
         }
 
-        // What one arm of a `select` may take for granted: its condition has the
-        // value `taken`, and where the condition tests a sign, the exclusive or
-        // of the sign bits of `sign_atoms` is `sign_parity`.
+        // What a reading under a condition may take for granted: the condition
+        // has the value `taken`, and where it tests a sign, the exclusive or of
+        // the sign bits of `sign_atoms` is `sign_parity`.
         struct ArmFacts {
             const llvm::Value *condition = nullptr;
             bool taken                   = false;
@@ -4047,17 +4086,82 @@ namespace cobra {
             bool sign_parity = false;
         };
 
-        // Reads the arm of a `select` again with what its condition says: an arm
-        // equal to the one read wherever the condition is what `facts` says it
-        // is, built before the `select` from the arm's operations with the
-        // operands read that way. What could not be read differently is the arm
-        // itself, and nothing is built for it.
+        // The instructions the readings of one root build, shared between them:
+        // the same operation over the same operands is built once, so two
+        // readings that come to the same computation come to the same value.
+        class ArmBuilds {
+          public:
+            ArmBuilds(llvm::Instruction &at, const llvm::SimplifyQuery &query) : at_(at), query_(query) {}
+
+            // `like` with `operands`, or the binary operation `opcode` over them
+            // when `like` is null: what an instruction built before is, what
+            // the simplification makes of it, or a new one before `at`.
+            llvm::Value *
+            Make(llvm::Instruction *like, unsigned opcode, llvm::ArrayRef< llvm::Value * > operands) {
+                std::vector< uintptr_t > key{ like != nullptr ? like->getOpcode() : opcode };
+                if (const auto *cmp = llvm::dyn_cast_or_null< llvm::CmpInst >(like)) {
+                    key.push_back(cmp->getPredicate());
+                }
+                key.push_back(reinterpret_cast< uintptr_t >(
+                    like != nullptr ? like->getType() : operands.front()->getType()
+                ));
+                for (llvm::Value *operand : operands) {
+                    key.push_back(reinterpret_cast< uintptr_t >(operand));
+                }
+                if (auto found = made_.find(key); found != made_.end()) {
+                    return found->second;
+                }
+                if (operands.size() == 2 && llvm::Instruction::isCommutative(static_cast< unsigned >(key[0]))) {
+                    std::vector< uintptr_t > swapped = key;
+                    std::swap(swapped[swapped.size() - 1], swapped[swapped.size() - 2]);
+                    if (auto found = made_.find(swapped); found != made_.end()) {
+                        return found->second;
+                    }
+                }
+                llvm::Instruction *made = nullptr;
+                if (like != nullptr) {
+                    made = like->clone();
+                    for (unsigned i = 0; i < operands.size(); ++i) {
+                        made->setOperand(i, operands[i]);
+                    }
+                    made->dropPoisonGeneratingFlags();
+                    made->dropUnknownNonDebugMetadata();
+                } else {
+                    made = llvm::BinaryOperator::Create(
+                        static_cast< llvm::Instruction::BinaryOps >(opcode), operands[0], operands[1]
+                    );
+                }
+                made->setName("cobra.arm");
+                made->insertBefore(&at_);
+                llvm::Value *result = made;
+                if (llvm::Value *simpler = llvm::simplifyInstruction(made, query_.getWithInstruction(made))) {
+                    made->eraseFromParent();
+                    result = simpler;
+                } else {
+                    built.push_back(made);
+                }
+                made_[key] = result;
+                return result;
+            }
+
+            // The instructions built, in the order they were.
+            llvm::SmallVector< llvm::Instruction *, 16 > built;
+
+          private:
+            llvm::Instruction &at_;
+            const llvm::SimplifyQuery &query_;
+            std::map< std::vector< uintptr_t >, llvm::Value * > made_;
+        };
+
+        // Reads a value again with what a condition says: a value equal to the
+        // one read wherever the condition is what `facts` says it is, built from
+        // the value's operations with the operands read that way. What could not
+        // be read differently is the value itself, and nothing is built for it.
         class ArmReader {
           public:
             static constexpr unsigned kBudget = 64;
 
-            ArmReader(llvm::Instruction &at, const ArmFacts &facts, const llvm::SimplifyQuery &query)
-                : at_(at), facts_(facts), query_(query) {}
+            ArmReader(const ArmFacts &facts, ArmBuilds &builds) : facts_(facts), builds_(builds) {}
 
             llvm::Value *Read(llvm::Value *value) {
                 if (auto found = read_.find(value); found != read_.end()) {
@@ -4068,11 +4172,8 @@ namespace cobra {
                 return result;
             }
 
-            // The instructions built, in the order they were.
-            llvm::SmallVector< llvm::Instruction *, 8 > built;
-
           private:
-            // The sign of `value` where the arm is read, when that is known.
+            // The sign of `value` where it is read, when that is known.
             std::optional< bool > KnownSign(const llvm::Value *value) const {
                 const SignBit sign = SignBitOf(value);
                 if (sign.atoms.empty()) {
@@ -4084,7 +4185,7 @@ namespace cobra {
                 return std::nullopt;
             }
 
-            // The value of a condition where the arm is read, when it is known.
+            // The value of a condition where it is read, when that is known.
             std::optional< bool > Decided(const llvm::Value *condition) const {
                 if (condition == facts_.condition) {
                     return facts_.taken;
@@ -4097,6 +4198,46 @@ namespace cobra {
                 return std::nullopt;
             }
 
+            // `y` where `value` is `0 - y`.
+            static llvm::Value *Negated(llvm::Value *value) {
+                llvm::Value *y = nullptr;
+                return llvm::PatternMatch::match(value, llvm::PatternMatch::m_Neg(llvm::PatternMatch::m_Value(y)))
+                    ? y
+                    : nullptr;
+            }
+
+            // A product by a constant with its negations taken into the constant,
+            // `(0 - y) * k` as `y * -k`, so that the two sides of a split by sign
+            // come to the one product they compute.
+            llvm::Value *Product(llvm::Value *a, llvm::Value *b) {
+                if (llvm::isa< llvm::ConstantInt >(a) && !llvm::isa< llvm::ConstantInt >(b)) {
+                    std::swap(a, b);
+                }
+                auto *k = llvm::dyn_cast< llvm::ConstantInt >(b);
+                if (k != nullptr) {
+                    if (llvm::Value *y = Negated(a)) {
+                        return builds_.Make(
+                            nullptr, llvm::Instruction::Mul, { y, llvm::ConstantInt::get(k->getType(), -k->getValue()) }
+                        );
+                    }
+                }
+                return builds_.Make(nullptr, llvm::Instruction::Mul, { a, b });
+            }
+
+            // `0 - r`, with a negation or a product by a constant under it taken in.
+            llvm::Value *Negation(llvm::Value *r) {
+                if (llvm::Value *y = Negated(r)) {
+                    return y;
+                }
+                llvm::Value *y      = nullptr;
+                llvm::ConstantInt *k = nullptr;
+                namespace pm        = llvm::PatternMatch;
+                if (pm::match(r, pm::m_Mul(pm::m_Value(y), pm::m_ConstantInt(k)))) {
+                    return Product(y, llvm::ConstantInt::get(k->getType(), -k->getValue()));
+                }
+                return builds_.Make(nullptr, llvm::Instruction::Sub, { llvm::ConstantInt::get(r->getType(), 0), r });
+            }
+
             llvm::Value *ReadOnce(llvm::Value *value) {
                 if (value->getType()->isIntegerTy(1)) {
                     if (const auto decided = Decided(value)) {
@@ -4105,6 +4246,17 @@ namespace cobra {
                 }
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(value);
                 if (inst == nullptr || budget_ == 0 || !inst->getType()->isIntegerTy()) {
+                    return value;
+                }
+                // `abs(x)` where the sign of `x` is known is `x` or `0 - x`.
+                if (auto *abs = llvm::dyn_cast< llvm::IntrinsicInst >(inst);
+                    abs != nullptr && abs->getIntrinsicID() == llvm::Intrinsic::abs)
+                {
+                    --budget_;
+                    if (const auto negative = KnownSign(abs->getArgOperand(0))) {
+                        llvm::Value *x = Read(abs->getArgOperand(0));
+                        return *negative ? Negation(x) : x;
+                    }
                     return value;
                 }
                 const bool pure = (llvm::isa< llvm::BinaryOperator >(inst) && !inst->isIntDivRem())
@@ -4169,25 +4321,17 @@ namespace cobra {
                 if (!differs) {
                     return value;
                 }
-                llvm::Instruction *copy = inst->clone();
-                for (unsigned i = 0; i < operands.size(); ++i) {
-                    copy->setOperand(i, operands[i]);
+                if (inst->getOpcode() == llvm::Instruction::Mul) {
+                    return Product(operands[0], operands[1]);
                 }
-                copy->dropPoisonGeneratingFlags();
-                copy->dropUnknownNonDebugMetadata();
-                copy->setName("cobra.arm");
-                copy->insertBefore(&at_);
-                if (llvm::Value *simpler = llvm::simplifyInstruction(copy, query_.getWithInstruction(copy))) {
-                    copy->eraseFromParent();
-                    return simpler;
+                if (llvm::PatternMatch::match(inst, llvm::PatternMatch::m_Neg(llvm::PatternMatch::m_Value()))) {
+                    return Negation(operands[1]);
                 }
-                built.push_back(copy);
-                return copy;
+                return builds_.Make(inst, 0, operands);
             }
 
-            llvm::Instruction &at_;
             const ArmFacts &facts_;
-            const llvm::SimplifyQuery &query_;
+            ArmBuilds &builds_;
             llvm::DenseMap< llvm::Value *, llvm::Value * > read_;
             unsigned budget_ = kBudget;
         };
@@ -4222,45 +4366,77 @@ namespace cobra {
         // inside `a` is its true arm. Where `c` tests the sign of a value, every
         // value with the same sign bit (`SignBitOf`: the same exclusive or of the
         // same values) has its sign known in each arm: `x & INT_MAX` is `x` in
-        // the arm where `x` is not negative, `x & INT_MIN` is a constant, and a
-        // `select` on another test of that sign takes its arm.
+        // the arm where `x` is not negative, `x & INT_MIN` is a constant,
+        // `abs(x)` is `x` or `0 - x`, and a `select` on another test of that sign
+        // takes its arm.
         //
         // That is how a product is split by the sign of what it multiplies:
         // `x <s 0 ? -((x <s 0 ? -x : x & INT_MAX) * k) : (x <s 0 ? -x : x & INT_MAX) * k`
         // is `x * k` on either side, and each arm read under its condition says
-        // so - `-(-x * k)` and `x * k`, which is linear. Read with the condition
-        // a free variable, the false arm is `(x & INT_MAX) * k`, which no
-        // rewrite of the tree relates to the true one, and with the condition
-        // put back the proof relates products the solver has to bit-blast.
+        // so. Read with the condition a free variable, the false arm is
+        // `(x & INT_MAX) * k`, which no rewrite of the tree relates to the true
+        // one, and with the condition put back the proof relates products the
+        // solver has to bit-blast. A negation of a product by a constant is
+        // taken into the constant as it is read, and the two arms build the
+        // same operation once, so arms that come to the same product are the
+        // same value and the `select` goes.
         //
-        // The arm read again is equal to the one read wherever its condition
-        // holds, so the `select` computes what it did; nothing undefined is
-        // taken for the same value twice: the condition and the values whose
-        // signs it fixes must never be `undef`. The new arms replace the old
-        // only when that does not add instructions.
+        // An operation over a `select` is read the same way, once under each
+        // value of the `select`'s condition, and replaced when both readings come
+        // to the same value: `(c ? -k : k) * abs(x)`, with `c` the sign of `x`,
+        // is `x * k` either way.
+        //
+        // A value read again is equal to the one read wherever the condition
+        // holds, so the `select` computes what it did; nothing undefined is taken
+        // for the same value twice: the condition and the values whose signs it
+        // fixes must never be `undef`. What is read replaces what was only when
+        // that does not add instructions.
         bool ReadArmsUnderTheirCondition(llvm::Function &f) {
-            llvm::SmallVector< llvm::WeakVH, 32 > selects;
+            llvm::SmallVector< llvm::WeakVH, 32 > roots;
             for (auto &inst : llvm::instructions(f)) {
-                auto *select = llvm::dyn_cast< llvm::SelectInst >(&inst);
-                if (select != nullptr && select->getType()->isIntegerTy()
-                    && select->getType()->getIntegerBitWidth() > 1
-                    && select->getCondition()->getType()->isIntegerTy(1))
-                {
-                    selects.emplace_back(select);
+                if (!inst.getType()->isIntegerTy() || inst.getType()->getIntegerBitWidth() == 1) {
+                    continue;
+                }
+                const bool select = llvm::isa< llvm::SelectInst >(inst)
+                    && inst.getOperand(0)->getType()->isIntegerTy(1);
+                const bool over_select = !llvm::isa< llvm::SelectInst >(inst) && !llvm::isa< llvm::PHINode >(inst)
+                    && llvm::any_of(inst.operands(), [](const llvm::Use &use) {
+                           const auto *operand = llvm::dyn_cast< llvm::SelectInst >(use.get());
+                           return operand != nullptr && operand->getCondition()->getType()->isIntegerTy(1);
+                       });
+                if (select || over_select) {
+                    roots.emplace_back(&inst);
                 }
             }
             const llvm::SimplifyQuery query(f.getParent()->getDataLayout());
             llvm::SmallPtrSet< const llvm::Value *, 32 > never_undef;
             const auto forget = [&](llvm::Value *value) { never_undef.erase(value); };
             bool changed = false;
-            for (const llvm::WeakVH &handle : selects) {
-                auto *select = llvm::dyn_cast_or_null< llvm::SelectInst >(handle);
-                if (select == nullptr || !NeverUndef(select->getCondition(), never_undef)) {
+            for (const llvm::WeakVH &handle : roots) {
+                auto *root = llvm::dyn_cast_or_null< llvm::Instruction >(handle);
+                if (root == nullptr) {
+                    continue;
+                }
+                auto *select    = llvm::dyn_cast< llvm::SelectInst >(root);
+                llvm::Value *condition = nullptr;
+                if (select != nullptr) {
+                    condition = select->getCondition();
+                } else {
+                    for (llvm::Value *operand : root->operands()) {
+                        if (auto *inner = llvm::dyn_cast< llvm::SelectInst >(operand);
+                            inner != nullptr && inner->getCondition()->getType()->isIntegerTy(1))
+                        {
+                            condition = inner->getCondition();
+                            break;
+                        }
+                    }
+                }
+                if (condition == nullptr || !NeverUndef(condition, never_undef)) {
                     continue;
                 }
                 ArmFacts facts;
-                facts.condition = select->getCondition();
-                if (const auto test = SignTest(facts.condition)) {
+                facts.condition = condition;
+                if (const auto test = SignTest(condition)) {
                     SignBit sign = SignBitOf(test->first);
                     if (llvm::all_of(sign.atoms, [&](const llvm::Value *atom) {
                             return NeverUndef(atom, never_undef);
@@ -4270,19 +4446,21 @@ namespace cobra {
                         facts.sign_parity = test->second != sign.flip;
                     }
                 }
-                ArmFacts if_true  = facts;
-                ArmFacts if_false = facts;
-                if_true.taken     = true;
+                ArmFacts if_true     = facts;
+                ArmFacts if_false    = facts;
+                if_true.taken        = true;
                 if_false.sign_parity = !facts.sign_parity;
-                ArmReader read_true(*select, if_true, query);
-                ArmReader read_false(*select, if_false, query);
-                llvm::Value *old_true  = select->getTrueValue();
-                llvm::Value *old_false = select->getFalseValue();
+                ArmBuilds builds(*root, query);
+                ArmReader read_true(if_true, builds);
+                ArmReader read_false(if_false, builds);
+
+                llvm::Value *old_true  = select != nullptr ? select->getTrueValue() : root;
+                llvm::Value *old_false = select != nullptr ? select->getFalseValue() : root;
                 llvm::Value *new_true  = read_true.Read(old_true);
                 llvm::Value *new_false = read_false.Read(old_false);
+                const bool same        = new_true == new_false;
 
-                llvm::SmallVector< llvm::Instruction *, 16 > built(read_true.built.begin(), read_true.built.end());
-                built.append(read_false.built.begin(), read_false.built.end());
+                auto &built            = builds.built;
                 const auto drop_unread = [&] {
                     for (auto it = built.rbegin(); it != built.rend(); ++it) {
                         if ((*it)->use_empty()) {
@@ -4293,33 +4471,47 @@ namespace cobra {
                     }
                     llvm::erase(built, nullptr);
                 };
-                if (new_true == old_true && new_false == old_false) {
+                // An operation over a `select` is replaced only by one value; a
+                // `select` takes new arms, or the one value both arms came to.
+                const bool unchanged = select != nullptr ? new_true == old_true && new_false == old_false
+                                                         : !same || new_true == root;
+                if (unchanged) {
                     drop_unread();
                     continue;
                 }
-                select->setOperand(1, new_true);
-                select->setOperand(2, new_false);
+                llvm::SmallVector< std::pair< llvm::Use *, llvm::Value * >, 8 > rewritten;
+                const auto rewrite = [&](llvm::Use &use, llvm::Value *now) {
+                    rewritten.emplace_back(&use, use.get());
+                    use.set(now);
+                };
+                if (same) {
+                    for (llvm::Use &use : llvm::make_early_inc_range(root->uses())) {
+                        rewrite(use, new_true);
+                    }
+                } else {
+                    rewrite(select->getOperandUse(1), new_true);
+                    rewrite(select->getOperandUse(2), new_false);
+                }
                 drop_unread();
-                const bool same = new_true == new_false;
                 llvm::SmallPtrSet< llvm::Instruction *, 16 > dead;
                 if (same) {
-                    CollectDead(select, dead);
+                    CollectDead(root, dead);
                 }
                 CollectDead(old_true, dead);
                 CollectDead(old_false, dead);
                 if (built.size() > dead.size()) {
-                    select->setOperand(1, old_true);
-                    select->setOperand(2, old_false);
+                    for (auto it = rewritten.rbegin(); it != rewritten.rend(); ++it) {
+                        it->first->set(it->second);
+                    }
                     drop_unread();
                     continue;
                 }
                 if (DetectDebug()) {
-                    llvm::errs() << "cobra: arms read under their condition " << *select << " (" << built.size()
+                    llvm::errs() << "cobra: read under its condition " << *root << " (" << built.size()
                                  << " built, " << dead.size() << " dead)\n";
                 }
                 if (same) {
-                    select->replaceAllUsesWith(new_true);
-                    llvm::RecursivelyDeleteTriviallyDeadInstructions(select, nullptr, nullptr, forget);
+                    llvm::RecursivelyDeleteTriviallyDeadInstructions(root, nullptr, nullptr, forget);
                 } else {
                     llvm::RecursivelyDeleteTriviallyDeadInstructions(old_true, nullptr, nullptr, forget);
                     llvm::RecursivelyDeleteTriviallyDeadInstructions(old_false, nullptr, nullptr, forget);

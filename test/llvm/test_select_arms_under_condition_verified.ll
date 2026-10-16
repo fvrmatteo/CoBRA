@@ -7,12 +7,13 @@
 ; `x` is not negative and nothing the true arm relates to otherwise. Read with
 ; the condition a free variable, the tree has no rewrite; with the condition put
 ; back, the proof relates products by a 64-bit constant and does not finish.
-; Each arm read under its condition is linear: `-(-x * k)` and `x * k`.
+; Each arm read under its condition is the product: `-(-x * k)`, with the
+; negations taken into the constant, and `x * k`, built once for both arms.
 ;
 ; CHECK-LABEL: @sign_split_product(
 ; CHECK-NEXT: [[S:%.*]] = sext i8 %c to i64
 ; CHECK-NEXT: [[X:%.*]] = xor i64 %h, [[S]]
-; CHECK-NEXT: [[M:%.*]] = mul i64 1099511628211, [[X]]
+; CHECK-NEXT: [[M:%.*]] = mul i64 [[X]], 1099511628211
 ; CHECK-NEXT: ret i64 [[M]]
 define i64 @sign_split_product(i64 noundef %h, i8 noundef %c) {
   %s = sext i8 %c to i64
@@ -35,7 +36,7 @@ define i64 @sign_split_product(i64 noundef %h, i8 noundef %c) {
 ; CHECK-LABEL: @sign_tested_on_another_value(
 ; CHECK-NEXT: [[S:%.*]] = sext i8 %c to i64
 ; CHECK-NEXT: [[X:%.*]] = xor i64 %h, [[S]]
-; CHECK-NEXT: [[M:%.*]] = mul i64 1099511628211, [[X]]
+; CHECK-NEXT: [[M:%.*]] = mul i64 [[X]], 1099511628211
 ; CHECK-NEXT: ret i64 [[M]]
 define i64 @sign_tested_on_another_value(i64 noundef %h, i8 noundef %c) {
   %b = ashr i8 %c, 7
@@ -52,6 +53,55 @@ define i64 @sign_tested_on_another_value(i64 noundef %h, i8 noundef %c) {
   %mul = mul i64 %t, 1099511628211
   %neg = sub i64 0, %mul
   %r = select i1 %cmp, i64 %neg, i64 %mul
+  ret i64 %r
+}
+
+; The sign split folded into the constant, as InstCombine leaves it:
+; `(x <s 0 ? -k : k) * abs(x)`. Read once with `x` negative and once without,
+; it is `-k * (0 - x)` and `k * x`, the same product.
+;
+; CHECK-LABEL: @sign_split_constant(
+; CHECK-NEXT: [[S:%.*]] = sext i8 %c to i64
+; CHECK-NEXT: [[X:%.*]] = xor i64 %h, [[S]]
+; CHECK-NEXT: [[M:%.*]] = mul i64 [[X]], 1099511628211
+; CHECK-NEXT: ret i64 [[M]]
+define i64 @sign_split_constant(i64 noundef %h, i8 noundef %c) {
+  %s = sext i8 %c to i64
+  %x = xor i64 %h, %s
+  %cmp = icmp slt i64 %x, 0
+  %a = call i64 @llvm.abs.i64(i64 %x, i1 false)
+  %k = select i1 %cmp, i64 -1099511628211, i64 1099511628211
+  %r = mul i64 %k, %a
+  ret i64 %r
+}
+
+; The same step in its loop: the hash is a phi of the product, so whether the
+; condition is ever `undef` is a question about the cycle through `abs` - which
+; makes no `undef` of operands that are not, and is walked through like the
+; arithmetic around it. The loads are `!noundef`, so the condition is defined.
+;
+; CHECK-LABEL: @sign_split_in_a_loop(
+; CHECK-NOT: @llvm.abs
+; CHECK: mul i64 %x, 1099511628211
+; CHECK: ret i64
+define i64 @sign_split_in_a_loop(ptr noundef %p, i64 noundef %n) {
+entry:
+  br label %loop
+loop:
+  %h = phi i64 [ -3750763034362895579, %entry ], [ %r, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
+  %q = getelementptr i8, ptr %p, i64 %i
+  %c = load i8, ptr %q, align 1, !noundef !0
+  %s = sext i8 %c to i64
+  %x = xor i64 %h, %s
+  %cmp = icmp slt i64 %x, 0
+  %a = call i64 @llvm.abs.i64(i64 %x, i1 false)
+  %k = select i1 %cmp, i64 -1099511628211, i64 1099511628211
+  %r = mul i64 %k, %a
+  %i.next = add i64 %i, 1
+  %done = icmp eq i64 %i.next, %n
+  br i1 %done, label %exit, label %loop
+exit:
   ret i64 %r
 }
 
@@ -89,3 +139,7 @@ define i64 @another_sign(i64 noundef %h, i64 noundef %g) {
   %r = select i1 %cmp, i64 %n, i64 %and
   ret i64 %r
 }
+
+declare i64 @llvm.abs.i64(i64, i1)
+
+!0 = !{}
