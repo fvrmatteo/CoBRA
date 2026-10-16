@@ -282,6 +282,10 @@ namespace cobra {
     // treats it as the partial view it is.
     constexpr uint32_t kBooleanCutLimit = kSumGroupLimit - kSumGroupRungs;
 
+    // The `node_limit` the extension cut carries (`ExtensionCutMbaCandidate`):
+    // below the boolean cut, a partial view of its own.
+    constexpr uint32_t kExtensionCutLimit = kBooleanCutLimit - 1;
+
     constexpr bool IsWholeSumGroupLimit(uint32_t node_limit) {
         return IsSumGroupLimit(node_limit)
             && (kSumGroupLimit - node_limit) % (kMaxSliceWidth + 1) == 0;
@@ -382,6 +386,15 @@ namespace cobra {
     // narrow value is a free leaf to that collection (`SliceToRead`). Empty
     // when `cand` is not a full collection.
     std::vector< MBACandidate > ExactNarrowReadingMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
+        uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}
+    );
+
+    // The root read again with every extension of a narrower value in it held
+    // as the leaf, instead of the narrower value under it. Empty when `cand` is
+    // not a full collection or its tree extends nothing.
+    std::vector< MBACandidate > ExtensionCutMbaCandidate(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint64_t options_tag, MbaCostModel cost_model = MbaCostModel::kTreeInstructions,
         uint32_t max_tree_nodes = 0, const DemandedMaskFn &demanded = {}

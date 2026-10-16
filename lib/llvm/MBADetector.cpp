@@ -3631,6 +3631,60 @@ namespace cobra {
         return candidates;
     }
 
+    // An extension of a narrower value is read through: the narrow value is the
+    // leaf, held zero-extended, and the extension is part of the tree. That is
+    // what lets a tree that narrows and widens the same value again cancel. It
+    // also hides a linear tree from the search: the signature is taken on
+    // inputs that are 0 or 1, where a sign extension is the value itself, so a
+    // tree that is `k * (h ^ sext(b))` reads on the corners as `k * (h ^ b)`, and
+    // that candidate is rightly refused at full width, where `b >= 128` tells
+    // the two apart. Read with the extension as the leaf the same tree is linear
+    // in two full-width variables and found at once.
+    std::vector< MBACandidate > ExtensionCutMbaCandidate(
+        const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
+        uint64_t options_tag, MbaCostModel cost_model, uint32_t max_tree_nodes,
+        const DemandedMaskFn &demanded
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr || cand.node_limit != 0) {
+            return candidates;
+        }
+        const uint32_t bw = cand.bitwidth;
+        llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
+        std::vector< llvm::Value * > leaves;
+        llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
+        CollectTree(
+            cand.root, bw, tree_insts, leaves, phi_redirects, /*try_phi_transparency=*/true, 0,
+            false, max_tree_nodes
+        );
+        // A condition widened to a word is the reading of conditions' business,
+        // not this one's: it is one bit, which the corners do see.
+        SharedCut cut;
+        for (auto *ti : tree_insts) {
+            if (ti == cand.root
+                || (ti->getOpcode() != llvm::Instruction::SExt
+                    && ti->getOpcode() != llvm::Instruction::ZExt))
+            {
+                continue;
+            }
+            const auto *source = ti->getOperand(0)->getType();
+            if (source->isIntegerTy() && source->getIntegerBitWidth() > 1
+                && source->getIntegerBitWidth() < bw)
+            {
+                cut.opaque.insert(ti);
+            }
+        }
+        if (cut.opaque.empty()) {
+            return candidates;
+        }
+        cut.node_limit = kExtensionCutLimit;
+        BuildCandidates(
+            { cand.root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
+            max_tree_nodes, demanded, &cut
+        );
+        return candidates;
+    }
+
     MbaFingerprint WithDemandedMask(MbaFingerprint fp, uint64_t mask, uint32_t bitwidth) {
         if (mask != Bitmask(bitwidth)) {
             fp.structure = MixFingerprint(fp.structure, mask);

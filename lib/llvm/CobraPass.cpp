@@ -4078,6 +4078,12 @@ namespace cobra {
                     options_tag, options_.cost_model, options_.max_tree_nodes, demanded
                 );
                 stats.shared_nanoseconds += since(shared_begin);
+                // And the one that holds what the tree extends whole
+                // (`ExtensionCutMbaCandidate`), next to the shared values.
+                auto extension = ExtensionCutMbaCandidate(
+                    cand, options_.min_ast_size, options_.max_vars, options_tag,
+                    options_.cost_model, options_.max_tree_nodes, demanded
+                );
                 const auto recut_begin = std::chrono::steady_clock::now();
                 auto recuts = RecutMbaCandidate(
                     cand, options_.min_ast_size, options_.max_vars, options_.max_recut_nodes,
@@ -4150,6 +4156,17 @@ namespace cobra {
                     }
                 }
                 for (auto &cut : shared) {
+                    if (attempted.insert({ cut.root, cut.node_limit }).second) {
+                        queue_key(cut);
+                        candidates.push_back(std::move(cut));
+                        origins.push_back(CandidateOrigin::kSharedCut);
+                        if (options_.retry_undecided_roots) {
+                            deferred.Queue(candidates.size() - 1, index);
+                        }
+                        ++stats.requeued;
+                    }
+                }
+                for (auto &cut : extension) {
                     if (attempted.insert({ cut.root, cut.node_limit }).second) {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
