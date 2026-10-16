@@ -23,6 +23,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallVector.h"
+#include <numeric>
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
@@ -3734,6 +3735,146 @@ namespace cobra {
             std::unordered_map< uint64_t, unsigned > running_by_run_;
         };
 
+        // A product by a constant with no reader but the one asking: `mul x, k`,
+        // or `0 - mul x, k`, which is the product by `-k`.
+        struct ConstantProduct
+        {
+            llvm::Value *factor = nullptr;
+            int64_t multiplier  = 0;
+        };
+
+        std::optional< ConstantProduct > ConstantProductOf(llvm::Value *v) {
+            auto *inst = llvm::dyn_cast< llvm::BinaryOperator >(v);
+            if (inst == nullptr || !inst->hasOneUse() || !inst->getType()->isIntegerTy()
+                || inst->getType()->getIntegerBitWidth() > 64)
+            {
+                return std::nullopt;
+            }
+            if (inst->getOpcode() == llvm::Instruction::Mul) {
+                for (unsigned side = 0; side < 2; ++side) {
+                    if (const auto *k = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(side))) {
+                        return ConstantProduct{ inst->getOperand(1 - side), k->getSExtValue() };
+                    }
+                }
+                return std::nullopt;
+            }
+            if (inst->getOpcode() == llvm::Instruction::Sub) {
+                const auto *zero = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(0));
+                if (zero != nullptr && zero->isZero()) {
+                    if (auto inner = ConstantProductOf(inst->getOperand(1));
+                        inner && inner->multiplier != std::numeric_limits< int64_t >::min())
+                    {
+                        return ConstantProduct{ inner->factor, -inner->multiplier };
+                    }
+                }
+            }
+            return std::nullopt;
+        }
+
+        // The common factor of two multipliers worth taking out: their greatest
+        // common divisor, when what it leaves of each is small and it is not a
+        // power of two (that is a shift either way). Zero when there is none.
+        uint64_t CommonFactor(int64_t a, int64_t b) {
+            if (a == 0 || b == 0 || a == std::numeric_limits< int64_t >::min()
+                || b == std::numeric_limits< int64_t >::min())
+            {
+                return 0;
+            }
+            const uint64_t g = std::gcd(static_cast< uint64_t >(a < 0 ? -a : a),
+                                        static_cast< uint64_t >(b < 0 ? -b : b));
+            constexpr int64_t kSmall = int64_t{ 1 } << 16;
+            if (g <= 1 || (g & (g - 1)) == 0) {
+                return 0;
+            }
+            const int64_t qa = a / static_cast< int64_t >(g);
+            const int64_t qb = b / static_cast< int64_t >(g);
+            if (qa > kSmall || qa < -kSmall || qb > kSmall || qb < -kSmall) {
+                return 0;
+            }
+            return g;
+        }
+
+        // `x * q`, spelled as the value itself when `q` is one.
+        llvm::Value *Scale(llvm::IRBuilder<> &builder, llvm::Value *x, int64_t q) {
+            if (q == 1) {
+                return x;
+            }
+            return builder.CreateMul(x, llvm::ConstantInt::getSigned(x->getType(), q), "cobra.factor");
+        }
+
+        // Products of the same odd constant taken out of a sum and out of the arms
+        // of a select, the way they were put in: `x * (g * p) + y * (g * q)` is
+        // `(x * p + y * q) * g`, and `c ? x * (g * p) : y * (g * q)` is
+        // `(c ? x * p : y * q) * g`, over the integers and so modulo the width.
+        //
+        // A tree that multiplies its values by a constant on every path is no
+        // harder to search than one that does not - the products are linear -
+        // but it is far harder to prove: a proof of `t == k * e` has to relate
+        // products the solver bit-blasts, and one of a sign-split step written
+        // with three products of a 64-bit constant did not finish in a minute,
+        // where the same step with the constant taken out is proved in a second.
+        // Taken out, the products meet in one place, and the tree under it is a
+        // root of its own with nothing to multiply.
+        //
+        // Only where the product has no other reader, so nothing is computed
+        // twice, and only for a factor the multipliers share as integers, with
+        // small quotients: the rewrite trades two products by large constants for
+        // one. No flag survives it.
+        bool HoistConstantFactors(llvm::Function &f) {
+            bool changed = false;
+            for (unsigned round = 0; round < 4; ++round) {
+                bool moved = false;
+                for (auto &block : f) {
+                    for (auto it = block.begin(); it != block.end();) {
+                        auto *inst = &*it++;
+                        const unsigned opcode = inst->getOpcode();
+                        const bool sum = opcode == llvm::Instruction::Add || opcode == llvm::Instruction::Sub;
+                        auto *select = llvm::dyn_cast< llvm::SelectInst >(inst);
+                        if (!sum && select == nullptr) {
+                            continue;
+                        }
+                        if (!inst->getType()->isIntegerTy() || inst->getType()->getIntegerBitWidth() > 64) {
+                            continue;
+                        }
+                        llvm::Value *left  = sum ? inst->getOperand(0) : select->getTrueValue();
+                        llvm::Value *right = sum ? inst->getOperand(1) : select->getFalseValue();
+                        if (left == right) {
+                            continue;
+                        }
+                        const auto a = ConstantProductOf(left);
+                        const auto b = ConstantProductOf(right);
+                        if (!a || !b) {
+                            continue;
+                        }
+                        const int64_t right_multiplier =
+                            opcode == llvm::Instruction::Sub ? -b->multiplier : b->multiplier;
+                        if (opcode == llvm::Instruction::Sub && b->multiplier == std::numeric_limits< int64_t >::min()) {
+                            continue;
+                        }
+                        const uint64_t g = CommonFactor(a->multiplier, right_multiplier);
+                        if (g == 0) {
+                            continue;
+                        }
+                        llvm::IRBuilder<> builder(inst);
+                        const auto gi  = static_cast< int64_t >(g);
+                        auto *x        = Scale(builder, a->factor, a->multiplier / gi);
+                        auto *y        = Scale(builder, b->factor, right_multiplier / gi);
+                        llvm::Value *inner = sum ? builder.CreateAdd(x, y, "cobra.factor")
+                                                 : builder.CreateSelect(select->getCondition(), x, y, "cobra.factor");
+                        auto *product = builder.CreateMul(inner, llvm::ConstantInt::get(inst->getType(), g), "cobra.factor");
+                        inst->replaceAllUsesWith(product);
+                        product->takeName(inst);
+                        llvm::RecursivelyDeleteTriviallyDeadInstructions(inst);
+                        moved = changed = true;
+                    }
+                }
+                if (!moved) {
+                    break;
+                }
+            }
+            return changed;
+        }
+
     } // namespace
 
     llvm::PreservedAnalyses
@@ -3757,6 +3898,14 @@ namespace cobra {
         };
 
         const uint64_t options_tag = OptionsTag(options_);
+
+        // Before anything reads the function: the rewrite changes no block.
+        if (HoistConstantFactors(f)) {
+            changed = true;
+            llvm::PreservedAnalyses kept;
+            kept.preserveSet< llvm::CFGAnalyses >();
+            AM.invalidate(f, kept);
+        }
 
         DemandedBitsOracle demanded_bits(f, stats, AM, options_.check_demanded_bits);
         const DemandedMaskFn demanded = [&](llvm::Instruction *inst) {
