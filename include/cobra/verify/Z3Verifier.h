@@ -30,9 +30,17 @@ namespace cobra {
             "instcombine<no-verify-fixpoint>,aggressive-instcombine,reassociate,sccp,dce,adce,"
             "instsimplify,gvn";
         // Whether kLLVM and kRace sweep a question (`SweepFormula`,
-        // cobra/verify/Sweep.h) that is not answered within a millisecond - under
-        // kRace both the compiled one and the one as built.
+        // cobra/verify/Sweep.h) that is not answered within `sweep_head_start_ms` -
+        // under kRace both the compiled one and the one as built.
         bool sweep = false;
+        // How long a question is asked as it is before it is swept. A sweep only
+        // ever proves - it finds subterms that agree and proves them equal - so a
+        // question whose answer is "these differ" is answered by the solver on the
+        // question as asked or not at all: Bitwuzla finds such a counterexample in
+        // tens of milliseconds (median 70 ms, at most 150 ms over 176 of them), a
+        // millisecond's head start found none, and the sweep then spent the whole
+        // budget on each. 150 ms finds them all.
+        uint32_t sweep_head_start_ms = 150;
     };
 
     struct Z3VerifyResult

@@ -2852,15 +2852,14 @@ namespace cobra {
 
         // How many times `z3_settings.timeout_ms` the proof of `cand` is given: one per
         // `kNodesPerBudget` instructions of its IR tree, at least one and at most
-        // `kMaxBudgetScale`. See `VerifyCandidate` for why the budget grows with the tree.
-        uint32_t ProofBudgetScale(uint32_t tree_size) {
+        // `max_budget_scale`. See `VerifyCandidate` for why the budget grows with the tree.
+        uint32_t ProofBudgetScale(uint32_t tree_size, const CobraPassOptions &options) {
             constexpr uint32_t kNodesPerBudget = 8;
-            constexpr uint32_t kMaxBudgetScale = 8;
-            return std::min(kMaxBudgetScale, std::max(1U, tree_size / kNodesPerBudget));
+            return std::min(std::max(1U, options.max_budget_scale), std::max(1U, tree_size / kNodesPerBudget));
         }
 
-        uint32_t ProofBudgetScale(const MBACandidate &cand) {
-            return ProofBudgetScale(static_cast< uint32_t >(cand.tree_size));
+        uint32_t ProofBudgetScale(const MBACandidate &cand, const CobraPassOptions &options) {
+            return ProofBudgetScale(static_cast< uint32_t >(cand.tree_size), options);
         }
 
         // Prove `proposal` equal to the tree of `cand` on the bits its readers
@@ -2997,7 +2996,7 @@ namespace cobra {
                 // unproved rewrite: a timeout is still a timeout, this only
                 // decides how long the solver is given before it is called one.
                 auto settings = options.z3_settings;
-                settings.timeout_ms *= ProofBudgetScale(cand);
+                settings.timeout_ms *= ProofBudgetScale(cand, options);
                 const auto solver_begin = std::chrono::steady_clock::now();
                 auto z3_result          = VerifyExprsWithStrategy(
                     *proved_ast, *z3_expr, cand.var_names, cand.bitwidth, settings
@@ -3301,7 +3300,7 @@ namespace cobra {
             }
 #ifdef COBRA_HAS_Z3
             auto settings = options.z3_settings;
-            settings.timeout_ms *= ProofBudgetScale(claim.tree_size);
+            settings.timeout_ms *= ProofBudgetScale(claim.tree_size, options);
             std::vector< std::string > names;
             for (uint32_t index = 0; index < claim.vars; ++index) {
                 names.push_back("v" + std::to_string(index));
@@ -3751,7 +3750,7 @@ namespace cobra {
                             stats.unknown_starved += had_it ? 0 : 1;
                             if (had_it) {
                                 SharedOutcomeCache().RecordUnknown(
-                                    task.key, ProofBudgetScale(task.input)
+                                    task.key, ProofBudgetScale(task.input, task.options)
                                 );
                             }
                             SharedOutcomeCache().MarkBackgroundUnknown(task.key);
@@ -6324,7 +6323,7 @@ namespace cobra {
             // for what that was costing. Handled exactly as a fresh timeout is: the rewrite
             // is not made this run and nothing is recorded against the tree. Asked before
             // the rewrite is built, since nothing it says depends on the IR.
-            if (!outcome->verified && cache.WasUnknown(key, ProofBudgetScale(cand))) {
+            if (!outcome->verified && cache.WasUnknown(key, ProofBudgetScale(cand, options_))) {
                 ++stats.solver_unknown_skipped;
                 ++stats.rejected_unverified;
                 left_for_later = true;
@@ -6715,7 +6714,7 @@ namespace cobra {
                 if (proof_unknown) {
                     // See `HadTheProcessor`.
                     if (HadTheProcessor(since(verify_begin), ThreadCpuNanoseconds() - cpu_begin)) {
-                        cache.RecordUnknown(key, ProofBudgetScale(cand));
+                        cache.RecordUnknown(key, ProofBudgetScale(cand, options_));
                     } else {
                         ++stats.unknown_starved;
                     }

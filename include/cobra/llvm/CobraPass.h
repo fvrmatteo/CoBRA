@@ -85,6 +85,12 @@ namespace cobra {
         // Zero leaves the walk unbounded.
         uint32_t max_tree_nodes = 48;
 
+        // At most how many times `z3_settings.timeout_ms` a proof is given: the budget
+        // grows by one for every eight instructions of the tree being replaced
+        // (`ProofBudgetScale`), up to this. A proof that comes back is quick whatever
+        // it was given; the large budgets are spent on the ones that do not.
+        uint32_t max_budget_scale = 8;
+
         // Decline a candidate whose tree stands on a value a loop carries.
         //
         // The collection looks through phis, handing on one arm, so a phi at the head

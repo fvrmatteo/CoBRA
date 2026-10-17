@@ -4,8 +4,8 @@
 // the two into cobra-verify, so both provide the same Z3Verify/Z3VerifyExprs
 // entry points. Bitwuzla is preferred when the superbuild provides it because
 // it discharges these bitvector queries faster; Z3 remains the fallback.
-#include "ConstantProduct.h"
 #include "VerifyCache.h"
+#include "cobra/verify/ConstantProduct.h"
 #include "cobra/core/Expr.h"
 #include "cobra/verify/Z3Verifier.h"
 #include <bitwuzla/cpp/bitwuzla.h>
@@ -59,7 +59,7 @@ namespace cobra {
                 case Expr::Kind::kAdd:
                     return kBinary(bitwuzla::Kind::BV_ADD);
                 case Expr::Kind::kMul:
-                    // A product by a constant as the shifts it is (ConstantProduct.h).
+                    // A product by a constant as the shifts it is (cobra/verify/ConstantProduct.h).
                     for (unsigned side = 0; side < 2; ++side) {
                         if (expr.children[side]->kind == Expr::Kind::kConstant) {
                             if (auto product = ConstantProduct(

@@ -21,7 +21,7 @@ namespace cobra {
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/verify/Sweep.h"
-#include "../verify/ConstantProduct.h"
+#include "cobra/verify/ConstantProduct.h"
 #include "../verify/VerifyCache.h"
 
 #include "llvm/IR/Constants.h"
@@ -105,6 +105,36 @@ namespace cobra {
             std::chrono::steady_clock::time_point deadline_;
         };
 
+        // `SMT_QUERY_DUMP=<dir>`: every question asked of the solver goes to
+        // <dir>/cobra-checks, with what came back after how long - the corpus the
+        // host writes for its own solvers - so the questions a run really poses
+        // can be timed and rewritten offline.
+        void DumpCheck(
+            bitwuzla::TermManager &terms, const Term &question, const Z3VerificationSettings &settings,
+            bool compiled, bool swept, bitwuzla::Result result, uint64_t microseconds
+        ) {
+            static const std::string directory = [] {
+                const char *where = std::getenv("SMT_QUERY_DUMP");
+                if (where == nullptr || *where == '\0') {
+                    return std::string{};
+                }
+                std::filesystem::create_directories(std::string(where) + "/cobra-checks");
+                return std::string(where) + "/cobra-checks";
+            }();
+            if (directory.empty()) {
+                return;
+            }
+            static std::atomic< uint64_t > sequence{ 0 };
+            bitwuzla::Bitwuzla printer(terms);
+            printer.assert_formula(question);
+            std::ofstream out(directory + "/" + std::to_string(++sequence) + ".smt2");
+            out << "; site cobra\n; method equivalence (" << (compiled ? "compiled" : "as built")
+                << (swept ? ", swept" : "") << ")\n; budget-ms " << settings.timeout_ms << "\n; answer "
+                << (result == bitwuzla::Result::UNSAT ? "unsat" : result == bitwuzla::Result::SAT ? "sat" : "unknown")
+                << "\n; microseconds " << microseconds << "\n";
+            printer.print_formula(out, "smt2");
+        }
+
         // `SMT_QUERY_DUMP=<dir>`: a question neither the solver nor the sweep
         // answered in time goes to <dir>/cobra-unanswered, as the formula before
         // the sweep, so the hard cases can be replayed on their own.
@@ -132,10 +162,6 @@ namespace cobra {
                 << ")\n; budget-ms " << settings.timeout_ms << "\n; answer unknown\n; microseconds 0\n";
             printer.print_formula(out, "smt2");
         }
-
-        // How long a compiled question is asked as it is before it is swept:
-        // most are answered well inside it and never pay for the sweep.
-        constexpr auto kSweepHeadStart = std::chrono::milliseconds(1);
 
         // ---- the question as an LLVM function -------------------------------
 
@@ -365,7 +391,7 @@ namespace cobra {
                     case llvm::Instruction::Sub:
                         return binary(Kind::BV_SUB);
                     case llvm::Instruction::Mul:
-                        // A product by a constant as the shifts it is (ConstantProduct.h).
+                        // A product by a constant as the shifts it is (cobra/verify/ConstantProduct.h).
                         for (unsigned side = 0; side < 2 && width <= 64; ++side) {
                             if (const auto *factor = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(side))) {
                                 if (auto product =
@@ -680,7 +706,9 @@ namespace cobra {
             // can take apart the very intermediate a sweep needs, so each side
             // proves some of what the other cannot.
             if (settings.sweep) {
-                result = ask(question, std::min(deadline, Clock::now() + kSweepHeadStart));
+                // Asked as it is first (`sweep_head_start_ms`): a counterexample is
+                // found there or not at all.
+                result = ask(question, std::min(deadline, Clock::now() + std::chrono::milliseconds(settings.sweep_head_start_ms)));
                 if (result == bitwuzla::Result::UNKNOWN && !stop.load(std::memory_order_relaxed)
                     && Clock::now() < deadline)
                 {
@@ -698,6 +726,12 @@ namespace cobra {
                 }
             } else {
                 result = ask(question, deadline);
+            }
+            if (!stop.load(std::memory_order_relaxed)) {
+                DumpCheck(terms, compiled, settings, optimize, swept, result,
+                          static_cast< uint64_t >(
+                              std::chrono::duration_cast< std::chrono::microseconds >(Clock::now() - begin).count()
+                          ));
             }
             if (result == bitwuzla::Result::UNSAT) {
                 return Answer::kEqual;
