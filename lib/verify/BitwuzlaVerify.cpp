@@ -4,6 +4,7 @@
 // the two into cobra-verify, so both provide the same Z3Verify/Z3VerifyExprs
 // entry points. Bitwuzla is preferred when the superbuild provides it because
 // it discharges these bitvector queries faster; Z3 remains the fallback.
+#include "ConstantProduct.h"
 #include "VerifyCache.h"
 #include "cobra/core/Expr.h"
 #include "cobra/verify/Z3Verifier.h"
@@ -58,6 +59,18 @@ namespace cobra {
                 case Expr::Kind::kAdd:
                     return kBinary(bitwuzla::Kind::BV_ADD);
                 case Expr::Kind::kMul:
+                    // A product by a constant as the shifts it is (ConstantProduct.h).
+                    for (unsigned side = 0; side < 2; ++side) {
+                        if (expr.children[side]->kind == Expr::Kind::kConstant) {
+                            if (auto product = ConstantProduct(
+                                    tm, BuildSmtExpr(tm, *expr.children[1 - side], var_terms, bitwidth),
+                                    expr.children[side]->constant_val, bitwidth
+                                ))
+                            {
+                                return *product;
+                            }
+                        }
+                    }
                     return kBinary(bitwuzla::Kind::BV_MUL);
                 case Expr::Kind::kAnd:
                     return kBinary(bitwuzla::Kind::BV_AND);
@@ -136,7 +149,8 @@ namespace cobra {
                 }
 
                 auto coeff = BvValue(tm, bitwidth, coeffs[i]);
-                auto term  = tm.mk_term(bitwuzla::Kind::BV_MUL, { coeff, product });
+                auto term  = ConstantProduct(tm, product, coeffs[i], bitwidth)
+                                .value_or(tm.mk_term(bitwuzla::Kind::BV_MUL, { coeff, product }));
                 result     = tm.mk_term(bitwuzla::Kind::BV_ADD, { result, term });
             }
             return result;

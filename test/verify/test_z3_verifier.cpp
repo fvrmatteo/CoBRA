@@ -188,3 +188,36 @@ TEST(Z3VerifierTest, ShiftByWidthOrMoreIsZero) {
     EXPECT_TRUE(result.equivalent);
     EXPECT_FALSE(result.unknown);
 }
+
+// A tree over one value that takes sums apart with masks, around a product by a dense
+// constant (0x3FFFFFFFFFFFFFFE, 61 bits set): it is `x ^ k`. Bit-blasted as an adder per set
+// bit, the product leaves the question unanswered whatever the budget; written as the shifts
+// its non-adjacent form names, `(x << 62) - (x << 1)`, it is answered at once.
+TEST(Z3VerifierTest, DenseConstantProductProved) {
+    const auto x   = [] { return Expr::Variable(0); };
+    const auto k   = [](uint64_t v) { return Expr::Constant(v); };
+    const auto sub = [](std::unique_ptr< Expr > a, std::unique_ptr< Expr > b) {
+        return Expr::Add(std::move(a), Expr::Negate(std::move(b)));
+    };
+    auto masked   = Expr::BitwiseAnd(x(), k(3829533694005038248ULL));
+    auto low      = Expr::BitwiseXor(CloneExpr(*masked), k(2379048531182044168ULL));
+    auto high     = Expr::BitwiseXor(std::move(masked), k(static_cast< uint64_t >(-2379048531182044169LL)));
+    auto other    = Expr::BitwiseXor(Expr::BitwiseAnd(x(), k(782152324422349655ULL)), k(183029263056802305ULL));
+    auto scaled   = Expr::Add(
+        sub(Expr::Mul(CloneExpr(*low), k(4611686018427387902ULL)), std::move(other)), k(4611686018427387902ULL)
+    );
+    auto carry    = sub(
+        Expr::Add(Expr::BitwiseAnd(x(), k(static_cast< uint64_t >(-4012562957061840554LL))), k(183029263056802306ULL)),
+        Expr::BitwiseAnd(x(), k(183029263056802305ULL))
+    );
+    auto doubled  = Expr::Add(Expr::Mul(CloneExpr(*low), k(2)), std::move(carry));
+    auto original = sub(
+        Expr::BitwiseAnd(std::move(scaled), std::move(low)), Expr::BitwiseAnd(std::move(doubled), std::move(high))
+    );
+    auto simplified = Expr::BitwiseXor(x(), k(static_cast< uint64_t >(-2562077794238846474LL)));
+    Z3VerificationSettings settings;
+    settings.timeout_ms = 2000;
+    const auto result   = Z3VerifyExprs(*original, *simplified, { "x" }, 64, settings);
+    EXPECT_TRUE(result.equivalent);
+    EXPECT_FALSE(result.unknown);
+}

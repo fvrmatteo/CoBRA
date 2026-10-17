@@ -21,6 +21,7 @@ namespace cobra {
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/verify/Sweep.h"
+#include "../verify/ConstantProduct.h"
 #include "../verify/VerifyCache.h"
 
 #include "llvm/IR/Constants.h"
@@ -364,6 +365,16 @@ namespace cobra {
                     case llvm::Instruction::Sub:
                         return binary(Kind::BV_SUB);
                     case llvm::Instruction::Mul:
+                        // A product by a constant as the shifts it is (ConstantProduct.h).
+                        for (unsigned side = 0; side < 2 && width <= 64; ++side) {
+                            if (const auto *factor = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(side))) {
+                                if (auto product =
+                                        ConstantProduct(terms_, op(1 - side), factor->getZExtValue(), width))
+                                {
+                                    return *product;
+                                }
+                            }
+                        }
                         return binary(Kind::BV_MUL);
                     case llvm::Instruction::And:
                         return binary(Kind::BV_AND);
