@@ -5044,9 +5044,16 @@ namespace cobra {
                         }
                     }
                 }
-                // A tree of one instruction is the comparison already.
+                // A tree of one instruction is the comparison already - but for a
+                // product by an odd constant other than one: `x * P == k` is
+                // `x == k * P^-1`, which InstCombine leaves as it is.
+                const auto scaled = [](const MBACandidate &candidate) {
+                    const auto factor = ProductFactor(*candidate.expr, 0);
+                    return factor.has_value() && (*factor & 1) != 0 && *factor != 1;
+                };
                 if (reading == nullptr || reading->expr == nullptr || reading->var_names.size() != 1
-                    || reading->tree.size() < 2 || reading->leaf_values.size() != 1)
+                    || (reading->tree.size() < 2 && !(reading->tree.size() == 1 && scaled(*reading)))
+                    || reading->leaf_values.size() != 1)
                 {
                     if (pair == nullptr) {
                         continue;
@@ -5187,11 +5194,13 @@ namespace cobra {
                         }
                     }
                     // The product the tree already computes, when it does: its
-                    // poison is the comparison's, once its own flags are gone.
+                    // poison is the comparison's, once its own flags are gone. A tree
+                    // that is the product and nothing else is the comparison as it was,
+                    // and is written over the value instead.
                     llvm::Instruction *product = nullptr;
                     for (auto *ti : reading->tree) {
                         auto *mul = llvm::dyn_cast< llvm::BinaryOperator >(ti);
-                        if (mul == nullptr || mul->getOpcode() != llvm::Instruction::Mul) {
+                        if (mul == nullptr || mul->getOpcode() != llvm::Instruction::Mul || reading->tree.size() < 2) {
                             continue;
                         }
                         for (unsigned side = 0; side < 2; ++side) {

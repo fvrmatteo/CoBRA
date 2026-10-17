@@ -55,6 +55,32 @@ define i1 @negated_product_only(i64 %x) {
   ret i1 %r
 }
 
+; A tree that is the product and nothing else is the comparison as it was: `x`
+; scaled by `P^-1` and compared with `k` is `x == k * P`, and the product goes.
+;
+; CHECK-LABEL: @product_alone(
+; CHECK-NOT: mul
+; CHECK: [[R:%.*]] = icmp eq i64 %x, -2212647683481811901
+; CHECK-NEXT: ret i1 [[R]]
+define i1 @product_alone(i64 %x) {
+  %m = mul i64 %x, -3560570117845248645
+  %r = icmp eq i64 %m, 307942621951445809
+  ret i1 %r
+}
+
+; The control: a product by an even constant equals `k` for two values of `x`, and
+; stays.
+;
+; CHECK-LABEL: @even_product_alone(
+; CHECK: mul i64 %x, 6
+; CHECK: icmp eq i64
+; CHECK: ret i1
+define i1 @even_product_alone(i64 %x) {
+  %m = mul i64 %x, 6
+  %r = icmp eq i64 %m, 12
+  ret i1 %r
+}
+
 ; A product compared with a range is no equality with one value: `m ^ -m` is below
 ; 1000 only where it is zero, for `m` 0 or 2^63 - and for an odd factor that is `x` 0
 ; or 2^63, every bit but the sign clear: a test of some of `x`'s bits.
