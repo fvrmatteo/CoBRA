@@ -4790,7 +4790,12 @@ namespace cobra {
         // `f - l == 32` is tested as `(f - l - 32) | ((l + 32) - f)` with `f - l`
         // and `l - f` computed apart, so the tree reads nothing twice and no cut
         // makes it a tree over one value. The lines are those through the
-        // constants the tree is built from, as for one value; each is evaluated
+        // constants the tree is built from, as for one value, and the one where a
+        // tree affine in the two values meets the constant: `(c - l) + f == k` is
+        // `f - l == k - c`, with `c` the tree at the origin - which no constant of
+        // it is, and which a constant term shared with another comparison keeps
+        // from folding in front of it (`c - l` read by two tests is no `add` with
+        // a constant to either of them). Each is evaluated
         // at points on it and off it, and only one that fits is asked of the
         // solver. The comparison is written over the difference or sum the tree
         // computes, or one built beside it.
@@ -4814,6 +4819,10 @@ namespace cobra {
             };
             offer(k);
             offer(~k + 1);
+            std::vector< uint64_t > values(2, 0);
+            const uint64_t meets = (k - EvalExpr(*reading.expr, values, bw)) & mask;
+            offer(meets);
+            offer(~meets + 1);
             for (const auto *ti : reading.tree) {
                 for (const auto &operand : ti->operands()) {
                     if (const auto *c = llvm::dyn_cast< llvm::ConstantInt >(operand.get());
@@ -4826,7 +4835,6 @@ namespace cobra {
                 }
             }
             const auto line = [&](bool sum, uint64_t a, uint64_t b) { return (sum ? a + b : a - b) & mask; };
-            std::vector< uint64_t > values(2);
             for (const bool sum : { false, true }) {
                 for (const uint64_t point : points) {
                     // Which of `==` and `!=` the comparison is on the line, if
@@ -4918,8 +4926,10 @@ namespace cobra {
         //
         // The value the test turns at cannot be found by probing - an equality
         // turns at one input of the whole range - and is not searched for either:
-        // it is one of the constants the tree is built from, or its negation, or
-        // the constant compared with, or where the tested value meets the one it is
+        // it is one of the constants the tree is built from, or its negation or
+        // complement, or the constant compared with (or its negation or complement:
+        // `((2 * h) | c) ^ h == k` holds exactly at `h == ~k`), or where the tested
+        // value meets the one it is
         // compared with when their difference is affine in `x` (`AffineZero`). Each
         // is asked of the solver, as an
         // equivalence of the comparison with `x == v` (and `x != v`) over every
@@ -5104,12 +5114,13 @@ namespace cobra {
                 if (condition == nullptr) {
                     continue;
                 }
-                // The constants the tree is built from, with their negations and
-                // the constant compared with: where an obfuscated equality turns.
-                llvm::SmallVector< uint64_t, 16 > points;
+                // The constants the tree is built from and the constant compared
+                // with, each with its negation and its complement: where an
+                // obfuscated equality turns.
+                llvm::SmallVector< uint64_t, 24 > points;
                 const auto offer = [&](uint64_t v) {
                     v &= mask;
-                    if (points.size() < 16 && !llvm::is_contained(points, v)) {
+                    if (points.size() < 24 && !llvm::is_contained(points, v)) {
                         points.push_back(v);
                     }
                 };
@@ -5128,6 +5139,7 @@ namespace cobra {
                 }
                 offer(k);
                 offer(~k + 1);
+                offer(~k);
                 for (const auto *ti : reading->tree) {
                     for (const auto &operand : ti->operands()) {
                         if (const auto *c = llvm::dyn_cast< llvm::ConstantInt >(operand.get());
@@ -5136,6 +5148,7 @@ namespace cobra {
                             const uint64_t v = static_cast< uint64_t >(c->getValue().getSExtValue());
                             offer(v);
                             offer(~v + 1);
+                            offer(~v);
                         }
                     }
                 }
@@ -5152,21 +5165,23 @@ namespace cobra {
                     const uint64_t factor  = products.front().factor;
                     const uint64_t inverse = OddInverse(factor, bw);
                     const auto over        = OverProducts(*condition, products, bw);
-                    llvm::SmallVector< uint64_t, 16 > over_points;
+                    llvm::SmallVector< uint64_t, 24 > over_points;
                     const auto offer_over = [&](uint64_t v) {
                         v &= mask;
-                        if (over_points.size() < 16 && !llvm::is_contained(over_points, v)) {
+                        if (over_points.size() < 24 && !llvm::is_contained(over_points, v)) {
                             over_points.push_back(v);
                         }
                     };
                     offer_over(k);
                     offer_over(~k + 1);
+                    offer_over(~k);
                     llvm::SmallVector< const Expr *, 32 > nodes{ over.get() };
                     while (!nodes.empty()) {
                         const Expr *node = nodes.pop_back_val();
                         if (node->kind == Expr::Kind::kConstant) {
                             offer_over(node->constant_val);
                             offer_over(~node->constant_val + 1);
+                            offer_over(~node->constant_val);
                         }
                         for (const auto &child : node->children) {
                             nodes.push_back(child.get());

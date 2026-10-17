@@ -49,6 +49,46 @@ define i1 @lowest_set_bit(i64 %x) {
   ret i1 %r
 }
 
+; `((2 * x) | c) ^ x` is a bijection of `x`: compared with `k` it holds at one value,
+; which is none of the tree's constants and neither `k` nor `-k`, but `~k`.
+;
+; CHECK-LABEL: @complement_of_the_constant(
+; CHECK-NEXT: [[R:%.*]] = icmp eq i64 %x, 8910050711687093894
+; CHECK-NEXT: ret i1 [[R]]
+define i1 @complement_of_the_constant(i64 %x) {
+  %d = shl i64 %x, 1
+  %o = or i64 %d, 626642650335363827
+  %t = xor i64 %o, %x
+  %r = icmp eq i64 %t, -8910050711687093895
+  ret i1 %r
+}
+
+; Two values on a line, `(c - l) + f == k`, with `c - l` read by two comparisons: no
+; `add` with a constant is left to fold in front of either, and the line `f - l ==
+; k - c` goes through no constant of the tree. Both are read where the tree meets the
+; constant, and the shared term is left to nobody.
+;
+; CHECK-LABEL: @line_through_a_shared_constant(
+; CHECK-NOT: sub i64 -33
+; CHECK: [[A:%.*]] = sub i64 %first, %l
+; CHECK-NEXT: icmp eq i64 [[A]], 32
+; CHECK: [[B:%.*]] = sub i64 %next, %l
+; CHECK-NEXT: icmp eq i64 [[B]], 32
+; CHECK: ret void
+define void @line_through_a_shared_constant(i64 %l, i64 %first, i64 %next, ptr %out) {
+  %s = sub i64 -33, %l
+  %a = add i64 %first, %s
+  %t1 = icmp eq i64 %a, -1
+  %z1 = zext i1 %t1 to i8
+  store i8 %z1, ptr %out
+  %b = add i64 %next, %s
+  %t2 = icmp eq i64 %b, -1
+  %z2 = zext i1 %t2 to i8
+  %p = getelementptr i8, ptr %out, i64 1
+  store i8 %z2, ptr %p
+  ret void
+}
+
 ; The control: a comparison true for many values is no equality, and stays.
 ;
 ; CHECK-LABEL: @range_test(
