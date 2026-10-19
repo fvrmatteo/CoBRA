@@ -340,11 +340,14 @@ namespace cobra {
     // it encloses has usually been attempted under some other root, and building
     // a candidate costs a tree walk and a signature sweep whether or not anyone
     // ends up looking at it. Only the caller knows which ones are new.
+    //
+    // `wide_cut_nodes` reads an inner root with more leaves than `max_vars` cut
+    // short, as `DetectMbaCandidates` does.
     std::vector< MBACandidate > ExpandMbaCandidate(
         llvm::ArrayRef< llvm::Instruction * > inner_roots, uint32_t min_ast_size,
         uint32_t max_vars, uint64_t options_tag,
         MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,
-        const DemandedMaskFn &demanded = {}
+        const DemandedMaskFn &demanded = {}, uint32_t wide_cut_nodes = 0
     );
 
     // The same root as `cand`, re-collected with the tree cut short so that

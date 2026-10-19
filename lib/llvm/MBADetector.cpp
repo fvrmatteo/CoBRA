@@ -3353,12 +3353,12 @@ namespace cobra {
     std::vector< MBACandidate > ExpandMbaCandidate(
         llvm::ArrayRef< llvm::Instruction * > inner_roots, uint32_t min_ast_size,
         uint32_t max_vars, uint64_t options_tag, MbaCostModel cost_model,
-        uint32_t max_tree_nodes, const DemandedMaskFn &demanded
+        uint32_t max_tree_nodes, const DemandedMaskFn &demanded, uint32_t wide_cut_nodes
     ) {
         std::vector< MBACandidate > candidates;
         BuildCandidates(
             inner_roots, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
-            max_tree_nodes, demanded
+            max_tree_nodes, demanded, nullptr, nullptr, nullptr, false, NarrowReading::kNone, wide_cut_nodes
         );
         return candidates;
     }

@@ -6052,7 +6052,8 @@ namespace cobra {
                 }
                 auto inners = ExpandMbaCandidate(
                     fresh, options_.min_ast_size, options_.max_vars, options_tag,
-                    options_.cost_model, options_.max_tree_nodes, demanded
+                    options_.cost_model, options_.max_tree_nodes, demanded,
+                    options_.cut_wide_roots ? options_.max_recut_nodes : 0
                 );
                 stats.inner_nanoseconds += since(inner_begin);
                 for (auto &cut : slices) {
