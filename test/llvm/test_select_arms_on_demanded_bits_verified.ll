@@ -68,11 +68,18 @@ define i64 @arms_differ(i64 noundef %x, i1 %c) {
   ret i64 %r
 }
 
-; The control: a leaf that may be `undef` is read by each arm on its own.
+; A leaf that may be `undef` is read by each arm on its own, so neither arm is
+; taken for the `select` here. The true arm is still a tree of its own: on the bits
+; read it is `x * P`, proved over the product it reads `x` as, and written as the
+; `%w` the function holds - every value that `%w` takes, the true arm could take with
+; its own reading of `x`, and both are poison exactly where `x` is. The `select` is
+; then of one value on both arms, and goes.
 ;
 ; CHECK-LABEL: @undefined_leaf(
-; CHECK: select
-; CHECK: ret i64
+; CHECK-NOT: select
+; CHECK: [[W:%.*]] = mul i64 %x, 16777619
+; CHECK-NEXT: [[R:%.*]] = and i64 [[W]], 4294967295
+; CHECK-NEXT: ret i64 [[R]]
 define i64 @undefined_leaf(i64 %x, i1 %c) {
   %w = mul i64 %x, 16777619
   %n = mul i64 %x, -16777619

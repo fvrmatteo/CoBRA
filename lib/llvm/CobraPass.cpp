@@ -1066,6 +1066,7 @@ namespace cobra {
             key += std::to_string(static_cast< uint64_t >(options.enabled_families));
             key += options.boolean_variables ? "|b" : "|";
             key += options.read_conditions ? "c" : "";
+            key += options.cut_wide_roots ? "w" : "";
             // The boolean cut is searched by the boolean reading alone, so its
             // verdict is not the one an identical tree read the ordinary way has.
             key += cand.node_limit == kBooleanCutLimit ? "B" : "";
@@ -1351,6 +1352,7 @@ namespace cobra {
             tag = mix(tag, static_cast< uint64_t >(options.leaf_freezing));
             tag = mix(tag, options.boolean_variables ? 1 : 0);
             tag = mix(tag, options.read_conditions ? 1 : 0);
+            tag = mix(tag, options.cut_wide_roots ? 1 : 0);
             // What the records mean changes with the pass itself as well as
             // with its settings: a host that keeps `!cobra.mba` on IR it saves
             // and loads again must not read a verdict an older build wrote
@@ -2868,6 +2870,16 @@ namespace cobra {
         // bits and variable count, which is everything the proof reads, and the
         // rewrite names its variables by position. Returns the rewrite marked
         // verified, or null when the proof fails or cannot be had.
+#ifdef COBRA_HAS_Z3
+        // `lhs = rhs` asked again over the products of what they read
+        // (`ProductVariables`), for a proof that had no answer as it was asked;
+        // nothing when no variable is read only as products by constants.
+        std::optional< Z3VerifyResult > VerifyOverProducts(
+            const Expr &lhs, const Expr &rhs, const std::vector< std::string > &var_names, uint32_t bitwidth,
+            const Z3VerificationSettings &settings
+        );
+#endif
+
         OutcomeCache::Entry VerifyCandidate(
             const MBACandidate &cand, const CandidateOutcome &proposal,
             const CobraPassOptions &options, CobraStatistics &stats, bool *unknown = nullptr
@@ -3001,6 +3013,18 @@ namespace cobra {
                 auto z3_result          = VerifyExprsWithStrategy(
                     *proved_ast, *z3_expr, cand.var_names, cand.bitwidth, settings
                 );
+                // A tree that reads a value only through products by constants
+                // and a rewrite that reads it as another product is a question
+                // about two products the solver bit-blasts, which it often
+                // cannot answer: `-(x * -k)` written the long way round against
+                // `x * k`. Over `w = x * p` it is a question about `w` alone.
+                if (z3_result.unknown) {
+                    if (auto over = VerifyOverProducts(*proved_ast, *z3_expr, cand.var_names, cand.bitwidth, settings);
+                        over.has_value() && !over->unknown)
+                    {
+                        z3_result = *over;
+                    }
+                }
                 const uint64_t solving = since(solver_begin);
                 ++stats.solver_calls;
                 stats.solver_nanoseconds += solving;
@@ -4634,6 +4658,21 @@ namespace cobra {
         // asked as they are, and asked again over the products of what they read
         // when the solver had no answer. A refutation is final: the change is
         // one to one, so the statement is false over the products too.
+        std::optional< Z3VerifyResult > VerifyOverProducts(
+            const Expr &lhs, const Expr &rhs, const std::vector< std::string > &var_names, uint32_t bitwidth,
+            const Z3VerificationSettings &settings
+        ) {
+            const auto both    = Expr::BitwiseXor(CloneExpr(lhs), CloneExpr(rhs));
+            const auto changed = ProductVariables(*both, var_names.size());
+            if (changed.empty()) {
+                return std::nullopt;
+            }
+            return VerifyExprsWithStrategy(
+                *OverProducts(lhs, changed, bitwidth), *OverProducts(rhs, changed, bitwidth), var_names, bitwidth,
+                settings
+            );
+        }
+
         bool ProvedEqual(
             const Expr &lhs, const Expr &rhs, const std::vector< std::string > &var_names, uint32_t bitwidth,
             const CobraPassOptions &options
@@ -4645,16 +4684,8 @@ namespace cobra {
             if (!direct.unknown) {
                 return false;
             }
-            const auto both    = Expr::BitwiseXor(CloneExpr(lhs), CloneExpr(rhs));
-            const auto changed = ProductVariables(*both, var_names.size());
-            if (changed.empty()) {
-                return false;
-            }
-            const auto proof = VerifyExprsWithStrategy(
-                *OverProducts(lhs, changed, bitwidth), *OverProducts(rhs, changed, bitwidth), var_names, bitwidth,
-                options.z3_settings
-            );
-            return proof.equivalent && !proof.unknown;
+            const auto proof = VerifyOverProducts(lhs, rhs, var_names, bitwidth, options.z3_settings);
+            return proof.has_value() && proof->equivalent && !proof->unknown;
         }
 
         // The fingerprint of the tree a comparison was last read over
@@ -5671,7 +5702,8 @@ namespace cobra {
         const auto detect_begin = std::chrono::steady_clock::now();
         auto candidates = DetectMbaCandidates(
             f, options_.min_ast_size, options_.max_vars, options_tag, options_.cost_model,
-            options_.max_tree_nodes, demanded, options_.read_conditions
+            options_.max_tree_nodes, demanded, options_.read_conditions,
+            options_.cut_wide_roots ? options_.max_recut_nodes : 0
         );
         stats.detect_nanoseconds += since(detect_begin);
         stats.detected = candidates.size();
@@ -6968,6 +7000,19 @@ namespace cobra {
                 llvm::errs() << "\n";
             }
             llvm::RecursivelyDeleteTriviallyDeadInstructions(dead);
+        }
+
+        // A `select` the rewrites left with one value on both arms is that value:
+        // an arm proved equal to the other is answered with the instruction the
+        // function already holds for it.
+        for (auto &inst : llvm::make_early_inc_range(llvm::instructions(f))) {
+            if (auto *select = llvm::dyn_cast< llvm::SelectInst >(&inst);
+                select != nullptr && select->getTrueValue() == select->getFalseValue())
+            {
+                select->replaceAllUsesWith(select->getTrueValue());
+                select->eraseFromParent();
+                changed = true;
+            }
         }
 
 #ifdef COBRA_HAS_Z3

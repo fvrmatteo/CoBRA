@@ -43,6 +43,7 @@ namespace {
     //   sweep                    z3_settings.sweep
     //   boolean                  boolean_variables
     //   conditions               read_conditions
+    //   wide-roots               cut_wide_roots
     //   dying-cost               cost_model = kDyingInstructions
     //   skip-loop-carried-phis   skip_loop_carried_phis
     //   across-freeze            leaf_freezing = kAcrossFreeze
@@ -79,6 +80,8 @@ namespace {
                     options.boolean_variables = true;
                 } else if (name == "conditions") {
                     options.read_conditions = true;
+                } else if (name == "wide-roots") {
+                    options.cut_wide_roots = true;
                 } else if (name == "verified-conditions") {
                     options.z3_verify       = true;
                     options.read_conditions = true;

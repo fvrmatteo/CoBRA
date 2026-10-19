@@ -319,10 +319,15 @@ namespace cobra {
     // `read_conditions` (`CobraPassOptions::read_conditions`) also takes as a
     // root a comparison nothing but a terminator reads: it is the top of its own
     // tree, read at the width of its operands and on its one bit.
+    //
+    // `wide_cut_nodes`, when non-zero (`CobraPassOptions::cut_wide_roots`),
+    // reads a root whose tree has more leaves than `max_vars` with its tree cut
+    // short instead: the smallest cut of at most that many nodes that is a
+    // candidate.
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
         MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,
-        const DemandedMaskFn &demanded = {}, bool read_conditions = false
+        const DemandedMaskFn &demanded = {}, bool read_conditions = false, uint32_t wide_cut_nodes = 0
     );
 
     // Candidates for `inner_roots`, to be used once the tree enclosing them has

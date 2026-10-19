@@ -167,6 +167,24 @@ namespace cobra {
         // than its speed.
         bool read_conditions = false;
 
+        // Read a root whose tree ends in more leaves than `max_vars` with its
+        // tree cut short, instead of turning it down.
+        //
+        // The tree of a root is collected down to values nothing simplifies
+        // further, and in a long chain - a hash taken one byte at a time - every
+        // root's tree reaches all of its bytes. A root that computes, from the
+        // value just below it, a word written the long way round (`-y` as
+        // `((~y << 1) | 2) - (y ^ -2)`) is then never asked about, because its
+        // tree holds every byte of the chain. Cut at the nodes nearest the root,
+        // the tree is the identity over that one value. The first cut is the
+        // smallest that is a candidate at all, and each rejection cuts again one
+        // node deeper, up to `max_recut_nodes`, as the re-cuts of any rejected
+        // root do.
+        //
+        // Every such root costs a ladder of small searches, so it is off by
+        // default, for a consumer that reads its output rather than its speed.
+        bool cut_wide_roots = false;
+
         // Hold a turned-down root's fingerprint until every slice, sum group
         // and cut queued from it has decided.
         //

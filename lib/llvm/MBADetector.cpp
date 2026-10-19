@@ -2878,7 +2878,8 @@ namespace cobra {
             bool cut_arith_under_bitwise = false, uint32_t max_tree_nodes = 0,
             const DemandedMaskFn &demanded = {}, const SharedCut *shared_cut = nullptr,
             const Slice *slice = nullptr, const SumGroup *sum_group = nullptr,
-            bool boolean_cut = false, NarrowReading narrow = NarrowReading::kNone
+            bool boolean_cut = false, NarrowReading narrow = NarrowReading::kNone,
+            uint32_t wide_cut_nodes = 0
         ) {
             const auto *opaque = shared_cut != nullptr ? &shared_cut->opaque : nullptr;
             // The summands this group leaves out, read as zero wherever the
@@ -2893,6 +2894,10 @@ namespace cobra {
             }
             const auto *reads_as = sum_group != nullptr ? &zeroed : nullptr;
             llvm::DenseSet< llvm::Instruction * > already_in_tree;
+            // The roots turned down for their leaves, read again cut short once
+            // every root has been collected whole (`wide_cut_nodes`), with the
+            // width each was read at.
+            llvm::SmallVector< std::pair< llvm::Instruction *, uint32_t >, 16 > wide;
 
             for (auto *root : roots) {
                 auto &inst = *root;
@@ -2990,6 +2995,12 @@ namespace cobra {
                 }
                 if (over_cap()) {
                     DeclinedRoot(inst, "more leaves than max_vars", tree_insts.size(), leaves.size());
+                    if (wide_cut_nodes != 0 && max_nodes == 0 && !cut_arith_under_bitwise
+                        && shared_cut == nullptr && slice == nullptr && sum_group == nullptr && !boolean_cut
+                        && narrow == NarrowReading::kNone)
+                    {
+                        wide.push_back({ &inst, bw });
+                    }
                     continue;
                 }
 
@@ -3237,6 +3248,43 @@ namespace cobra {
                                       : std::vector< std::pair< llvm::Value *, bool > >{} }
                 );
             }
+
+            // Each is read first at the cut over the fewest leaves, the smallest
+            // such cut: where the values below the root come together again, as
+            // `-y` written over `~y` and `y` does at `y`. A cut that only stops
+            // short of a value it then reads twice is no smaller a question, and
+            // read first it is answered alone - the shift inside such a negation
+            // rewritten as a product, which leaves nothing of the identity for
+            // the root above it. A cut is collected on its own, so what it claims
+            // is its own: the roots inside a wide root are still collected whole
+            // above.
+            for (const auto &[root, width] : wide) {
+                uint32_t first  = 0;
+                size_t fewest   = 0;
+                for (uint32_t nodes = 1; nodes <= wide_cut_nodes; ++nodes) {
+                    llvm::SmallVector< llvm::Instruction *, 16 > cut_insts;
+                    std::vector< llvm::Value * > cut_leaves;
+                    llvm::DenseMap< llvm::Value *, llvm::Value * > cut_redirects;
+                    CollectTree(root, width, cut_insts, cut_leaves, cut_redirects, true, nodes);
+                    if (cut_insts.size() < nodes) {
+                        break;
+                    }
+                    if (cut_insts.size() >= min_ast_size && (first == 0 || cut_leaves.size() < fewest)) {
+                        first  = nodes;
+                        fewest = cut_leaves.size();
+                    }
+                }
+                for (uint32_t nodes = first; nodes != 0 && nodes <= wide_cut_nodes; ++nodes) {
+                    const size_t before = candidates.size();
+                    BuildCandidates(
+                        { root }, min_ast_size, max_vars, cost_model, options_tag, candidates, nodes,
+                        false, 0, demanded
+                    );
+                    if (candidates.size() > before) {
+                        break;
+                    }
+                }
+            }
         }
 
     } // namespace
@@ -3244,7 +3292,7 @@ namespace cobra {
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
         MbaCostModel cost_model, uint32_t max_tree_nodes, const DemandedMaskFn &demanded,
-        bool read_conditions
+        bool read_conditions, uint32_t wide_cut_nodes
     ) {
         // Post-order: process uses before defs across blocks. Within each block,
         // reverse iteration hits outermost roots first, so the largest MBA tree
@@ -3297,7 +3345,7 @@ namespace cobra {
         }
         BuildCandidates(
             roots, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
-            max_tree_nodes, demanded
+            max_tree_nodes, demanded, nullptr, nullptr, nullptr, false, NarrowReading::kNone, wide_cut_nodes
         );
         return candidates;
     }
