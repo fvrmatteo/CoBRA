@@ -3259,6 +3259,37 @@ namespace cobra {
             // is its own: the roots inside a wide root are still collected whole
             // above.
             for (const auto &[root, width] : wide) {
+                // First the cut at the values the tree reads more than once,
+                // the first rung of the shared-value ladder (`SharedCutMbaCandidate`,
+                // which takes it on from there): where an identity over one value
+                // comes together again, however many levels it is written in. A
+                // breadth-first cut stops at a depth, and one more level of the
+                // same identity - `~y` written as `-y - 1` - moves the value it
+                // is over past that depth.
+                {
+                    llvm::SmallVector< llvm::Instruction *, 16 > full_insts;
+                    std::vector< llvm::Value * > full_leaves;
+                    llvm::DenseMap< llvm::Value *, llvm::Value * > full_redirects;
+                    CollectTree(
+                        root, width, full_insts, full_leaves, full_redirects, true, 0, false, max_tree_nodes
+                    );
+                    const llvm::DenseSet< const llvm::Value * > full_set(full_insts.begin(), full_insts.end());
+                    SharedCut cut;
+                    for (auto *ti : full_insts) {
+                        if (ti != root && llvm::count_if(ti->uses(), [&](const llvm::Use &use) {
+                                return full_set.contains(use.getUser());
+                            }) > 1)
+                        {
+                            cut.opaque.insert(ti);
+                        }
+                    }
+                    if (!cut.opaque.empty()) {
+                        BuildCandidates(
+                            { root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
+                            max_tree_nodes, demanded, &cut
+                        );
+                    }
+                }
                 uint32_t first  = 0;
                 size_t fewest   = 0;
                 for (uint32_t nodes = 1; nodes <= wide_cut_nodes; ++nodes) {

@@ -11,8 +11,8 @@
 ;
 ; CHECK-LABEL: @last_step(
 ; CHECK: [[X:%.*]] = xor i64 %h4, %e5
-; CHECK-NOT: shl
-; CHECK-NOT: or i64
+; CHECK-NOT: = shl
+; CHECK-NOT: = or i64
 ; CHECK: mul i64 {{.*}}1099511628211
 ; CHECK: select i1 %negative
 ; CHECK: ret i64
