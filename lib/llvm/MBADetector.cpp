@@ -1757,7 +1757,9 @@ namespace cobra {
                          << ", leaves " << leaves << ")\n";
         }
 
-        bool HasPolynomialMul(
+        // The multiplications in the tree whose operands both depend on a
+        // leaf: products of two variables, which a linear reading cannot hold.
+        llvm::SmallVector< llvm::Instruction *, 4 > PolynomialMuls(
             llvm::Instruction *root, const llvm::DenseSet< llvm::Value * > &visited_tree
         ) {
             llvm::DenseMap< llvm::Value *, bool > depends_on_var;
@@ -1814,6 +1816,7 @@ namespace cobra {
                 }
             }
 
+            llvm::SmallVector< llvm::Instruction *, 4 > products;
             for (auto *v : visited) {
                 auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
                 if (inst == nullptr) {
@@ -1828,10 +1831,10 @@ namespace cobra {
                 const bool lhs_dep = depends_on_var.lookup(inst->getOperand(0));
                 const bool rhs_dep = depends_on_var.lookup(inst->getOperand(1));
                 if (lhs_dep && rhs_dep) {
-                    return true;
+                    products.push_back(inst);
                 }
             }
-            return false;
+            return products;
         }
 
         // Logical negation of a 0/1 value. Expr::BitwiseNot is bitwise, so it
@@ -2942,11 +2945,6 @@ namespace cobra {
                 llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
                 std::vector< llvm::Value * > leaves;
                 llvm::DenseMap< llvm::Value *, llvm::Value * > phi_redirects;
-                CollectTree(
-                    &inst, bw, tree_insts, leaves, phi_redirects,
-                    /*try_phi_transparency=*/true, max_nodes, cut_arith_under_bitwise,
-                    max_tree_nodes, opaque, reads_as, narrow
-                );
 
                 // The sweep below is 2^leaves, so every leaf doubles the price
                 // of finding out whether the solver can use the tree at all.
@@ -2982,17 +2980,64 @@ namespace cobra {
                 // A tree past the leaf cap is collected again the same way when
                 // it read through a phi: the arms' cones bring their own leaves,
                 // and with the phi a leaf the tree may well fit.
-                if (has_phi_redirect()
-                    && (over_cap() || !VerifyPhiArms(&inst, phi_redirects, tree_insts, leaves)))
-                {
+                const llvm::DenseSet< const llvm::Value * > *held = opaque;
+                const auto collect = [&] {
                     tree_insts.clear();
                     leaves.clear();
                     phi_redirects.clear();
                     CollectTree(
                         &inst, bw, tree_insts, leaves, phi_redirects,
-                        /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
-                        max_tree_nodes, opaque, reads_as, narrow
+                        /*try_phi_transparency=*/true, max_nodes, cut_arith_under_bitwise,
+                        max_tree_nodes, held, reads_as, narrow
                     );
+                    if (has_phi_redirect()
+                        && (over_cap() || !VerifyPhiArms(&inst, phi_redirects, tree_insts, leaves)))
+                    {
+                        tree_insts.clear();
+                        leaves.clear();
+                        phi_redirects.clear();
+                        CollectTree(
+                            &inst, bw, tree_insts, leaves, phi_redirects,
+                            /*try_phi_transparency=*/false, max_nodes, cut_arith_under_bitwise,
+                            max_tree_nodes, held, reads_as, narrow
+                        );
+                    }
+                };
+
+                // A product of two values the tree computes is read as a leaf,
+                // and the tree collected again around it: the sum, the masks
+                // and the selects above it are still a linear expression, over
+                // the product as one more variable. Which products a tree
+                // holds otherwise depends on where its collection stopped - a
+                // larger `max_tree_nodes` reaches one that a smaller cap left
+                // below the cut, and the whole root used to be declined for it.
+                // A collection that goes further may meet another product, so
+                // this repeats, a few times at most; the root itself a product
+                // is declined as before.
+                constexpr unsigned kProductRounds = 4;
+                llvm::DenseSet< const llvm::Value * > held_products;
+                bool polynomial_root = false;
+                collect();
+                for (unsigned round = 0;; ++round) {
+                    const llvm::DenseSet< llvm::Value * > collected(tree_insts.begin(), tree_insts.end());
+                    const auto products = PolynomialMuls(&inst, collected);
+                    if (products.empty()) {
+                        break;
+                    }
+                    if (round == kProductRounds || llvm::is_contained(products, &inst)) {
+                        polynomial_root = true;
+                        break;
+                    }
+                    if (held_products.empty() && opaque != nullptr) {
+                        held_products.insert(opaque->begin(), opaque->end());
+                    }
+                    held_products.insert(products.begin(), products.end());
+                    held = &held_products;
+                    collect();
+                }
+                if (polynomial_root) {
+                    DeclinedRoot(inst, "a polynomial multiplication", tree_insts.size(), leaves.size());
+                    continue;
                 }
                 if (over_cap()) {
                     DeclinedRoot(inst, "more leaves than max_vars", tree_insts.size(), leaves.size());
@@ -3047,10 +3092,6 @@ namespace cobra {
                 const llvm::DenseSet< llvm::Value * > tree_set(
                     tree_insts.begin(), tree_insts.end()
                 );
-                if (HasPolynomialMul(&inst, tree_set)) {
-                    DeclinedRoot(inst, "a polynomial multiplication", tree_insts.size(), leaves.size());
-                    continue;
-                }
 
                 // Which of the tree's instructions actually disappear if the root
                 // is replaced. The root always does; anything else only follows
