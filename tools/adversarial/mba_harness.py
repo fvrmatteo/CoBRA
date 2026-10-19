@@ -113,12 +113,36 @@ def identity_xor_mba(h, e):
     return op('mul', x, const(PRIME))
 
 
+def lowered(e):
+    # The byte lower-cased: `c | 32` where `c` is in 'A'..'Z'.
+    in_range = Node('icmp', op('add', e, const(-65)), const(26), pred='ult')
+    return Node('select', in_range, op('or', e, const(32)), e)
+
+
+def step_lower(h, e):
+    return op('mul', op('xor', h, lowered(e)), const(PRIME))
+
+
+def identity_lower_key(h, e, junk):
+    # The lower-cased step plus a key term over the lowered byte that is zero:
+    # (v | k) - (v & k) - (v ^ k), as a rolling key mixes in what it hashes.
+    v = lowered(e)
+    k = const(1640939767)
+    zero = op('sub', op('sub', op('or', v, k), op('and', v, k)), op('xor', v, k))
+    return op('add', op('mul', op('xor', h, v), const(PRIME)), zero)
+
+
+# Each identity, and the value it writes: a step of the plain hash, or of the
+# hash of the lower-cased bytes.
+PLAIN_STEPS = {'fnv': step_plain, 'fnv-lower': step_lower}
 IDENTITIES = {
-    'none': lambda h, e, junk: step_plain(h, e),
-    'neg-long': lambda h, e, junk: identity_neg_long(h, e),
-    'sign-split': lambda h, e, junk: identity_sign_split(h, e),
-    'cancel': identity_cancel,
-    'xor-mba': lambda h, e, junk: identity_xor_mba(h, e),
+    'none': ('fnv', lambda h, e, junk: step_plain(h, e)),
+    'neg-long': ('fnv', lambda h, e, junk: identity_neg_long(h, e)),
+    'sign-split': ('fnv', lambda h, e, junk: identity_sign_split(h, e)),
+    'cancel': ('fnv', identity_cancel),
+    'xor-mba': ('fnv', lambda h, e, junk: identity_xor_mba(h, e)),
+    'lower': ('fnv-lower', lambda h, e, junk: step_lower(h, e)),
+    'lower-key': ('fnv-lower', identity_lower_key),
 }
 
 
@@ -187,6 +211,16 @@ def reshape_neg_as_mul(root, rng):
     return root
 
 
+def reshape_freeze_select(root, rng):
+    # A `freeze` on what each `select` chooses, where a pass that freezes a read
+    # leaves it once the read has been folded into the choice.
+    for node in list(walk(root)):
+        for index, operand in enumerate(node.args):
+            if operand.op == 'select':
+                node.args[index] = Node('freeze', operand)
+    return root
+
+
 def reshape_mask_select(root, rng):
     for node in walk(root):
         if node.op == 'select':
@@ -203,6 +237,7 @@ RESHAPES = {
     'shl-as-mul': reshape_shl_as_mul,
     'neg-as-mul': reshape_neg_as_mul,
     'mask-select': reshape_mask_select,
+    'freeze-select': reshape_freeze_select,
 }
 # Reshapings of the context rather than of the expression.
 CONTEXT = ('fanout', 'freeze', 'undef-leaves', 'own-block')
@@ -233,6 +268,8 @@ class Emitter:
             self.lines.append(f'  {result} = select i1 {args[0]}, i64 {args[1]}, i64 {args[2]}')
         elif node.op == 'sext':
             self.lines.append(f'  {result} = sext i1 {args[0]} to i64')
+        elif node.op == 'freeze':
+            self.lines.append(f'  {result} = freeze i64 {args[0]}')
         else:
             self.lines.append(f'  {result} = {node.op} i64 {args[0]}, {args[1]}')
         self.names[node] = result
@@ -267,7 +304,7 @@ def build(identity, length, position, reshapes, rng):
                 e.lines.append(f'  br label %{label}')
                 e.lines = []
                 blocks.append((label, e.lines))
-            tree = IDENTITIES[identity](h, byte, junk)
+            tree = IDENTITIES[identity][1](h, byte, junk)
             for name in reshapes:
                 if name in RESHAPES:
                     tree = RESHAPES[name](tree, rng)
@@ -277,7 +314,7 @@ def build(identity, length, position, reshapes, rng):
                     stored.append(inner[len(inner) // 2])
             h = tree
         else:
-            h = step_plain(h, byte)
+            h = PLAIN_STEPS[IDENTITIES[identity][0]](h, byte)
         h = leaf(e.emit(h))
         for node in stored:
             if not isinstance(node, str):
@@ -368,7 +405,8 @@ class Harness:
         self.lock = threading.Lock()
 
     def simplify(self, source, setting):
-        pipeline = f'function(cobra-simplify<{setting}>,instcombine,gvn,instcombine,adce,simplifycfg)'
+        pre = f'{self.args.pre},' if self.args.pre else ''
+        pipeline = f'function({pre}cobra-simplify<{setting}>,instcombine,gvn,instcombine,adce,simplifycfg)'
         result, seconds = run([self.args.opt, f'-load-pass-plugin={self.args.plugin}', f'-passes={pipeline}',
                                '-S', '-'], source)
         if result.returncode != 0:
@@ -381,13 +419,14 @@ class Harness:
             raise RuntimeError(f'lli failed: {result.stderr[-2000:]}')
         return result.stdout
 
-    def baseline(self, length, position, setting, context):
+    def baseline(self, identity, length, position, setting, context):
         """The plain step in the same context, simplified the same way."""
-        key = (length, position, setting, context)
+        key = (IDENTITIES[identity][0], length, position, setting, context)
         with self.lock:
             if key in self.baselines:
                 return self.baselines[key]
-        source, extra = build('none', length, position, context, random.Random(0))
+        plain = 'none' if IDENTITIES[identity][0] == 'fnv' else 'lower'
+        source, extra = build(plain, length, position, context, random.Random(0))
         simplified, _ = self.simplify(source, setting)
         size = instructions(simplified)
         with self.lock:
@@ -400,7 +439,7 @@ class Harness:
         simplified, seconds = self.simplify(source, setting)
         expected, got = self.outputs(source), self.outputs(simplified)
         context = tuple(r for r in reshapes if r in ('freeze', 'undef-leaves', 'own-block'))
-        target = self.baseline(length, position, setting, context)
+        target = self.baseline(identity, length, position, setting, context)
         size = instructions(simplified)
         if self.args.keep:
             stem = re.sub(r'[^a-z0-9]+', '-', f'{identity} {length} {position} {" ".join(reshapes)} {setting}'.lower())
@@ -423,6 +462,7 @@ def main():
     parser.add_argument('--reshapes', nargs='+', default=list(RESHAPES) + list(CONTEXT))
     parser.add_argument('--pairs', action='store_true', help='also every two reshapings together')
     parser.add_argument('-j', type=int, default=4)
+    parser.add_argument('--pre', default='', help='passes run before the pass, as a host runs them (instcombine)')
     parser.add_argument('--keep', default='')
     args = parser.parse_args()
     if args.keep:

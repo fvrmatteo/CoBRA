@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -2995,6 +2996,27 @@ namespace cobra {
                 }
                 if (over_cap()) {
                     DeclinedRoot(inst, "more leaves than max_vars", tree_insts.size(), leaves.size());
+                    // `COBRA_DETECT_LEAVES=1`: what those leaves are, and how many phis the
+                    // collection read through as the computation of their arms.
+                    static const bool leaf_kinds = std::getenv("COBRA_DETECT_LEAVES") != nullptr;
+                    if (leaf_kinds) {
+                        std::map< std::string, unsigned > kinds;
+                        for (const auto *leaf : leaves) {
+                            const auto *leaf_inst = llvm::dyn_cast< llvm::Instruction >(leaf);
+                            std::string kind = leaf_inst != nullptr ? leaf_inst->getOpcodeName()
+                                : llvm::isa< llvm::Argument >(leaf)  ? "argument"
+                                                                     : "other";
+                            if (leaf->getType()->isIntegerTy()) {
+                                kind += ":i" + std::to_string(leaf->getType()->getIntegerBitWidth());
+                            }
+                            kinds[kind]++;
+                        }
+                        llvm::errs() << "cobra:   leaves";
+                        for (const auto &[kind, count] : kinds) {
+                            llvm::errs() << ' ' << kind << '=' << count;
+                        }
+                        llvm::errs() << ", phis read through " << phi_redirects.size() << '\n';
+                    }
                     if (wide_cut_nodes != 0 && max_nodes == 0 && !cut_arith_under_bitwise
                         && shared_cut == nullptr && slice == nullptr && sum_group == nullptr && !boolean_cut
                         && narrow == NarrowReading::kNone)
