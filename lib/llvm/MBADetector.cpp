@@ -3256,6 +3256,24 @@ namespace cobra {
                     llvm::any_of(tree_insts, [](const llvm::Instruction *ti) {
                         return IsTransparentFreeze(ti);
                     });
+                // What the whole expression costs, the yardstick of
+                // `MbaCostModel::kTreeInstructions`, without the `freeze`s the
+                // rest of the function keeps. The tree is read through such a
+                // freeze and a rewrite need not read it, but it cannot take it
+                // away: once the clean-up has merged the rewrite's operators
+                // with the ones the freeze's other readers keep, the value the
+                // rewrite rebuilt below the freeze is read through it again
+                // (`InstCombine` gives every use the freeze dominates the
+                // frozen value), and the root's tree is the one it replaced.
+                // Priced in, a freeze made the same expression read around it
+                // one instruction cheaper than itself: the rewrite was taken,
+                // undone by the clean-up, and taken again on every run. A
+                // freeze that dies with the root is one the rewrite removes.
+                const auto kept_freezes = static_cast< uint32_t >(
+                    llvm::count_if(tree_insts, [&](llvm::Instruction *ti) {
+                        return IsTransparentFreeze(ti) && !dying.contains(ti);
+                    })
+                );
                 const bool poison_reaches_root = !has_phi_redirect() && !spans_freeze
                     && llvm::none_of(tree_insts, [](const llvm::Instruction *ti) {
                            return llvm::isa< llvm::SelectInst >(ti);
@@ -3288,7 +3306,7 @@ namespace cobra {
                                       : cut_arith_under_bitwise ? kBoundaryCutLimit
                                       : boolean_cut             ? kBooleanCutLimit
                                                                 : max_nodes,
-                                  .tree_size    = static_cast< uint32_t >(tree_insts.size()),
+                                  .tree_size    = static_cast< uint32_t >(tree_insts.size()) - kept_freezes,
                                   .boundary_cut  = cut_arith_under_bitwise,
                                   .demanded_mask = demanded_mask,
                                   .spans_freeze  = spans_freeze,
