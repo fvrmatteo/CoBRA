@@ -53,6 +53,7 @@ namespace cobra {
         kSlice,       // the same root, read at the width of an extension it holds
         kSumGroup,    // one group of the root's sum, read at the width of an extension it holds
         kBooleanCut,  // the same root, read with the comparisons of narrow values taken in
+        kRecollected, // a root collected again once a value its tree read became a constant
         kCount
     };
 
@@ -169,6 +170,12 @@ namespace cobra {
         // dominate the root (a leaf reached through a transparent phi's arm).
         uint64_t unavailable_leaves             = 0;
         uint64_t stale_trees                    = 0;
+        // `propagate_constant_roots`: readers of a constant replacement folded
+        // to constants, roots queued again because their tree read one of
+        // those values, and stale candidates re-read in place instead.
+        uint64_t constant_readers_folded = 0;
+        uint64_t constant_roots_requeued = 0;
+        uint64_t constant_trees_reread   = 0;
         uint64_t declined_no_expression         = 0;
         uint64_t background_withdrawn_unneeded  = 0;
         // Timeouts not recorded because the thread had the processor for less

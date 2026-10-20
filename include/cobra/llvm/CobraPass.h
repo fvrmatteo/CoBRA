@@ -202,6 +202,27 @@ namespace cobra {
         // Off by default.
         bool retry_undecided_roots = false;
 
+        // Carry a root rewritten to a constant into the trees that read it, in
+        // the same run.
+        //
+        // A tree queued before a root inside it was replaced is stale, and is
+        // left for the next run, which collects it from the simplified
+        // function. When the replacement is a constant, the next run only ever
+        // sees the same tree with that constant in it, and a chain whose every
+        // link reads the one before it - a running key, a word-by-word
+        // decryption whose key is the sum of the words already decrypted -
+        // then advances by the few links one tree spans per run. With this on,
+        // the constant's readers whose operands are now all constants are
+        // folded, and every root whose tree held the replaced root or a folded
+        // reader is collected again from the function as it now stands, in
+        // this run: queued again when it was already tried, and re-read in
+        // place when it was not. One run then walks the whole chain.
+        //
+        // A root replaced by anything but a constant keeps the rule above.
+        //
+        // Off by default.
+        bool propagate_constant_roots = false;
+
         // Answer every demanded-bits question both from the readers and from
         // LLVM's whole-function analysis, and report each disagreement on
         // stderr. A check on the pass, for its tests; it changes no answer.

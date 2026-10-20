@@ -22,6 +22,7 @@
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Sequence.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include <numeric>
 #include "llvm/ADT/Statistic.h"
@@ -585,6 +586,9 @@ namespace cobra {
             into.unreachable_roots += run.unreachable_roots;
             into.unavailable_leaves += run.unavailable_leaves;
             into.stale_trees += run.stale_trees;
+            into.constant_readers_folded += run.constant_readers_folded;
+            into.constant_roots_requeued += run.constant_roots_requeued;
+            into.constant_trees_reread += run.constant_trees_reread;
             into.declined_no_expression += run.declined_no_expression;
             into.background_withdrawn_unneeded += run.background_withdrawn_unneeded;
             into.unknown_starved += run.unknown_starved;
@@ -5771,6 +5775,26 @@ namespace cobra {
         uint64_t rewrites_this_run = 0;
         llvm::DenseSet< const llvm::Value * > replaced_roots;
 
+        // `propagate_constant_roots`: the replaced values a constant now stands
+        // for - roots rewritten to one, and the readers folded after them - and
+        // the roots queued again and not yet reached.
+        llvm::DenseSet< const llvm::Value * > constant_values;
+        llvm::DenseSet< const llvm::Instruction * > requeued_roots;
+        // `root` collected afresh from the function as it now stands.
+        const auto collect_again = [&](llvm::Instruction *root) -> std::optional< MBACandidate > {
+            llvm::Instruction *roots[] = { root };
+            auto fresh                 = ExpandMbaCandidate(
+                roots, options_.min_ast_size, options_.max_vars, options_tag, options_.cost_model,
+                options_.max_tree_nodes, demanded, options_.cut_wide_roots ? options_.max_recut_nodes : 0
+            );
+            for (auto &collected : fresh) {
+                if (collected.root == root) {
+                    return std::move(collected);
+                }
+            }
+            return std::nullopt;
+        };
+
         for (size_t index = 0; index < candidates.size(); ++index) {
             auto &cand = candidates[index];
 
@@ -5804,6 +5828,10 @@ namespace cobra {
                     speculation.Withdraw(keys[index], stats);
                 }
             };
+
+            if (origins[index] == CandidateOrigin::kRecollected) {
+                requeued_roots.erase(cand.root);
+            }
 
             if (cand.root->use_empty()) {
                 ++stats.dead_roots;
@@ -5840,21 +5868,60 @@ namespace cobra {
             // a replaced one is the same stale reading: added back, it would give
             // a replaced root a reader again - one the deletion of the run's
             // leftovers below does not expect, and would delete from under it.
-            if (!replaced_roots.empty()
-                && (llvm::any_of(cand.tree, [&](const llvm::Instruction *node) {
-                        return replaced_roots.contains(node);
-                    })
-                    || llvm::any_of(cand.leaf_values, [&](const llvm::Value *leaf) {
-                           return replaced_roots.contains(leaf);
-                       })
-                    || llvm::any_of(cand.sum_residual, [&](const auto &summand) {
-                           return replaced_roots.contains(summand.first);
-                       })))
-            {
-                ++stats.stale_trees;
-                left_for_later = true;
-                pass_by();
-                continue;
+            //
+            // Under `propagate_constant_roots` a tree whose replaced values are
+            // all constants now is collected again in place instead: the next
+            // run would find the same tree with those constants in it, and the
+            // values it reads are the function's own. A root with a fresh
+            // collection queued already is answered by that one. And a root
+            // queued again for a constant is re-read whatever went stale in it
+            // since: it waits at the end of the queue, and the roots inside its
+            // tree are often rewritten before it is reached - into smaller
+            // forms that are no constants, but that it reads all the same.
+            if (!replaced_roots.empty()) {
+                bool stale          = false;
+                bool only_constants = true;
+                const auto note     = [&](const llvm::Value *value) {
+                    if (replaced_roots.contains(value)) {
+                        stale          = true;
+                        only_constants = only_constants && constant_values.contains(value);
+                    }
+                };
+                for (const auto *node : cand.tree) {
+                    note(node);
+                }
+                for (const auto *leaf : cand.leaf_values) {
+                    note(leaf);
+                }
+                for (const auto &summand : cand.sum_residual) {
+                    note(summand.first);
+                }
+                if (stale) {
+                    ++stats.stale_trees;
+                    const bool recollected = origins[index] == CandidateOrigin::kRecollected;
+                    const bool propagated =
+                        options_.propagate_constant_roots && (only_constants || recollected);
+                    if (propagated && requeued_roots.contains(cand.root)) {
+                        pass_by();
+                        continue;
+                    }
+                    const bool rereadable = propagated && cand.sum_residual.empty() && !cand.boundary_cut
+                        && (origins[index] == CandidateOrigin::kDetected
+                            || origins[index] == CandidateOrigin::kInnerRoot
+                            || origins[index] == CandidateOrigin::kRecollected);
+                    auto fresh = rereadable ? collect_again(cand.root) : std::nullopt;
+                    pass_by();
+                    if (!fresh) {
+                        left_for_later = true;
+                        continue;
+                    }
+                    if (DetectDebug()) {
+                        llvm::errs() << "cobra: re-read over the constants it holds" << *cand.root << "\n";
+                    }
+                    cand        = std::move(*fresh);
+                    keys[index] = CandidateKey(cand, options_);
+                    ++stats.constant_trees_reread;
+                }
             }
 
             // The demanded mask was read when the candidate was queued. A
@@ -6890,8 +6957,53 @@ namespace cobra {
                     }
                 }
             }
+            // `propagate_constant_roots`: what reads a root rewritten to a
+            // constant, before the replacement takes its readers.
+            const bool to_constant =
+                options_.propagate_constant_roots && llvm::isa< llvm::ConstantInt >(new_val);
+            llvm::SmallVector< llvm::Instruction *, 8 > constant_readers;
+            if (to_constant) {
+                for (llvm::User *user : cand.root->users()) {
+                    if (auto *reader = llvm::dyn_cast< llvm::Instruction >(user)) {
+                        constant_readers.push_back(reader);
+                    }
+                }
+            }
             cand.root->replaceAllUsesWith(new_val);
             replaced_roots.insert(cand.root);
+            // The readers whose operands are all constants now are constants
+            // themselves, and so on down the chain. Each is replaced like a
+            // root: left in the function, unread, until the run ends, so the
+            // trees queued over it see it replaced. A fold to anything but an
+            // integer - poison from an operation whose flags the constants
+            // break - is left alone, and so is every reader that does not fold:
+            // those are where what the constant changes is read.
+            llvm::SmallVector< llvm::Instruction *, 8 > constant_frontier;
+            if (to_constant) {
+                constant_values.insert(cand.root);
+                const llvm::SimplifyQuery query(f.getParent()->getDataLayout());
+                for (size_t next = 0; next < constant_readers.size(); ++next) {
+                    auto *reader = constant_readers[next];
+                    if (replaced_roots.contains(reader)) {
+                        continue;
+                    }
+                    auto *folded =
+                        llvm::dyn_cast_or_null< llvm::ConstantInt >(llvm::simplifyInstruction(reader, query));
+                    if (folded == nullptr) {
+                        constant_frontier.push_back(reader);
+                        continue;
+                    }
+                    for (llvm::User *user : reader->users()) {
+                        if (auto *next_reader = llvm::dyn_cast< llvm::Instruction >(user)) {
+                            constant_readers.push_back(next_reader);
+                        }
+                    }
+                    reader->replaceAllUsesWith(folded);
+                    replaced_roots.insert(reader);
+                    constant_values.insert(reader);
+                    ++stats.constant_readers_folded;
+                }
+            }
             // The condition came out of a widening the rewrite built only to
             // hold it; with the condition itself taken out of it, nobody reads
             // it. Left behind it would be the one instruction of the rewrite
@@ -6974,6 +7086,63 @@ namespace cobra {
                 llvm::dbgs() << "CoBRA: simplified to "
                              << Render(*outcome->expr, real_vars, cand.bitwidth) << "\n"
             );
+
+            // Last, because queuing moves `cand`: the roots that read what the
+            // constant changed are collected again and queued, so this run
+            // reaches what the constant makes of them. A root is found by
+            // following the readers that stayed through the arithmetic that
+            // reads them, to the first value something else reads too - a
+            // store, a comparison, a call, an address - which is where a tree
+            // ends. Found this way rather than among the queued candidates: a
+            // root the detector declined when its tree was wider than
+            // `max_vars` is often the one the constant brings back into reach.
+            // The walk stops at the roots it finds, and after
+            // `2 * max_tree_nodes` instructions in all.
+            if (!constant_frontier.empty()) {
+                const auto arithmetic = [](const llvm::Instruction *reader) {
+                    return llvm::isa< llvm::BinaryOperator >(reader) || llvm::isa< llvm::CastInst >(reader)
+                        || llvm::isa< llvm::SelectInst >(reader) || llvm::isa< llvm::FreezeInst >(reader);
+                };
+                const size_t budget = 2 * static_cast< size_t >(std::max< uint32_t >(options_.max_tree_nodes, 32));
+                llvm::SmallSetVector< llvm::Instruction *, 8 > again;
+                llvm::DenseSet< const llvm::Instruction * > walked;
+                llvm::SmallVector< llvm::Instruction *, 32 > work(
+                    constant_frontier.begin(), constant_frontier.end()
+                );
+                while (!work.empty() && walked.size() < budget) {
+                    auto *at = work.pop_back_val();
+                    if (!at->getType()->isIntegerTy() || replaced_roots.contains(at)
+                        || !walked.insert(at).second)
+                    {
+                        continue;
+                    }
+                    const bool read_elsewhere = llvm::any_of(at->users(), [&](const llvm::User *user) {
+                        const auto *reader = llvm::dyn_cast< llvm::Instruction >(user);
+                        return reader == nullptr || !arithmetic(reader);
+                    });
+                    if (read_elsewhere) {
+                        if (!requeued_roots.contains(at)) {
+                            again.insert(at);
+                        }
+                        continue;
+                    }
+                    for (llvm::User *user : at->users()) {
+                        work.push_back(llvm::cast< llvm::Instruction >(user));
+                    }
+                }
+                for (auto *root : again) {
+                    if (auto fresh = collect_again(root)) {
+                        if (DetectDebug()) {
+                            llvm::errs() << "cobra: queued again over a constant it reads" << *root << "\n";
+                        }
+                        queue_key(*fresh);
+                        candidates.push_back(std::move(*fresh));
+                        origins.push_back(CandidateOrigin::kRecollected);
+                        requeued_roots.insert(root);
+                        ++stats.constant_roots_requeued;
+                    }
+                }
+            }
         }
 
         // What the rewrites left without readers: the replaced roots, and
@@ -7072,6 +7241,8 @@ namespace cobra {
             case CandidateOrigin::kSlice:       return "re-read at an extension's width";
             case CandidateOrigin::kSumGroup:
                 return "one group of its sum, at an extension's width";
+            case CandidateOrigin::kRecollected:
+                return "collected again over a constant it reads";
             case CandidateOrigin::kCount:       break;
         }
         return "?";
@@ -7232,6 +7403,9 @@ namespace cobra {
         part("  queued candidates on an unreachable root", stats.unreachable_roots);
         part("  queued candidates reading a leaf the root does not see", stats.unavailable_leaves);
         part("  queued candidates over a root replaced this run", stats.stale_trees);
+        part("    re-read in place over the constants it was replaced by", stats.constant_trees_reread);
+        part("  readers of a constant replacement folded", stats.constant_readers_folded);
+        part("  roots queued again over a constant they read", stats.constant_roots_requeued);
         part("  candidates without an expression to prove", stats.declined_no_expression);
         part("  worker tasks withdrawn for candidates passed by", stats.background_withdrawn_unneeded);
         part("  timeouts not recorded: the thread lacked the processor", stats.unknown_starved);

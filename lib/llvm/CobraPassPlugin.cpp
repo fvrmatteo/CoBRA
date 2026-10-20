@@ -48,6 +48,7 @@ namespace {
     //   skip-loop-carried-phis   skip_loop_carried_phis
     //   across-freeze            leaf_freezing = kAcrossFreeze
     //   retry-undecided-roots    retry_undecided_roots
+    //   propagate-constants      propagate_constant_roots
     //   demanded-check           check_demanded_bits
     //   unknown-as-equivalent    z3_settings.unknown_result_mode = kTreatAsEquivalent
     //   strategy=direct|llvm|race
@@ -96,6 +97,8 @@ namespace {
                     options.leaf_freezing = cobra::LeafFreezing::kAcrossFreeze;
                 } else if (name == "retry-undecided-roots") {
                     options.retry_undecided_roots = true;
+                } else if (name == "propagate-constants") {
+                    options.propagate_constant_roots = true;
                 } else if (name == "demanded-check") {
                     options.check_demanded_bits = true;
                 } else if (name == "unknown-as-equivalent") {
