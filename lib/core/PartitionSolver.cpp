@@ -321,12 +321,22 @@ namespace cobra {
             return out;
         }
 
-        // The variables a slice actually reads.
-        uint32_t SliceSupport(const std::vector< uint64_t > &slice, uint32_t n) {
+        // What a class's slice is defined modulo. A class whose lowest bit is
+        // `j` adds its slice in at `2^j` and above, so the slice counts only
+        // modulo `2^(width - j)`: on the top bit alone, 3 and 1 and -1 are the
+        // same contribution. Reading a class at the full width takes it apart
+        // from classes it agrees with on every bit it has.
+        uint64_t ClassModulus(uint64_t mask, uint64_t modulus) {
+            return mask == 0 ? modulus : modulus >> std::countr_zero(mask);
+        }
+
+        // The variables a slice actually reads, modulo what it is defined to.
+        uint32_t
+        SliceSupport(const std::vector< uint64_t > &slice, uint32_t n, uint64_t modulus) {
             uint32_t support = 0;
             for (uint32_t i = 0; i < n; ++i) {
                 for (size_t a = 0; a < slice.size(); ++a) {
-                    if (slice[a] != slice[a ^ (size_t{ 1 } << i)]) {
+                    if (((slice[a] - slice[a ^ (size_t{ 1 } << i)]) & modulus) != 0) {
                         support |= uint32_t{ 1 } << i;
                         break;
                     }
@@ -336,8 +346,8 @@ namespace cobra {
         }
 
         // The first map under which `slice` is `reference` up to an additive
-        // constant, or nothing. A variable the slice reads cannot have been
-        // cleared or set.
+        // constant, modulo what `slice` is defined to, or nothing. A variable
+        // the slice reads cannot have been cleared or set.
         std::optional< uint32_t > FindMap(
             const std::vector< uint64_t > &slice, uint32_t support,
             const std::vector< uint64_t > &reference, uint32_t n, uint64_t modulus
@@ -486,7 +496,7 @@ namespace cobra {
         uint32_t union_support = 0;
         for (const auto &[profiles, mask] : class_of_profile) {
             auto slice              = SliceOf(*sum, profiles, kMod);
-            const uint32_t kSupport = SliceSupport(slice, num_vars);
+            const uint32_t kSupport = SliceSupport(slice, num_vars, ClassModulus(mask, kMod));
             union_support |= kSupport;
             classes.push_back({ .mask = mask, .slice = std::move(slice), .support = kSupport });
         }
@@ -527,7 +537,9 @@ namespace cobra {
             bool translates      = true;
             uint64_t offset_bits = 0;
             for (const auto &cls : classes) {
-                auto tuple = FindMap(cls.slice, cls.support, classes[r].slice, num_vars, kMod);
+                auto tuple = FindMap(
+                    cls.slice, cls.support, classes[r].slice, num_vars, ClassModulus(cls.mask, kMod)
+                );
                 if (!tuple.has_value()) {
                     translates = false;
                     break;
