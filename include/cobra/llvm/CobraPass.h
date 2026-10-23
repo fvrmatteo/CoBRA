@@ -245,6 +245,19 @@ namespace cobra {
         // Off by default.
         bool unblock_shared_values = false;
 
+        // Read the intrinsics flags are written with as the operations they
+        // are, not as leaves (`BitIntrinsicsRead`): `bitreverse` - InstCombine's
+        // spelling of a flag word put together bit by bit - as its bits moved,
+        // and the overflow bit of `ssub.with.overflow`, with the difference
+        // beside it, as the sign of `(a ^ b) & (a ^ (a - b))`. A flag word and
+        // the overflow of a comparison are then functions of the values they
+        // read; as leaves they are free bits, and a flag the obfuscator made
+        // constant is no constant of a free bit. Each is written in the
+        // operators the model has, so every rewrite over them is proved like any
+        // other. Only the bits of an operand that can be set are read. A
+        // population count is not read: see `BitReverseOf`. Off by default.
+        bool read_bit_intrinsics = false;
+
         // Read a root whose tree ends in more leaves than `max_vars` with its
         // tree cut short, instead of turning it down.
         //

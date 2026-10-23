@@ -1108,6 +1108,7 @@ namespace cobra {
             key += options.read_narrow_roots_wide ? "n" : "";
             key += options.two_valued_selects ? "s" : "";
             key += options.unblock_shared_values ? "u" : "";
+            key += options.read_bit_intrinsics ? "i" : "";
             // The boolean cut is searched by the boolean reading alone, so its
             // verdict is not the one an identical tree read the ordinary way has.
             key += cand.node_limit == kBooleanCutLimit ? "B" : "";
@@ -1400,6 +1401,7 @@ namespace cobra {
             tag = mix(tag, options.read_narrow_roots_wide ? 1 : 0);
             tag = mix(tag, options.two_valued_selects ? 1 : 0);
             tag = mix(tag, options.unblock_shared_values ? 1 : 0);
+            tag = mix(tag, options.read_bit_intrinsics ? 1 : 0);
             // What the records mean changes with the pass itself as well as
             // with its settings: a host that keeps `!cobra.mba` on IR it saves
             // and loads again must not read a verdict an older build wrote
@@ -5990,6 +5992,7 @@ namespace cobra {
         const uint64_t options_tag = OptionsTag(options_);
         const NarrowRootsReadWide narrow_roots(options_.read_narrow_roots_wide);
         const SharedValuesRead shared_values(options_.unblock_shared_values);
+        const BitIntrinsicsRead bit_intrinsics(options_.read_bit_intrinsics);
 
         // Before anything reads the function: the rewrite changes no block.
         const bool armed   = ReadArmsUnderTheirCondition(f, options_.unblock_shared_values);

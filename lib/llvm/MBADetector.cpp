@@ -274,6 +274,8 @@ namespace cobra {
         thread_local bool narrow_roots_read_wide = false;
         // Set by `SharedValuesRead`.
         thread_local bool shared_values_read = false;
+        // Set by `BitIntrinsicsRead`.
+        thread_local bool bit_intrinsics_read = false;
 
         bool IsMbaOpcode(unsigned opcode) {
             switch (opcode) { // NOLINT(hicpp-multiway-paths-covered)
@@ -338,6 +340,74 @@ namespace cobra {
             // the smallest width that permutes anything.
             const auto width = intrinsic->getType()->getIntegerBitWidth();
             return width >= 16 && width % 8 == 0 ? intrinsic : nullptr;
+        }
+
+        // A bit reversal of an integer of at most 64 bits (`BitIntrinsicsRead`):
+        // a flag word put together bit by bit, which InstCombine writes as a
+        // reversal of a narrow value holding the bits to move. It reads its
+        // operand bit by bit, one term per bit that can be set
+        // (`PossibleBits`), so a reversal of a value with one bit to move is one
+        // shift.
+        //
+        // A population count is the same kind of reading and is deliberately
+        // not taken: it is a lifter's parity flag over a whole byte, eight
+        // terms where the IR has one instruction, and over a replayed proof CFG
+        // the rewrites that read it grew the function by more than they took
+        // out of it.
+        const llvm::IntrinsicInst *BitReverseOf(const llvm::Value *v) {
+            const auto *intrinsic = llvm::dyn_cast< llvm::IntrinsicInst >(v);
+            if (!bit_intrinsics_read || intrinsic == nullptr
+                || intrinsic->getIntrinsicID() != llvm::Intrinsic::bitreverse
+                || !intrinsic->getType()->isIntegerTy() || intrinsic->getType()->getIntegerBitWidth() > 64)
+            {
+                return nullptr;
+            }
+            return intrinsic;
+        }
+
+        // The overflow bit (index 1) or the difference (index 0) of a signed
+        // subtraction with overflow over integers of at most 64 bits
+        // (`BitIntrinsicsRead`): the overflow flag of a comparison, which reads
+        // `a`, `b` and nothing else.
+        struct OverflowRead
+        {
+            const llvm::IntrinsicInst *op = nullptr;
+            unsigned index                = 0;
+        };
+
+        std::optional< OverflowRead > OverflowOf(const llvm::Value *v) {
+            const auto *extract = llvm::dyn_cast< llvm::ExtractValueInst >(v);
+            if (!bit_intrinsics_read || extract == nullptr || extract->getNumIndices() != 1
+                || extract->getIndices()[0] > 1)
+            {
+                return std::nullopt;
+            }
+            const auto *op = llvm::dyn_cast< llvm::IntrinsicInst >(extract->getAggregateOperand());
+            if (op == nullptr || op->getIntrinsicID() != llvm::Intrinsic::ssub_with_overflow) {
+                return std::nullopt;
+            }
+            const auto *type = llvm::dyn_cast< llvm::IntegerType >(op->getArgOperand(0)->getType());
+            if (type == nullptr || type->getBitWidth() > 64 || type->getBitWidth() < 2) {
+                return std::nullopt;
+            }
+            return OverflowRead{ op, extract->getIndices()[0] };
+        }
+
+        // The bits of `v` that can be set, at its own `width`: a model that
+        // reads a value bit by bit need not read the ones LLVM knows are clear.
+        // Exact on every value the program computes, which is what the model
+        // is held to - the same reading the leaves' known bits are.
+        uint64_t PossibleBits(const llvm::Value *v, uint32_t width) {
+            uint64_t possible = Bitmask(width);
+            if (const auto *constant = llvm::dyn_cast< llvm::ConstantInt >(v)) {
+                return constant->getValue().getZExtValue() & possible;
+            }
+            const auto *inst = llvm::dyn_cast< llvm::Instruction >(v);
+            if (inst != nullptr && inst->getModule() != nullptr && width <= 64) {
+                const llvm::KnownBits known = llvm::computeKnownBits(v, inst->getModule()->getDataLayout());
+                possible &= ~known.Zero.getZExtValue();
+            }
+            return possible;
         }
 
         // How many bytes a byte swap permutes.
@@ -453,6 +523,7 @@ namespace cobra {
 
         bool IsMbaInstruction(const llvm::Instruction *inst) {
             return IsMbaOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
+                || BitReverseOf(inst) != nullptr || OverflowOf(inst).has_value()
                 || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr || AbsOf(inst) != nullptr
                 || SaturatingOf(inst) != nullptr || IsTransparentFreeze(inst)
                 || ByteGepOf(inst) != nullptr;
@@ -858,6 +929,16 @@ namespace cobra {
                 return bswap->getType()->getIntegerBitWidth() <= bw;
             }
 
+            // So are a reversal of bits and the overflow of a subtraction of
+            // values held at their own width: each reads the bits of its
+            // operands below that width alone.
+            if (const auto *reverse = BitReverseOf(inst)) {
+                return reverse->getType()->getIntegerBitWidth() <= bw;
+            }
+            if (const auto overflow = OverflowOf(inst)) {
+                return overflow->op->getArgOperand(0)->getType()->getIntegerBitWidth() <= bw;
+            }
+
             // A minimum or maximum compares whole words, so it is only exact at
             // the width the tree is evaluated at: a narrower value is held
             // zero-extended inside the tree, and a signed comparison of the
@@ -1157,6 +1238,23 @@ namespace cobra {
                         // The callee and the amount are not values to follow.
                         work.push({ fsh->getArgOperand(0), true });
                         work.push({ fsh->getArgOperand(1), true });
+                        continue;
+                    }
+                    // A reversal of bits reads its operand bit by bit.
+                    if (const auto *reverse = BitReverseOf(inst)) {
+                        work.push({ reverse->getArgOperand(0), true });
+                        continue;
+                    }
+                    // The overflow of a subtraction reads what it subtracts, the
+                    // way a subtraction does; the call it is taken from is part of
+                    // the tree, so the tree's identity tells two of them apart.
+                    if (const auto overflow = OverflowOf(inst)) {
+                        auto *op = const_cast< llvm::IntrinsicInst * >(overflow->op);
+                        if (visited.insert(op).second) {
+                            tree_insts.push_back(op);
+                        }
+                        work.push({ overflow->op->getArgOperand(0), false });
+                        work.push({ overflow->op->getArgOperand(1), false });
                         continue;
                     }
                     // A byte swap reads its operand bit by bit, like the shifts
@@ -1608,6 +1706,45 @@ namespace cobra {
                     const uint32_t high  = MaskToWidth(v, Emit(Op::kShl, a, ConstSlot(left)));
                     const uint32_t low   = Emit(Op::kLShr, b, ConstSlot(right));
                     return Emit(Op::kOr, high, low);
+                }
+
+                // A reversal of bits as each bit that can be set moved to its
+                // mirror position.
+                if (const auto *reverse = BitReverseOf(inst)) {
+                    const uint32_t width    = reverse->getType()->getIntegerBitWidth();
+                    const uint32_t source   = lower(reverse->getArgOperand(0));
+                    const uint64_t possible = PossibleBits(reverse->getArgOperand(0), width);
+                    uint32_t result         = kZeroSlot;
+                    bool first              = true;
+                    for (uint32_t bit = 0; bit < width; ++bit) {
+                        if (((possible >> bit) & 1) == 0) {
+                            continue;
+                        }
+                        uint32_t one = bit == 0 ? source : Emit(Op::kLShr, source, ConstSlot(bit));
+                        one          = Emit(Op::kAnd, one, ConstSlot(1));
+                        if (width - 1 - bit != 0) {
+                            one = Emit(Op::kShl, one, ConstSlot(width - 1 - bit));
+                        }
+                        result = first ? one : Emit(Op::kOr, result, one);
+                        first  = false;
+                    }
+                    return result;
+                }
+
+                // The overflow of a signed subtraction: the sign, at the
+                // operands' width, of `(a ^ b) & (a ^ (a - b))`; and beside it the
+                // difference itself.
+                if (const auto overflow = OverflowOf(inst)) {
+                    const auto *operand = overflow->op->getArgOperand(0);
+                    const uint32_t width = operand->getType()->getIntegerBitWidth();
+                    const uint32_t a     = lower(overflow->op->getArgOperand(0));
+                    const uint32_t b     = lower(overflow->op->getArgOperand(1));
+                    const uint32_t diff  = Emit(Op::kAnd, Emit(Op::kSub, a, b), ConstSlot(Bitmask(width)));
+                    if (overflow->index == 0) {
+                        return diff;
+                    }
+                    const uint32_t test = Emit(Op::kAnd, Emit(Op::kXor, a, b), Emit(Op::kXor, a, diff));
+                    return Emit(Op::kAnd, Emit(Op::kLShr, test, ConstSlot(width - 1)), ConstSlot(1));
                 }
 
                 // A byte swap, byte by byte: the operand held at its own width,
@@ -2216,6 +2353,79 @@ namespace cobra {
                 auto high = mask_to_width(Expr::Mul(std::move(a), Expr::Constant(1ULL << left)));
                 auto low  = Expr::LogicalShr(std::move(b), right);
                 return Expr::BitwiseOr(std::move(high), std::move(low));
+            }
+
+            // A reversal of bits as each bit that can be set moved to its mirror
+            // position: one copy of the operand per bit read, each charged to the
+            // node budget.
+            if (const auto *reverse = BitReverseOf(inst)) {
+                const uint32_t width    = reverse->getType()->getIntegerBitWidth();
+                const uint64_t possible = PossibleBits(reverse->getArgOperand(0), width);
+                auto source             = BuildExprFromIRImpl(
+                    reverse->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget,
+                    leaf_bits
+                );
+                if (source == nullptr) {
+                    return nullptr;
+                }
+                std::unique_ptr< Expr > result;
+                for (uint32_t bit = 0; bit < width; ++bit) {
+                    if (((possible >> bit) & 1) == 0) {
+                        continue;
+                    }
+                    if (budget == 0) {
+                        return nullptr;
+                    }
+                    --budget;
+                    auto one = ChargedClone(*source, budget);
+                    if (one == nullptr) {
+                        return nullptr;
+                    }
+                    if (bit != 0) {
+                        one = Expr::LogicalShr(std::move(one), bit);
+                    }
+                    one = Expr::BitwiseAnd(std::move(one), Expr::Constant(1));
+                    if (width - 1 - bit != 0) {
+                        one = Expr::Mul(std::move(one), Expr::Constant(uint64_t{ 1 } << (width - 1 - bit)));
+                    }
+                    result = result == nullptr ? std::move(one) : Expr::BitwiseOr(std::move(result), std::move(one));
+                }
+                return result != nullptr ? std::move(result) : Expr::Constant(0);
+            }
+
+            // The overflow of a signed subtraction, `((a ^ b) & (a ^ d)) >> (w - 1)`
+            // over the difference `d` at the operands' width `w`; and `d` itself.
+            if (const auto overflow = OverflowOf(inst)) {
+                const uint32_t width = overflow->op->getArgOperand(0)->getType()->getIntegerBitWidth();
+                auto a               = BuildExprFromIRImpl(
+                    overflow->op->getArgOperand(0), leaves, tree_set, mask, phi_redirects, in_progress, budget,
+                    leaf_bits
+                );
+                auto b = BuildExprFromIRImpl(
+                    overflow->op->getArgOperand(1), leaves, tree_set, mask, phi_redirects, in_progress, budget,
+                    leaf_bits
+                );
+                if (a == nullptr || b == nullptr) {
+                    return nullptr;
+                }
+                const auto width_mask = [&](std::unique_ptr< Expr > expr) {
+                    return width >= 64 ? std::move(expr)
+                                       : Expr::BitwiseAnd(std::move(expr), Expr::Constant(Bitmask(width)));
+                };
+                if (overflow->index == 0) {
+                    return width_mask(Expr::Add(std::move(a), Expr::Negate(std::move(b))));
+                }
+                auto a_test = ChargedClone(*a, budget);
+                auto a_diff = a_test != nullptr ? ChargedClone(*a, budget) : nullptr;
+                auto b_diff = a_diff != nullptr ? ChargedClone(*b, budget) : nullptr;
+                if (b_diff == nullptr) {
+                    return nullptr;
+                }
+                auto diff = width_mask(Expr::Add(std::move(a_diff), Expr::Negate(std::move(b_diff))));
+                auto test = Expr::BitwiseAnd(
+                    Expr::BitwiseXor(std::move(a), std::move(b)), Expr::BitwiseXor(std::move(a_test), std::move(diff))
+                );
+                return Expr::BitwiseAnd(Expr::LogicalShr(std::move(test), width - 1), Expr::Constant(1));
             }
 
             // A byte swap, byte by byte. The operand appears once per byte, so a
@@ -3468,6 +3678,10 @@ namespace cobra {
 
     SharedValuesRead::SharedValuesRead(bool on) : previous_(shared_values_read) { shared_values_read = on; }
 
+    BitIntrinsicsRead::BitIntrinsicsRead(bool on) : previous_(bit_intrinsics_read) { bit_intrinsics_read = on; }
+
+    BitIntrinsicsRead::~BitIntrinsicsRead() { bit_intrinsics_read = previous_; }
+
     SharedValuesRead::~SharedValuesRead() { shared_values_read = previous_; }
 
     NarrowRootsReadWide::NarrowRootsReadWide(bool on) : previous_(narrow_roots_read_wide) {
@@ -3493,9 +3707,16 @@ namespace cobra {
             if (!seen.insert(inst).second) {
                 continue;
             }
-            // A comparison of wider values joins a tree of their width only.
+            // A comparison of wider values joins a tree of their width only, and
+            // so does the overflow of a subtraction of them.
             if (llvm::isa< llvm::ICmpInst >(inst)) {
                 if (const uint32_t width = wider(inst->getOperand(0))) {
+                    widest = std::max(widest, width);
+                    continue;
+                }
+            }
+            if (const auto overflow = OverflowOf(inst)) {
+                if (const uint32_t width = wider(overflow->op->getArgOperand(0))) {
                     widest = std::max(widest, width);
                     continue;
                 }
