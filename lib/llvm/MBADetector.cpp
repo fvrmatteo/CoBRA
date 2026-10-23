@@ -270,6 +270,11 @@ namespace cobra {
                 && *tag == options_tag;
         }
 
+        // Set by `NarrowRootsReadWide`.
+        thread_local bool narrow_roots_read_wide = false;
+        // Set by `SharedValuesRead`.
+        thread_local bool shared_values_read = false;
+
         bool IsMbaOpcode(unsigned opcode) {
             switch (opcode) { // NOLINT(hicpp-multiway-paths-covered)
                 case llvm::Instruction::Add:
@@ -481,10 +486,26 @@ namespace cobra {
                 && !llvm::isa< llvm::ConstantInt >(inner->getOperand(1));
         }
 
+        // A truncation of a wider integer to one of more than one bit: a reader
+        // of the bits it keeps (`SharedValuesRead`). The wide value under it may
+        // have readers that need every bit, and so a root of its own that cannot
+        // drop a leaf the truncation never sees; the truncation, read at its own
+        // width through the ring operations below it (`WideNodeFitsTreeWidth`),
+        // is the root that can.
+        bool IsNarrowReader(const llvm::Instruction *inst) {
+            if (inst->getOpcode() != llvm::Instruction::Trunc) {
+                return false;
+            }
+            const auto *from = llvm::dyn_cast< llvm::IntegerType >(inst->getOperand(0)->getType());
+            const auto *to   = llvm::dyn_cast< llvm::IntegerType >(inst->getType());
+            return from != nullptr && to != nullptr && from->getBitWidth() <= 64 && to->getBitWidth() > 1;
+        }
+
         bool IsMbaRoot(const llvm::Instruction *inst) {
             return IsMbaRootOpcode(inst->getOpcode()) || FunnelShiftOf(inst) != nullptr
                 || ByteSwapOf(inst) != nullptr || MinMaxOf(inst) != nullptr || AbsOf(inst) != nullptr
-                || SaturatingOf(inst) != nullptr || IsPtrAddChain(inst);
+                || SaturatingOf(inst) != nullptr || IsPtrAddChain(inst)
+                || (shared_values_read && IsNarrowReader(inst));
         }
 
         // The operators that read their operands bit by bit, and the ones that
@@ -575,6 +596,15 @@ namespace cobra {
             if (cmp->use_empty()) {
                 return nullptr;
             }
+            // With `SharedValuesRead`, a terminator among the readers is enough:
+            // the trees of the others read the comparison, and the branch reads
+            // nothing they rewrite.
+            if (shared_values_read) {
+                return llvm::any_of(cmp->users(), [](const llvm::User *user) {
+                    const auto *reader = llvm::dyn_cast< llvm::Instruction >(user);
+                    return reader != nullptr && reader->isTerminator();
+                }) ? cmp : nullptr;
+            }
             for (const llvm::User *user : cmp->users()) {
                 const auto *reader = llvm::dyn_cast< llvm::Instruction >(user);
                 if (reader == nullptr || !reader->isTerminator()) {
@@ -613,7 +643,24 @@ namespace cobra {
             const uint32_t shift = static_cast< uint32_t >(amount->getZExtValue());
             for (const llvm::User *user : inst->users()) {
                 const auto *trunc = llvm::dyn_cast< llvm::TruncInst >(user);
-                if (trunc == nullptr || shift + trunc->getType()->getIntegerBitWidth() > bw) {
+                if (trunc != nullptr) {
+                    if (shift + trunc->getType()->getIntegerBitWidth() > bw) {
+                        return false;
+                    }
+                    continue;
+                }
+                // What else reads the shift is wrong about it only inside a tree
+                // read at `bw`, which holds the low bits alone. A comparison of
+                // the whole word is a leaf of any such tree (`FitsTreeWidth`),
+                // and a store, a return or a call that is no operator of the
+                // model is in none: each reads the shift outside every reading
+                // that holds it narrow (`SharedValuesRead`).
+                const auto *reader = llvm::dyn_cast< llvm::Instruction >(user);
+                const bool outside = reader != nullptr
+                    && (llvm::isa< llvm::ICmpInst >(reader) || llvm::isa< llvm::StoreInst >(reader)
+                        || llvm::isa< llvm::ReturnInst >(reader)
+                        || (llvm::isa< llvm::CallBase >(reader) && !IsMbaInstruction(reader)));
+                if (!shared_values_read || !outside) {
                     return false;
                 }
             }
@@ -2921,12 +2968,29 @@ namespace cobra {
                 }
                 // A slice reads the root at the width the caller proved it to
                 // be an extension of, not at the width of its type.
+                // And a root narrower than what it reads, at the width of that
+                // (`NarrowRootsReadWide`), with only its own bits demanded.
+                const uint32_t own = ptradd ? 0 : inst.getType()->getIntegerBitWidth();
+                const bool widened = narrow_roots_read_wide && slice == nullptr && !ptradd
+                    && condition == nullptr && own > 1 && own < 64;
                 const uint32_t bw = slice != nullptr ? slice->width
                     : ptradd    ? gep->getOperand(1)->getType()->getIntegerBitWidth()
                     : condition ? condition->getOperand(0)->getType()->getIntegerBitWidth()
-                                : inst.getType()->getIntegerBitWidth();
+                    : widened   ? WidthReadUnder(&inst, own)
+                                : own;
                 if (bw > 64 || bw == 0) {
                     continue;
+                }
+                const uint64_t own_bits = bw > own && widened ? Bitmask(own) : Bitmask(bw);
+                // The tree the root reads at its own width, what a rewrite of the
+                // wide reading is measured against.
+                uint32_t own_width_tree_size = 0;
+                if (widened && bw > own) {
+                    llvm::SmallVector< llvm::Instruction *, 16 > own_insts;
+                    std::vector< llvm::Value * > own_leaves;
+                    llvm::DenseMap< llvm::Value *, llvm::Value * > own_redirects;
+                    CollectTree(&inst, own, own_insts, own_leaves, own_redirects, /*try_phi_transparency=*/false);
+                    own_width_tree_size = static_cast< uint32_t >(std::max< size_t >(own_insts.size(), 1));
                 }
                 // A `ptradd`'s readers are pointers: every bit of the index is
                 // live, so there is no narrower mask to read it under. A
@@ -2939,8 +3003,8 @@ namespace cobra {
                           demanded(&inst), bw,
                           slice != nullptr ? slice->extension : SliceExtension::kNone,
                           sum_group != nullptr
-                      )
-                    : Bitmask(bw);
+                      ) & own_bits
+                    : own_bits;
 
                 llvm::SmallVector< llvm::Instruction *, 16 > tree_insts;
                 std::vector< llvm::Value * > leaves;
@@ -3307,6 +3371,7 @@ namespace cobra {
                                       : boolean_cut             ? kBooleanCutLimit
                                                                 : max_nodes,
                                   .tree_size    = static_cast< uint32_t >(tree_insts.size()) - kept_freezes,
+                                  .own_width_tree_size = own_width_tree_size,
                                   .boundary_cut  = cut_arith_under_bitwise,
                                   .demanded_mask = demanded_mask,
                                   .spans_freeze  = spans_freeze,
@@ -3400,6 +3465,60 @@ namespace cobra {
         }
 
     } // namespace
+
+    SharedValuesRead::SharedValuesRead(bool on) : previous_(shared_values_read) { shared_values_read = on; }
+
+    SharedValuesRead::~SharedValuesRead() { shared_values_read = previous_; }
+
+    NarrowRootsReadWide::NarrowRootsReadWide(bool on) : previous_(narrow_roots_read_wide) {
+        narrow_roots_read_wide = on;
+    }
+
+    NarrowRootsReadWide::~NarrowRootsReadWide() { narrow_roots_read_wide = previous_; }
+
+    uint32_t WidthReadUnder(const llvm::Instruction *root, uint32_t own) {
+        // Bounded: the cone of a root can be most of a function.
+        constexpr size_t kMaxVisited = 256;
+        uint32_t widest = own;
+        llvm::SmallPtrSet< const llvm::Instruction *, 32 > seen;
+        llvm::SmallVector< const llvm::Instruction *, 32 > work{ root };
+        const auto wider = [&](const llvm::Value *value) -> uint32_t {
+            const auto *type = llvm::dyn_cast< llvm::IntegerType >(value->getType());
+            return type != nullptr && type->getBitWidth() > own && type->getBitWidth() <= 64
+                ? type->getBitWidth()
+                : 0;
+        };
+        while (!work.empty() && seen.size() < kMaxVisited) {
+            const auto *inst = work.pop_back_val();
+            if (!seen.insert(inst).second) {
+                continue;
+            }
+            // A comparison of wider values joins a tree of their width only.
+            if (llvm::isa< llvm::ICmpInst >(inst)) {
+                if (const uint32_t width = wider(inst->getOperand(0))) {
+                    widest = std::max(widest, width);
+                    continue;
+                }
+            }
+            for (const llvm::Value *operand : inst->operands()) {
+                const auto *def = llvm::dyn_cast< llvm::Instruction >(operand);
+                if (def == nullptr || !IsMbaInstruction(def)) {
+                    continue;
+                }
+                // A wider value is read at `own` bits only where its low bits
+                // are a function of its operands' low bits; the rest stop the
+                // narrow reading, and are what the wide one is for.
+                if (const uint32_t width = wider(def)) {
+                    if (!WideNodeFitsTreeWidth(def, own)) {
+                        widest = std::max(widest, width);
+                        continue;
+                    }
+                }
+                work.push_back(def);
+            }
+        }
+        return widest;
+    }
 
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
@@ -3616,7 +3735,8 @@ namespace cobra {
         MbaCostModel cost_model, uint32_t max_tree_nodes, const DemandedMaskFn &demanded
     ) {
         std::vector< MBACandidate > candidates;
-        if (cand.root == nullptr || cand.node_limit != 0 || ByteGepOf(cand.root) != nullptr
+        const bool boolean = cand.node_limit == kBooleanCutLimit;
+        if (cand.root == nullptr || (cand.node_limit != 0 && !boolean) || ByteGepOf(cand.root) != nullptr
             || !cand.root->getType()->isIntegerTy() || !is_extension)
         {
             return candidates;
@@ -3645,7 +3765,7 @@ namespace cobra {
 
         for (uint32_t index = 0; index < split->groups; ++index) {
             SumGroup group;
-            group.index = index;
+            group.index = boolean ? kMaxSumGroups + index : index;
             for (size_t term = 0; term < split->terms.size(); ++term) {
                 if (split->group[term] != index) {
                     group.residual.push_back(split->terms[term]);
@@ -3659,7 +3779,8 @@ namespace cobra {
             BuildCandidates(
                 { cand.root }, min_ast_size, max_vars, cost_model, options_tag, whole, 0,
                 /*cut_arith_under_bitwise=*/false, max_tree_nodes, demanded, &as_collected,
-                /*slice=*/nullptr, &group
+                /*slice=*/nullptr, &group, /*boolean_cut=*/boolean,
+                boolean ? NarrowReading::kUnsigned : NarrowReading::kNone
             );
             // The root has no reading with the rest of the sum left out: the
             // collection kept it as a leaf, so the candidate is the root read
@@ -3677,7 +3798,15 @@ namespace cobra {
                 continue;
             }
             const auto read = is_extension(whole.front());
-            if (!read || read->second == SliceExtension::kNone || read->first < 2
+            // The group asked for at the width it was read at, no extension: the
+            // group itself is the candidate, its sum read whole and the rest of
+            // the root's sum added back.
+            if (read && read->second == SliceExtension::kNone && read->first == whole.front().bitwidth) {
+                whole.front().comparison_free_only = cand.comparison_free_only;
+                candidates.push_back(std::move(whole.front()));
+                continue;
+            }
+            if (boolean || !read || read->second == SliceExtension::kNone || read->first < 2
                 || read->first > kMaxSliceWidth || read->first >= bw)
             {
                 continue;
@@ -3701,6 +3830,45 @@ namespace cobra {
                                 .tree_size = static_cast< uint32_t >(claimed.tree_size) }
             );
             candidates.push_back(std::move(sliced.front()));
+        }
+        return candidates;
+    }
+
+    std::vector< MBACandidate > ReaderMbaCandidates(
+        const MBACandidate &cand,
+        const std::vector< std::pair< uint64_t, std::vector< llvm::Use * > > > &readers,
+        uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag, MbaCostModel cost_model,
+        uint32_t max_tree_nodes, const DemandedMaskFn &demanded
+    ) {
+        std::vector< MBACandidate > candidates;
+        if (cand.root == nullptr || cand.node_limit != 0 || !cand.reader_uses.empty()
+            || ByteGepOf(cand.root) != nullptr)
+        {
+            return candidates;
+        }
+        uint32_t index = 0;
+        for (const auto &[mask, uses] : readers) {
+            if (index >= kMaxReaderMasks) {
+                break;
+            }
+            llvm::Instruction *root = cand.root;
+            const DemandedMaskFn under = [&, mask = mask](llvm::Instruction *inst) -> uint64_t {
+                if (inst == root) {
+                    return mask;
+                }
+                return demanded ? demanded(inst) : UINT64_MAX;
+            };
+            std::vector< MBACandidate > read;
+            BuildCandidates(
+                { root }, min_ast_size, max_vars, cost_model, options_tag, read, 0,
+                /*cut_arith_under_bitwise=*/false, max_tree_nodes, under
+            );
+            if (read.empty() || read.front().root != root) {
+                continue;
+            }
+            read.front().node_limit  = ReaderNodeLimit(index++);
+            read.front().reader_uses = uses;
+            candidates.push_back(std::move(read.front()));
         }
         return candidates;
     }

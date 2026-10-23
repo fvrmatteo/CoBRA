@@ -68,6 +68,14 @@ namespace cobra {
         // ring, and one whose shifts sit over sums has them lifted out (see
         // ShiftLifting.h). All ones asks for every bit.
         uint64_t demanded_mask = UINT64_MAX;
+
+        // Read a right shift by a constant at the top of an expression read
+        // under a demanded mask as its operand read under the mask shifted up:
+        // `(e >> k)` on the bits `m` is `e` on the bits `m << k`, shifted. A
+        // value read whole by one reader and through a shift by another is a
+        // root of its own only where nothing else reads it; held in the tree of
+        // the shift's reader, its narrower reading is this one. Off by default.
+        bool read_shifted_operand = false;
     };
 
     Result< SimplifyOutcome > Simplify(

@@ -14,7 +14,9 @@
 #include "llvm/IR/Value.h"
 #include "llvm/Support/KnownBits.h"
 
+#include <bit>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -201,6 +203,135 @@ namespace cobra {
             return EmitCast(opcode, value, target_ty, builder, "cobra.cast", reuse);
         }
 
+        // A node whose value is `low` where bit `bit` of `source` is clear and
+        // `high` where it is set: `(x | -2) + 1` is `-1` or `0` by the low bit
+        // of `x`, and so is everything computed from it and from constants.
+        struct TwoValued
+        {
+            const Expr *source = nullptr;
+            uint32_t bit       = 0;
+            uint64_t low       = 0;
+            uint64_t high      = 0;
+        };
+
+        // `kind` applied to two values, as `EvalExpr` does at `bitwidth`; nothing
+        // for a kind that is not an operator of one or two values.
+        std::optional< uint64_t >
+        ApplyTo(Expr::Kind kind, uint64_t lhs, uint64_t rhs, uint64_t amount, uint32_t bitwidth) {
+            const uint64_t mask = Bitmask(bitwidth);
+            const auto signed_of = [&](uint64_t value) {
+                return SignExtend(value, bitwidth);
+            };
+            switch (kind) {
+                case Expr::Kind::kAdd:
+                    return (lhs + rhs) & mask;
+                case Expr::Kind::kMul:
+                    return (lhs * rhs) & mask;
+                case Expr::Kind::kAnd:
+                    return lhs & rhs & mask;
+                case Expr::Kind::kOr:
+                    return (lhs | rhs) & mask;
+                case Expr::Kind::kXor:
+                    return (lhs ^ rhs) & mask;
+                case Expr::Kind::kNot:
+                    return ~lhs & mask;
+                case Expr::Kind::kNeg:
+                    return (0 - lhs) & mask;
+                case Expr::Kind::kShr:
+                    return amount >= bitwidth ? 0 : ((lhs & mask) >> amount);
+                case Expr::Kind::kCmpEq:
+                    return static_cast< uint64_t >((lhs & mask) == (rhs & mask));
+                case Expr::Kind::kCmpUlt:
+                    return static_cast< uint64_t >((lhs & mask) < (rhs & mask));
+                case Expr::Kind::kCmpSlt:
+                    return static_cast< uint64_t >(signed_of(lhs) < signed_of(rhs));
+                default:
+                    return std::nullopt;
+            }
+        }
+
+        // `expr` read as one of two values picked by one bit (`TwoValued`), or
+        // nothing. A node whose operands are constants or two-valued on the same
+        // bit of the same source is two-valued on it too, the operator applied
+        // to each side. Below those, a bit is read where it is the whole of what
+        // varies: `x & 2^i`, `x | ~2^i`, the top bit `x >> (w - 1)`, and a
+        // comparison, which is its own 0 or 1.
+        std::optional< TwoValued > ReadTwoValued(const Expr &expr, uint32_t bitwidth) {
+            const uint64_t mask = Bitmask(bitwidth);
+            if (expr.kind == Expr::Kind::kConstant || expr.kind == Expr::Kind::kVariable) {
+                return std::nullopt;
+            }
+            // From the operands.
+            std::optional< TwoValued > shared;
+            bool composes = true;
+            std::vector< std::pair< uint64_t, uint64_t > > sides;
+            for (const auto &child : expr.children) {
+                if (child->kind == Expr::Kind::kConstant) {
+                    sides.emplace_back(child->constant_val & mask, child->constant_val & mask);
+                    continue;
+                }
+                auto read = ReadTwoValued(*child, bitwidth);
+                if (!read
+                    || (shared
+                        && (shared->bit != read->bit || !ExprStructurallyEqual(*shared->source, *read->source))))
+                {
+                    composes = false;
+                    break;
+                }
+                shared = read;
+                sides.emplace_back(read->low, read->high);
+            }
+            if (composes && shared) {
+                const uint64_t lhs_low  = sides[0].first;
+                const uint64_t lhs_high = sides[0].second;
+                const uint64_t rhs_low  = sides.size() > 1 ? sides[1].first : 0;
+                const uint64_t rhs_high = sides.size() > 1 ? sides[1].second : 0;
+                const auto low  = ApplyTo(expr.kind, lhs_low, rhs_low, expr.constant_val, bitwidth);
+                const auto high = ApplyTo(expr.kind, lhs_high, rhs_high, expr.constant_val, bitwidth);
+                if (low && high) {
+                    return TwoValued{ shared->source, shared->bit, *low, *high };
+                }
+                return std::nullopt;
+            }
+            // A bit read whole.
+            if (IsComparison(expr.kind)) {
+                return TwoValued{ &expr, 0, 0, 1 };
+            }
+            if (expr.kind == Expr::Kind::kShr && expr.constant_val + 1 == bitwidth) {
+                return TwoValued{ expr.children[0].get(), bitwidth - 1, 0, 1 };
+            }
+            if ((expr.kind == Expr::Kind::kAnd || expr.kind == Expr::Kind::kOr) && expr.children.size() == 2) {
+                for (unsigned side = 0; side < 2; ++side) {
+                    const auto &constant = *expr.children[side];
+                    if (constant.kind != Expr::Kind::kConstant) {
+                        continue;
+                    }
+                    const uint64_t c    = constant.constant_val & mask;
+                    const uint64_t kept = expr.kind == Expr::Kind::kAnd ? c : ~c & mask;
+                    if (kept == 0 || (kept & (kept - 1)) != 0) {
+                        continue;
+                    }
+                    const auto bit = static_cast< uint32_t >(std::countr_zero(kept));
+                    return expr.kind == Expr::Kind::kAnd
+                        ? TwoValued{ expr.children[1 - side].get(), bit, 0, kept }
+                        : TwoValued{ expr.children[1 - side].get(), bit, c, mask };
+                }
+            }
+            return std::nullopt;
+        }
+
+        // How many operators `expr` holds, constants and variables aside.
+        uint32_t Operators(const Expr &expr) {
+            if (expr.kind == Expr::Kind::kConstant || expr.kind == Expr::Kind::kVariable) {
+                return 0;
+            }
+            uint32_t count = 1;
+            for (const auto &child : expr.children) {
+                count += Operators(*child);
+            }
+            return count;
+        }
+
     } // namespace
 
     namespace {
@@ -219,16 +350,16 @@ namespace cobra {
         llvm::Value *ReconstructNode(
             const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
             const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse,
-            bool condition_forms, SubtreeMemo *memo
+            bool condition_forms, bool two_valued, uint32_t width, SubtreeMemo *memo
         );
 
         llvm::Value *Reconstruct(
             const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
             const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse,
-            bool condition_forms, SubtreeMemo *memo
+            bool condition_forms, bool two_valued, uint32_t width, SubtreeMemo *memo
         ) {
             if (memo == nullptr || expr.kind == Expr::Kind::kConstant) {
-                return ReconstructNode(expr, candidate, builder, var_map, leaves, reuse, condition_forms, memo);
+                return ReconstructNode(expr, candidate, builder, var_map, leaves, reuse, condition_forms, two_valued, width, memo);
             }
             const size_t hash = std::hash< Expr >{}(expr);
             const auto range  = memo->built.equal_range(hash);
@@ -237,7 +368,7 @@ namespace cobra {
                     return it->second.second;
                 }
             }
-            auto *value = ReconstructNode(expr, candidate, builder, var_map, leaves, reuse, condition_forms, memo);
+            auto *value = ReconstructNode(expr, candidate, builder, var_map, leaves, reuse, condition_forms, two_valued, width, memo);
             memo->built.emplace(hash, std::make_pair(&expr, value));
             return value;
         }
@@ -246,11 +377,11 @@ namespace cobra {
     llvm::Value *ReconstructIr(
         const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
         const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse,
-        bool condition_forms
+        bool condition_forms, bool two_valued_selects, uint32_t build_width
     ) {
         SubtreeMemo memo;
         return Reconstruct(
-            expr, candidate, builder, var_map, leaves, reuse, condition_forms,
+            expr, candidate, builder, var_map, leaves, reuse, condition_forms, two_valued_selects, build_width,
             condition_forms ? &memo : nullptr
         );
     }
@@ -259,9 +390,9 @@ namespace cobra {
     llvm::Value *ReconstructNode(
         const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
         const std::vector< uint32_t > &var_map, LeafSupply *leaves, IrReuse *reuse,
-        bool condition_forms, SubtreeMemo *memo
+        bool condition_forms, bool two_valued, uint32_t width, SubtreeMemo *memo
     ) {
-        auto *int_ty = builder.getIntNTy(candidate.bitwidth);
+        auto *int_ty = builder.getIntNTy(width != 0 ? width : candidate.bitwidth);
         const auto leaf_value = [&](uint32_t index) -> llvm::Value * {
             if (leaves == nullptr) {
                 return candidate.leaf_values[index];
@@ -280,11 +411,11 @@ namespace cobra {
         };
         const auto child = [&](unsigned index) {
             return Reconstruct(
-                *expr.children[index], candidate, builder, var_map, leaves, reuse, condition_forms, memo
+                *expr.children[index], candidate, builder, var_map, leaves, reuse, condition_forms, two_valued, width, memo
             );
         };
         const auto build = [&](const Expr &node) {
-            return Reconstruct(node, candidate, builder, var_map, leaves, reuse, condition_forms, memo);
+            return Reconstruct(node, candidate, builder, var_map, leaves, reuse, condition_forms, two_valued, width, memo);
         };
         // A comparison as the `i1` it is, its predicate inverted when `^ 1`
         // flips it; null for anything else.
@@ -315,6 +446,63 @@ namespace cobra {
             auto *rhs = build(*cmp->children[1]);
             return EmitCompare(predicate, lhs, rhs, builder, "cobra.cond", reuse);
         };
+
+        // A sub-expression that is one of two values picked by one bit
+        // (`two_valued_selects`), as the `select` of the two on that bit, where
+        // that costs no more than the operators between the bit and the value.
+        if (two_valued) {
+            if (const auto read = ReadTwoValued(expr, int_ty->getBitWidth())) {
+                const uint32_t width = int_ty->getBitWidth();
+                const bool compares  = IsComparison(read->source->kind);
+                // Past what both build - the source's operands - the arithmetic
+                // spells the operators above the source (and a comparison as an
+                // `icmp` widened); the `select` spells the test of the bit and the
+                // pick.
+                const uint32_t written = Operators(expr) - Operators(*read->source) + (compares ? 2 : 0);
+                const uint32_t test    = compares || read->bit == 0 || read->bit + 1 == width ? 1 : 2;
+                const uint32_t spelled = test + 1;
+                // Two values one bit apart are already all a reader learns from
+                // the known bits of the arithmetic, and `0` and `-1` from its
+                // range; the `select` is for the rest, and a `select` LLVM has no
+                // need of is one more instruction its folds have to see through.
+                const uint64_t apart = read->low ^ read->high;
+                const bool readable  = std::popcount(apart) < 2
+                    || ((read->low == 0 || read->high == 0) && apart == Bitmask(width));
+                if (!readable && spelled <= written) {
+                    llvm::Value *bit = nullptr;
+                    if (compares) {
+                        bit = condition(*read->source);
+                    } else {
+                        auto *source = build(*read->source);
+                        if (read->bit + 1 == width) {
+                            bit = EmitCompare(
+                                llvm::CmpInst::ICMP_SLT, source, llvm::ConstantInt::get(int_ty, 0), builder,
+                                "cobra.bit", reuse
+                            );
+                        } else if (read->bit == 0) {
+                            bit = EmitCast(
+                                llvm::Instruction::Trunc, source, builder.getInt1Ty(), builder, "cobra.bit", reuse
+                            );
+                        } else {
+                            auto *masked = EmitBinary(
+                                llvm::Instruction::And, source,
+                                llvm::ConstantInt::get(int_ty, uint64_t{ 1 } << read->bit), builder, "cobra.bit", reuse
+                            );
+                            bit = EmitCompare(
+                                llvm::CmpInst::ICMP_NE, masked, llvm::ConstantInt::get(int_ty, 0), builder,
+                                "cobra.bit", reuse
+                            );
+                        }
+                    }
+                    if (bit != nullptr) {
+                        return EmitSelect(
+                            bit, llvm::ConstantInt::get(int_ty, read->high), llvm::ConstantInt::get(int_ty, read->low),
+                            builder, "cobra.pick", reuse
+                        );
+                    }
+                }
+            }
+        }
 
         switch (expr.kind) {
             case Expr::Kind::kConstant:
@@ -375,8 +563,7 @@ namespace cobra {
                     if (leaf_idx >= candidate.leaf_values.size()) {
                         return nullptr;
                     }
-                    const uint64_t width = candidate.bitwidth >= 64 ? ~uint64_t{ 0 }
-                                                                    : (uint64_t{ 1 } << candidate.bitwidth) - 1;
+                    const uint64_t width = Bitmask(int_ty->getBitWidth());
                     // What may be relied on is what holds of the value the
                     // rewrite reads, now - not what the tree was read under.
                     // The proof covers the leaf masked by its known bits, which
