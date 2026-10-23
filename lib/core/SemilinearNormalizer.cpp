@@ -6,7 +6,10 @@
 #include "cobra/core/SemilinearIR.h"
 #include "cobra/core/Trace.h"
 #include <algorithm>
+#include <bit>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -55,6 +58,105 @@ namespace cobra {
             return std::ranges::any_of(expr.children, [](const auto &child) {
                 return HasConstant(*child);
             });
+        }
+
+        // A bitwise value moved up by a power of two, with constant bits
+        // below it: `(value << shift) | low`, where `value` is purely bitwise
+        // and `low < 2^shift`.
+        struct ShiftedUp
+        {
+            std::unique_ptr< Expr > value;
+            uint32_t shift = 0;
+            uint64_t low   = 0;
+        };
+
+        // Reads `expr` as a bitwise value shifted up, when it is one.
+        //
+        // A bitwise operation with a constant over a shifted value works on
+        // the shifted bits and on the bits below the shift apart, and below
+        // the shift there are only constants: `(v << k) ^ c` is
+        // `(v ^ (c >> k)) << k` with `c`'s low `k` bits beneath it, and
+        // likewise for `&`, `|` and `~`, and for two values shifted by the
+        // same distance. A compiler moves a mask or a flip outward past a
+        // doubling - `2 * (x ^ c)` is printed `(x << 1) ^ (c << 1)` - and the
+        // rewritten shape is a bitwise operation over a product the sum
+        // cannot take apart; read this way it is the semilinear term
+        // `2^k * (v ^ c')` again. Exact in the ring: bits shifted past the
+        // width are gone on both sides.
+        std::optional< ShiftedUp > ReadShiftedUp(const Expr &expr, uint32_t bitwidth, uint64_t mask) {
+            if (IsPurelyBitwise(expr) && HasVariable(expr)) {
+                return ShiftedUp{ .value = CloneExpr(expr) };
+            }
+            switch (expr.kind) {
+                case Expr::Kind::kMul: {
+                    for (size_t side = 0; side < 2; ++side) {
+                        const auto &factor = *expr.children[side];
+                        if (HasVariable(factor)) { continue; }
+                        const uint64_t kFactor = EvalConstantExpr(factor, bitwidth);
+                        if (kFactor == 0 || !std::has_single_bit(kFactor)) { return std::nullopt; }
+                        auto inner = ReadShiftedUp(*expr.children[1 - side], bitwidth, mask);
+                        if (!inner.has_value()) { return std::nullopt; }
+                        const auto kBy = static_cast< uint32_t >(std::countr_zero(kFactor));
+                        if (inner->shift + kBy >= bitwidth) { return std::nullopt; }
+                        inner->shift += kBy;
+                        inner->low    = (inner->low << kBy) & mask;
+                        return inner;
+                    }
+                    return std::nullopt;
+                }
+                case Expr::Kind::kNot: {
+                    auto inner = ReadShiftedUp(*expr.children[0], bitwidth, mask);
+                    if (!inner.has_value()) { return std::nullopt; }
+                    inner->value = Expr::BitwiseNot(std::move(inner->value));
+                    inner->low   = ~inner->low & ((uint64_t{ 1 } << inner->shift) - 1);
+                    return inner;
+                }
+                case Expr::Kind::kAnd:
+                case Expr::Kind::kOr:
+                case Expr::Kind::kXor: {
+                    const auto combine = [&](std::unique_ptr< Expr > lhs, std::unique_ptr< Expr > rhs) {
+                        switch (expr.kind) {
+                            case Expr::Kind::kAnd:
+                                return Expr::BitwiseAnd(std::move(lhs), std::move(rhs));
+                            case Expr::Kind::kOr:
+                                return Expr::BitwiseOr(std::move(lhs), std::move(rhs));
+                            default:
+                                return Expr::BitwiseXor(std::move(lhs), std::move(rhs));
+                        }
+                    };
+                    const auto combine_low = [&](uint64_t lhs, uint64_t rhs) {
+                        switch (expr.kind) {
+                            case Expr::Kind::kAnd:
+                                return lhs & rhs;
+                            case Expr::Kind::kOr:
+                                return lhs | rhs;
+                            default:
+                                return lhs ^ rhs;
+                        }
+                    };
+                    for (size_t side = 0; side < 2; ++side) {
+                        const auto &constant = *expr.children[side];
+                        if (HasVariable(constant)) { continue; }
+                        auto inner = ReadShiftedUp(*expr.children[1 - side], bitwidth, mask);
+                        if (!inner.has_value()) { return std::nullopt; }
+                        const uint64_t kC    = EvalConstantExpr(constant, bitwidth);
+                        const uint64_t kBelow = (uint64_t{ 1 } << inner->shift) - 1;
+                        inner->value = combine(std::move(inner->value), Expr::Constant(kC >> inner->shift));
+                        inner->low   = combine_low(inner->low, kC & kBelow);
+                        return inner;
+                    }
+                    auto lhs = ReadShiftedUp(*expr.children[0], bitwidth, mask);
+                    auto rhs = ReadShiftedUp(*expr.children[1], bitwidth, mask);
+                    if (!lhs.has_value() || !rhs.has_value() || lhs->shift != rhs->shift) {
+                        return std::nullopt;
+                    }
+                    lhs->value = combine(std::move(lhs->value), std::move(rhs->value));
+                    lhs->low   = combine_low(lhs->low, rhs->low);
+                    return lhs;
+                }
+                default:
+                    return std::nullopt;
+            }
         }
 
         OperatorFamily DetectProvenance(const Expr &expr) {
@@ -336,14 +438,27 @@ namespace cobra {
                 case Expr::Kind::kOr:
                 case Expr::Kind::kXor:
                 case Expr::Kind::kNot:
+                    // A bitwise operation over a value shifted up is the
+                    // shifted bitwise value plus the constant bits below it.
+                    if (auto shifted = ReadShiftedUp(expr, ctx.bitwidth, ctx.mask);
+                        shifted.has_value() && shifted->shift != 0)
+                    {
+                        auto result = CollectTerms(
+                            ctx, *shifted->value, (coeff << shifted->shift) & ctx.mask
+                        );
+                        result.constant = (result.constant + (coeff * shifted->low)) & ctx.mask;
+                        return result;
+                    }
+                    // Otherwise reached when the node has variables but is
+                    // NOT purely bitwise (e.g. (x+y) & 0x457). Reject
+                    // explicitly instead of silently dropping the subtree.
+                    ctx.encountered_nonlinear = true;
+                    return { .constant = 0, .terms = {} };
                 // A comparison over variables is neither a linear term nor a
                 // bitwise atom, so it gets the same explicit rejection.
                 case Expr::Kind::kCmpEq:
                 case Expr::Kind::kCmpUlt:
                 case Expr::Kind::kCmpSlt:
-                    // Reached when the node has variables but is NOT
-                    // purely bitwise (e.g. (x+y) & 0x457). Reject
-                    // explicitly instead of silently dropping the subtree.
                     ctx.encountered_nonlinear = true;
                     return { .constant = 0, .terms = {} };
             }

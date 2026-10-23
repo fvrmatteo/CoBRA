@@ -1,3 +1,5 @@
+#include "cobra/core/Evaluator.h"
+#include "cobra/core/MaskedAtomReconstructor.h"
 #include "cobra/core/Result.h"
 #include "cobra/core/SemilinearNormalizer.h"
 #include <gtest/gtest.h>
@@ -411,4 +413,48 @@ TEST(NormalizerTest, ScaledMaskReadsAnArithmeticConstant) {
     EXPECT_EQ(ir.value().constant, 0u);
     ASSERT_EQ(ir.value().terms.size(), 1u);
     EXPECT_EQ(ir.value().terms[0].coeff, 8u);
+}
+
+// A bitwise operation over a value shifted up is the shifted bitwise value with
+// the constant's low bits beneath it: `(x << k) ^ c` is
+// `((x ^ (c >> k)) << k) + (c & (2^k - 1))`, and likewise for `&`, `|`, `~`,
+// two values shifted by the same distance, and a shift of a shifted value.
+// Every shape below normalises, and what it normalises to computes the
+// expression at every 8-bit input.
+TEST(NormalizerTest, BitwiseOverAShiftedValueIsTheShiftedBitwiseValue) {
+    const auto x     = [] { return Expr::Variable(0); };
+    const auto y     = [] { return Expr::Variable(1); };
+    const auto c     = [](uint64_t value) { return Expr::Constant(value); };
+    const auto twice = [](std::unique_ptr< Expr > e) {
+        return Expr::Mul(std::move(e), Expr::Constant(2));
+    };
+    std::vector< std::unique_ptr< Expr > > shapes;
+    shapes.push_back(Expr::BitwiseXor(Expr::BitwiseAnd(twice(x()), c(0xFC)), c(0xAC)));
+    shapes.push_back(Expr::BitwiseOr(Expr::BitwiseNot(Expr::Mul(x(), c(4))), c(0x05)));
+    shapes.push_back(Expr::BitwiseAnd(Expr::BitwiseXor(twice(x()), twice(y())), c(0x7F)));
+    shapes.push_back(Expr::Mul(c(4), Expr::BitwiseXor(twice(x()), c(0x33))));
+    shapes.push_back(
+        Expr::BitwiseOr(twice(Expr::BitwiseXor(Expr::Mul(c(4), x()), c(0x11))), c(0x81))
+    );
+    for (const auto &shape : shapes) {
+        auto ir = NormalizeToSemilinear(*shape, { "x", "y" }, 8);
+        ASSERT_TRUE(ir.has_value());
+        auto back           = ReconstructMaskedAtoms(ir.value(), {});
+        const auto original = Evaluator::FromExpr(*shape, 8);
+        const auto read     = Evaluator::FromExpr(*back, 8);
+        for (uint64_t a = 0; a < 256; ++a) {
+            for (uint64_t b = 0; b < 256; ++b) {
+                ASSERT_EQ(read({ a, b }), original({ a, b })) << "x=" << a << " y=" << b;
+            }
+        }
+    }
+}
+
+// Two values shifted by different distances have no one shift to take out.
+TEST(NormalizerTest, BitwiseOverDifferentShiftsIsNotSemilinear) {
+    auto e = Expr::BitwiseXor(
+        Expr::Mul(Expr::Variable(0), Expr::Constant(2)),
+        Expr::Mul(Expr::Variable(0), Expr::Constant(4))
+    );
+    EXPECT_FALSE(NormalizeToSemilinear(*e, { "x" }, 8).has_value());
 }
