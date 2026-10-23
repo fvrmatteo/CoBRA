@@ -387,6 +387,22 @@ namespace cobra {
         uint32_t max_tree_nodes, const DemandedMaskFn &demanded
     );
 
+    // While one is alive on this thread, `bitreverse` and the overflow bit of
+    // `ssub.with.overflow` are operations of a tree rather than leaves
+    // (`CobraPassOptions::read_bit_intrinsics`).
+    class BitIntrinsicsRead
+    {
+      public:
+        explicit BitIntrinsicsRead(bool on);
+        ~BitIntrinsicsRead();
+
+        BitIntrinsicsRead(const BitIntrinsicsRead &)            = delete;
+        BitIntrinsicsRead &operator=(const BitIntrinsicsRead &) = delete;
+
+      private:
+        bool previous_;
+    };
+
     // The width a root of `own` bits is read at under `NarrowRootsReadWide`:
     // the widest integer, up to 64 bits, that a reading at `own` bits would stop
     // at - a comparison of wider values, or a wider value under a truncation

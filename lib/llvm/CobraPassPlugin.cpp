@@ -48,6 +48,7 @@ namespace {
     //   narrow-roots             read_narrow_roots_wide
     //   two-valued-selects       two_valued_selects
     //   shared-values            unblock_shared_values
+    //   bit-intrinsics           read_bit_intrinsics
     //   wide-roots               cut_wide_roots
     //   dying-cost               cost_model = kDyingInstructions
     //   skip-loop-carried-phis   skip_loop_carried_phis
@@ -96,6 +97,8 @@ namespace {
                     options.two_valued_selects = true;
                 } else if (name == "shared-values") {
                     options.unblock_shared_values = true;
+                } else if (name == "bit-intrinsics") {
+                    options.read_bit_intrinsics = true;
                 } else if (name == "wide-roots") {
                     options.cut_wide_roots = true;
                 } else if (name == "verified-conditions") {
