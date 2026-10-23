@@ -43,6 +43,11 @@ namespace {
     //   sweep                    z3_settings.sweep
     //   boolean                  boolean_variables
     //   conditions               read_conditions
+    //   subterms                 subterm_reading
+    //   affine                   affine_reading
+    //   narrow-roots             read_narrow_roots_wide
+    //   two-valued-selects       two_valued_selects
+    //   shared-values            unblock_shared_values
     //   wide-roots               cut_wide_roots
     //   dying-cost               cost_model = kDyingInstructions
     //   skip-loop-carried-phis   skip_loop_carried_phis
@@ -81,6 +86,16 @@ namespace {
                     options.boolean_variables = true;
                 } else if (name == "conditions") {
                     options.read_conditions = true;
+                } else if (name == "subterms") {
+                    options.subterm_reading = true;
+                } else if (name == "affine") {
+                    options.affine_reading = true;
+                } else if (name == "narrow-roots") {
+                    options.read_narrow_roots_wide = true;
+                } else if (name == "two-valued-selects") {
+                    options.two_valued_selects = true;
+                } else if (name == "shared-values") {
+                    options.unblock_shared_values = true;
                 } else if (name == "wide-roots") {
                     options.cut_wide_roots = true;
                 } else if (name == "verified-conditions") {

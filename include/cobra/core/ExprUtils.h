@@ -83,4 +83,20 @@ namespace cobra {
     /// must do the same.
     std::unique_ptr< Expr > RepairProductShadow(std::unique_ptr< Expr > expr);
 
+    /// `expr` with what each low-bit mask `e & (2^k - 1)` already says read
+    /// into `e`. Below such a mask only the low `k` bits of `e` are read, and
+    /// the low `k` bits of a sum, a product, a negation or a bitwise operation
+    /// are those of its operands' low `k` bits: so a mask of `k` or more bits
+    /// inside `e` changes nothing and goes, and a constant inside it is only
+    /// itself modulo `2^k` and is written sign-extended from `k` bits. A value
+    /// computed at a narrow width and widened - which a lifter writes as
+    /// `zext (add i16 (trunc x), -128)`, read here as
+    /// `((x & 0xFFFF) + 0xFF80) & 0xFFFF` - is then the same expression as the
+    /// wide computation it truncates, `(x + -128) & 0xFFFF`, and the two are
+    /// one atom to the search rather than two unrelated ones. A shift right or
+    /// a comparison reads bits above `k`, so the masks under one stay. The
+    /// result computes `expr` exactly. `changed` says whether anything moved.
+    std::unique_ptr< Expr >
+    NormalizeLowBitMasks(const Expr &expr, uint32_t bitwidth, bool &changed);
+
 } // namespace cobra

@@ -36,6 +36,8 @@ target_sources(cobra-core PRIVATE
     SignatureEval.cpp
     DynamicMask.cpp
     ShiftLifting.cpp
+    SubtermReading.cpp
+    AffineReading.cpp
     MixedProductRewriter.cpp
     ExprCost.cpp
     SignatureSimplifier.cpp

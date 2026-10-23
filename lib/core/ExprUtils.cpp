@@ -446,4 +446,121 @@ namespace cobra {
         return expr;
     }
 
+    namespace {
+
+        // `k` when `value` is `2^k - 1` with `0 < k < bitwidth`.
+        std::optional< uint32_t > LowMaskWidth(uint64_t value, uint32_t bitwidth) {
+            value &= Bitmask(bitwidth);
+            if (value == 0 || value == Bitmask(bitwidth) || (value & (value + 1)) != 0) {
+                return std::nullopt;
+            }
+            return static_cast< uint32_t >(std::popcount(value));
+        }
+
+        // The low `width` bits of `value`, sign-extended to `bitwidth`.
+        uint64_t SignExtendedLow(uint64_t value, uint32_t width, uint32_t bitwidth) {
+            value &= Bitmask(width);
+            if (((value >> (width - 1)) & 1) != 0) {
+                value |= ~Bitmask(width);
+            }
+            return value & Bitmask(bitwidth);
+        }
+
+        std::unique_ptr< Expr > Normalize(const Expr &expr, uint32_t bitwidth, bool &changed);
+
+        // `expr`, of which only the low `width` bits are read.
+        std::unique_ptr< Expr >
+        UnderMask(const Expr &expr, uint32_t width, uint32_t bitwidth, bool &changed) {
+            switch (expr.kind) {
+                case Expr::Kind::kConstant: {
+                    const uint64_t value = SignExtendedLow(expr.constant_val, width, bitwidth);
+                    changed |= value != (expr.constant_val & Bitmask(bitwidth));
+                    return Expr::Constant(value);
+                }
+                case Expr::Kind::kVariable:
+                    return CloneExpr(expr);
+                case Expr::Kind::kAnd: {
+                    for (size_t side = 0; side < 2; ++side) {
+                        const Expr &mask  = *expr.children[side];
+                        const Expr &other = *expr.children[1 - side];
+                        if (mask.kind != Expr::Kind::kConstant) {
+                            continue;
+                        }
+                        const auto inner = LowMaskWidth(mask.constant_val, bitwidth);
+                        if (inner && *inner >= width) {
+                            // The mask keeps every bit that is read.
+                            changed = true;
+                            return UnderMask(other, width, bitwidth, changed);
+                        }
+                        if (inner) {
+                            // Narrower: it is what reads the operand now.
+                            return Expr::BitwiseAnd(
+                                UnderMask(other, *inner, bitwidth, changed), CloneExpr(mask)
+                            );
+                        }
+                    }
+                    return Expr::BitwiseAnd(
+                        UnderMask(*expr.children[0], width, bitwidth, changed),
+                        UnderMask(*expr.children[1], width, bitwidth, changed)
+                    );
+                }
+                case Expr::Kind::kAdd:
+                    return Expr::Add(
+                        UnderMask(*expr.children[0], width, bitwidth, changed),
+                        UnderMask(*expr.children[1], width, bitwidth, changed)
+                    );
+                case Expr::Kind::kMul:
+                    return Expr::Mul(
+                        UnderMask(*expr.children[0], width, bitwidth, changed),
+                        UnderMask(*expr.children[1], width, bitwidth, changed)
+                    );
+                case Expr::Kind::kOr:
+                    return Expr::BitwiseOr(
+                        UnderMask(*expr.children[0], width, bitwidth, changed),
+                        UnderMask(*expr.children[1], width, bitwidth, changed)
+                    );
+                case Expr::Kind::kXor:
+                    return Expr::BitwiseXor(
+                        UnderMask(*expr.children[0], width, bitwidth, changed),
+                        UnderMask(*expr.children[1], width, bitwidth, changed)
+                    );
+                case Expr::Kind::kNot:
+                    return Expr::BitwiseNot(UnderMask(*expr.children[0], width, bitwidth, changed));
+                case Expr::Kind::kNeg:
+                    return Expr::Negate(UnderMask(*expr.children[0], width, bitwidth, changed));
+                default:
+                    // A shift right or a comparison reads every bit of its operands.
+                    return Normalize(expr, bitwidth, changed);
+            }
+        }
+
+        std::unique_ptr< Expr > Normalize(const Expr &expr, uint32_t bitwidth, bool &changed) {
+            if (expr.kind == Expr::Kind::kAnd) {
+                for (size_t side = 0; side < 2; ++side) {
+                    const Expr &mask = *expr.children[side];
+                    if (mask.kind != Expr::Kind::kConstant) {
+                        continue;
+                    }
+                    if (const auto width = LowMaskWidth(mask.constant_val, bitwidth)) {
+                        return Expr::BitwiseAnd(
+                            UnderMask(*expr.children[1 - side], *width, bitwidth, changed), CloneExpr(mask)
+                        );
+                    }
+                }
+            }
+            auto node = CloneNode(expr);
+            for (const auto &child : expr.children) {
+                node->children.push_back(Normalize(*child, bitwidth, changed));
+            }
+            return node;
+        }
+
+    } // namespace
+
+    std::unique_ptr< Expr >
+    NormalizeLowBitMasks(const Expr &expr, uint32_t bitwidth, bool &changed) {
+        changed = false;
+        return Normalize(expr, bitwidth, changed);
+    }
+
 } // namespace cobra

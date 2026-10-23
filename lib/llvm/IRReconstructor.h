@@ -100,12 +100,26 @@ namespace cobra {
     // sign extension; a comparison flipped with `^ 1` as the inverse predicate;
     // `x + -y` as `x - y`; and `B ^ ((A ^ B) & -c)`, which is how a `select` of a
     // comparison reads, as that `select`. Each is the same value.
+    //
+    // `two_valued_selects` (`CobraPassOptions::two_valued_selects`) builds a
+    // sub-expression that takes one of two values, picked by one bit of another
+    // (`ReadTwoValued`), as the `select` of those two constants on that bit
+    // wherever that costs no more instructions than the arithmetic: what LLVM's
+    // range analyses read of `select (trunc t), 0, -194` is that it is one of
+    // two numbers, and of `((t | -2) + 1) & -194` nothing at all.
+    //
+    // `build_width`, when not zero, builds the rewrite at that width instead of
+    // the candidate's: for an expression whose low bits are the same expression
+    // over its leaves' low bits (no right shift, no comparison), each leaf
+    // narrowed to it.
     llvm::Value *ReconstructIr(
         const Expr &expr, const MBACandidate &candidate, llvm::IRBuilder<> &builder,
         const std::vector< uint32_t > &var_map                 = {},
         LeafSupply *leaves                                     = nullptr,
         IrReuse *reuse                                         = nullptr,
-        bool condition_forms                                   = false
+        bool condition_forms                                   = false,
+        bool two_valued_selects                                = false,
+        uint32_t build_width                                   = 0
     );
 
 } // namespace cobra

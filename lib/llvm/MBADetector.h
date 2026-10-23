@@ -180,6 +180,14 @@ namespace cobra {
         // against under `MbaCostModel::kTreeInstructions`.
         uint32_t tree_size = 0;
 
+        // For a root read wider than its type (`NarrowRootsReadWide`): the
+        // instructions of its tree read at its own width, sharing and all. The
+        // wide reading reaches into the wide values the root reads, which the
+        // root's own expression reads as leaves; it is a way to find the root's
+        // simpler form, and that form is measured against the tree the root
+        // reads at its own width. Zero for any other candidate.
+        uint32_t own_width_tree_size = 0;
+
         // Collected with every arithmetic value under a bitwise reader kept
         // as a leaf (see `BoundaryCutMbaCandidate`). Like a re-cut it is a
         // partial view of the root, and `node_limit` says so too.
@@ -207,6 +215,15 @@ namespace cobra {
         // the fact is what tells both that only a proof may accept a rewrite.
         bool holds_comparison = false;
 
+        // For a boolean cut taken only because a `select` leaf reads a narrow
+        // comparison: a rewrite of it is taken only when it compares nothing.
+        // The cut reads the comparison exactly, at the tree width, and a rewrite
+        // that kept it would spell it anew there - equal to the comparison the
+        // function shares, and a different value, which no pass that matches
+        // conditions by identity relates to it. One that compares nothing has
+        // read the comparison together with the value it compares, and left it.
+        bool comparison_free_only = false;
+
         // For a slice: how the root is recovered from the `bitwidth` bits this
         // candidate reads of it. A rewrite replaces the root with that
         // extension of what the narrow bits were rewritten into, so the
@@ -225,6 +242,11 @@ namespace cobra {
         // the candidate is the group alone; the rewrite adds them back, which
         // is what makes the root's value again.
         std::vector< std::pair< llvm::Value *, bool > > sum_residual;
+
+        // For a candidate read under the bits some of its root's readers demand
+        // (`ReaderMbaCandidates`): those readers' uses of the root, which are
+        // all its rewrite replaces. The root stays for its other readers.
+        std::vector< llvm::Use * > reader_uses;
     };
 
     // The `node_limit` a boundary cut carries: past any re-cut ladder, so the
@@ -264,7 +286,9 @@ namespace cobra {
     // at the root's own width, which is what the extension claim is proved
     // over.
     constexpr uint32_t kMaxSumGroups  = 8;
-    constexpr uint32_t kSumGroupRungs = kMaxSumGroups * (kMaxSliceWidth + 1);
+    // The groups of the boolean cut's sum stand after those of the root read
+    // whole (`SumGroupSliceMbaCandidates`), so the band holds both.
+    constexpr uint32_t kSumGroupRungs = 2 * kMaxSumGroups * (kMaxSliceWidth + 1);
     constexpr uint32_t kSumGroupLimit = kSliceCutLimit - kMaxSliceWidth - 1;
 
     constexpr uint32_t SumGroupNodeLimit(uint32_t index, uint32_t width) {
@@ -291,10 +315,87 @@ namespace cobra {
     // of its own.
     constexpr uint32_t kShiftedLeafCutLimit = kExtensionCutLimit - 1;
 
+    // The `node_limit`s the readings of a root under one of its readers'
+    // demanded bits carry (`ReaderMbaCandidates`): a band below the shifted-leaf
+    // cut, one rung per distinct mask.
+    constexpr uint32_t kMaxReaderMasks = 8;
+    constexpr uint32_t kReaderLimit    = kShiftedLeafCutLimit - 1;
+
+    constexpr uint32_t ReaderNodeLimit(uint32_t index) { return kReaderLimit - index; }
+
+    constexpr bool IsReaderLimit(uint32_t node_limit) {
+        return node_limit <= kReaderLimit && node_limit > kReaderLimit - kMaxReaderMasks;
+    }
+
     constexpr bool IsWholeSumGroupLimit(uint32_t node_limit) {
         return IsSumGroupLimit(node_limit)
             && (kSumGroupLimit - node_limit) % (kMaxSliceWidth + 1) == 0;
     }
+
+    // While one is alive on this thread, every collection reads a root narrower
+    // than what it reads at the width of what it reads
+    // (`CobraPassOptions::read_narrow_roots_wide`, `WidthReadUnder`): the root
+    // is held zero-extended in a tree of that width, as a narrow node inside a
+    // wider tree always is, only its own bits are demanded, and the rewrite is
+    // truncated back to the root's type. Every collection of a root - the
+    // detection, the descent into inner roots and every cut of it - asks the
+    // same question of the same IR, so all of them read it at one width.
+    class NarrowRootsReadWide
+    {
+      public:
+        explicit NarrowRootsReadWide(bool on);
+        ~NarrowRootsReadWide();
+
+        NarrowRootsReadWide(const NarrowRootsReadWide &)            = delete;
+        NarrowRootsReadWide &operator=(const NarrowRootsReadWide &) = delete;
+
+      private:
+        bool previous_;
+    };
+
+    // While one is alive on this thread, a value other trees also read stops no
+    // reading of a tree (`CobraPassOptions::unblock_shared_values`): a truncation
+    // is a root, read under the bits it keeps however many readers the wide
+    // value under it has; a right shift a narrow tree reads the low bits of is
+    // read through whatever else reads it whole outside any such tree; and a
+    // comparison a branch reads is a root of its own even when a tree reads it
+    // too.
+    class SharedValuesRead
+    {
+      public:
+        explicit SharedValuesRead(bool on);
+        ~SharedValuesRead();
+
+        SharedValuesRead(const SharedValuesRead &)            = delete;
+        SharedValuesRead &operator=(const SharedValuesRead &) = delete;
+
+      private:
+        bool previous_;
+    };
+
+    // The root of `cand`, read again under the bits some of its readers
+    // demand - each entry of `readers` a mask and the uses of the root that
+    // demand no more than it (`CobraPassOptions::unblock_shared_values`). A
+    // value read whole by one reader and through a shift or a truncation by
+    // another is demanded whole, and its own reading cannot use what the other
+    // reader ignores; read again under that reader's bits, the rewrite replaces
+    // the root in those uses alone.
+    std::vector< MBACandidate > ReaderMbaCandidates(
+        const MBACandidate &cand,
+        const std::vector< std::pair< uint64_t, std::vector< llvm::Use * > > > &readers,
+        uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag, MbaCostModel cost_model,
+        uint32_t max_tree_nodes, const DemandedMaskFn &demanded
+    );
+
+    // The width a root of `own` bits is read at under `NarrowRootsReadWide`:
+    // the widest integer, up to 64 bits, that a reading at `own` bits would stop
+    // at - a comparison of wider values, or a wider value under a truncation
+    // that the narrow tree has no reading of (`WideNodeFitsTreeWidth`) -
+    // reached from `root` through the nodes a collection reads. `own` when
+    // there is none. A flag computed from the top bit of a 64-bit sum and
+    // stored as a byte is the shape this is for: at eight bits the sum is a
+    // leaf, and whatever the obfuscator wrote into it is out of reach.
+    uint32_t WidthReadUnder(const llvm::Instruction *root, uint32_t own);
 
     // Find MBA candidates across a function.  Blocks are scanned in
     // post-order (uses before defs) with reverse instruction iteration
@@ -613,13 +714,22 @@ namespace cobra {
     // the same question `SliceToRead` answers about a whole root, over the
     // group's own expression. A group it declines is dropped; a group it
     // accepts is returned collected at that width, carrying both the extension
-    // and the residual.
+    // and the residual. An answer of the width the group was read at with no
+    // extension returns the group as it was read: a sum the rest of the root's
+    // sum is added back to, and nothing claimed about its bits.
     //
     // Returns nothing for a cut, for a `ptradd` root, for a root whose sum does
     // not split, and for a split with more than `kMaxSumGroups` groups.
     using SumGroupExtensionFn = std::function<
         std::optional< std::pair< uint32_t, SliceExtension > >(const MBACandidate &) >;
 
+    //
+    // `cand` may also be the boolean cut (`BooleanCutMbaCandidate`), whose tree
+    // holds the narrow comparisons the ordinary collection keeps as leaves: a
+    // carry picked by testing the value a group sums then reaches that group's
+    // leaves and is split with them, where as a leaf of its own it would be a
+    // group apart. Its groups are collected the same way, take the indices after
+    // the ordinary ones, and are only ever read whole.
     std::vector< MBACandidate > SumGroupSliceMbaCandidates(
         const MBACandidate &cand, uint32_t min_ast_size, uint32_t max_vars,
         uint64_t options_tag, const SumGroupExtensionFn &is_extension,

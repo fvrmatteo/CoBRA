@@ -1246,6 +1246,43 @@ namespace cobra {
             );
         }
 
+        // `expr`, a right shift by a constant `k` read on the bits `mask`, as its
+        // operand read on the bits `mask << k` and shifted back
+        // (`Options::read_shifted_operand`). The operand agrees with the answer
+        // on the bits the shift brings down to `mask`, so the shifted answer
+        // agrees with `expr` there; it is checked on `mask` at full width like
+        // every demanded-mask answer.
+        std::optional< SimplifyOutcome > SolveShiftedOperand(
+            const std::vector< std::string > &vars, const Expr &expr, uint64_t mask,
+            const Options &opts
+        ) {
+            const uint32_t bitwidth = opts.bitwidth;
+            if (!opts.read_shifted_operand || expr.kind != Expr::Kind::kShr || expr.children.size() != 1
+                || expr.constant_val == 0 || expr.constant_val >= bitwidth)
+            {
+                return std::nullopt;
+            }
+            const uint64_t operand_mask = (mask << expr.constant_val) & Bitmask(bitwidth);
+            if (operand_mask == 0) { return std::nullopt; }
+            const Expr &operand = *expr.children[0];
+            Options inner       = opts;
+            inner.demanded_mask = operand_mask;
+            inner.evaluator     = Evaluator{};
+            auto sig            = EvaluateBooleanSignature(
+                operand, static_cast< uint32_t >(vars.size()), bitwidth
+            );
+            auto result = Simplify(sig, vars, &operand, inner);
+            if (!result.has_value() || result->kind != SimplifyOutcome::Kind::kSimplified
+                || result->expr == nullptr)
+            {
+                return std::nullopt;
+            }
+            auto shifted = Expr::LogicalShr(std::move(result->expr), expr.constant_val);
+            return VerifiedOnMask(
+                vars, expr, std::move(shifted), std::move(result->real_vars), mask, bitwidth
+            );
+        }
+
     } // namespace
 
     namespace {
@@ -1349,7 +1386,17 @@ namespace cobra {
     ) {
         std::optional< ProbeConstantsScope > probes;
         if (input_expr != nullptr) { probes.emplace(*input_expr); }
-        auto result = SimplifyUnchecked(sig, vars, input_expr, opts);
+        // The search is given the expression with its low-bit masks read in
+        // (`NormalizeLowBitMasks`): the same function, in which a value computed
+        // narrow and widened is the atom it truncates. Everything the answer is
+        // held against below stays the input as given.
+        std::unique_ptr< Expr > normalized;
+        if (input_expr != nullptr) {
+            bool changed = false;
+            normalized   = NormalizeLowBitMasks(*input_expr, opts.bitwidth, changed);
+            if (!changed) { normalized.reset(); }
+        }
+        auto result = SimplifyUnchecked(sig, vars, normalized ? normalized.get() : input_expr, opts);
         if (!result.has_value() || result.value().kind != SimplifyOutcome::Kind::kSimplified
             || result.value().expr == nullptr)
         {
@@ -1430,6 +1477,9 @@ namespace cobra {
                 if (auto masked = SolveUnderDemandedMask(vars, *input_expr, demanded, opts)) {
                     return Ok< SimplifyOutcome >(std::move(*masked));
                 }
+                if (auto peeled = SolveShiftedOperand(vars, *input_expr, demanded, opts)) {
+                    return Ok< SimplifyOutcome >(std::move(*peeled));
+                }
             }
         }
 
@@ -1491,7 +1541,11 @@ namespace cobra {
                 inner_opts.demanded_mask = UINT64_MAX;
                 inner_opts.evaluator     = Evaluator{};
                 const uint64_t kKept     = Bitmask(mask->effective_width);
-                if (auto solved = SolveUnderDemandedMask(vars, *mask->inner, kKept, inner_opts)) {
+                auto solved              = SolveUnderDemandedMask(vars, *mask->inner, kKept, inner_opts);
+                if (!solved) {
+                    solved = SolveShiftedOperand(vars, *mask->inner, kKept, inner_opts);
+                }
+                if (solved) {
                     auto wrapped = Expr::BitwiseAnd(std::move(solved->expr), Expr::Constant(kKept));
                     auto eval    = Evaluator::FromExpr(*input_expr, opts.bitwidth);
                     auto check   = internal::VerifyInOriginalSpace(

@@ -11,6 +11,8 @@
 #include "cobra/core/ExprCost.h"
 #include "cobra/core/ExprTraversal.h"
 #include "cobra/core/RingProof.h"
+#include "cobra/core/SubtermReading.h"
+#include "cobra/core/AffineReading.h"
 #include "cobra/core/ExprUtils.h"
 #include "cobra/core/SignatureChecker.h"
 #include "cobra/core/SignatureEval.h"
@@ -123,6 +125,11 @@ namespace cobra {
             // only on the solver's own proof that it equals the tree - see
             // `VerifyCandidate`.
             bool boolean_reading = false;
+            // Proposed by the probes of the affine reading
+            // (`CobraPassOptions::affine_reading`) and not by a search: a proof
+            // that turns it down hands the tree to the other readings
+            // (`VerifyCandidateOrOrdinary`).
+            bool affine_reading = false;
         };
 
         // Which bits of a value its readers look at, as LLVM's demanded-bits
@@ -192,6 +199,27 @@ namespace cobra {
             void Invalidate() {
                 analysis_.reset();
                 local_.Invalidate();
+            }
+
+            // The bits of its operand `use` demands: what the user reads of the
+            // value, which another reader of the same value may read more of.
+            uint64_t MaskOfUse(llvm::Use &use) {
+                auto *type = llvm::dyn_cast< llvm::IntegerType >(use.get()->getType());
+                if (type == nullptr || type->getBitWidth() > 64 || !llvm::isa< llvm::Instruction >(use.getUser())) {
+                    return UINT64_MAX;
+                }
+                // A reader with no integer value of its own - a store, a call, a
+                // branch - reads every bit; the analysis answers only for the
+                // others.
+                const auto *user = llvm::cast< llvm::Instruction >(use.getUser());
+                if (!user->getType()->isIntegerTy() || user->getType()->getIntegerBitWidth() > 64) {
+                    return Bitmask(type->getBitWidth());
+                }
+                if (!analysis_.has_value()) {
+                    analysis_.emplace(f_, assumptions_, dominators_);
+                    ++stats_.demanded_builds;
+                }
+                return analysis_->getDemandedBits(&use).getZExtValue() & Bitmask(type->getBitWidth());
             }
 
             // The function's dominator tree. The pass never changes the control
@@ -577,6 +605,10 @@ namespace cobra {
             into.free_leaf_found += run.free_leaf_found;
             into.keyed_leaf_trees += run.keyed_leaf_trees;
             into.keyed_leaf_found += run.keyed_leaf_found;
+            into.subterm_trees += run.subterm_trees;
+            into.subterm_found += run.subterm_found;
+            into.affine_trees += run.affine_trees;
+            into.affine_found += run.affine_found;
             into.enumeration_nanoseconds += run.enumeration_nanoseconds;
             into.ring_attempted += run.ring_attempted;
             into.ring_proved += run.ring_proved;
@@ -1071,9 +1103,15 @@ namespace cobra {
             key += options.boolean_variables ? "|b" : "|";
             key += options.read_conditions ? "c" : "";
             key += options.cut_wide_roots ? "w" : "";
+            key += options.subterm_reading ? "t" : "";
+            key += options.affine_reading ? "a" : "";
+            key += options.read_narrow_roots_wide ? "n" : "";
+            key += options.two_valued_selects ? "s" : "";
+            key += options.unblock_shared_values ? "u" : "";
             // The boolean cut is searched by the boolean reading alone, so its
             // verdict is not the one an identical tree read the ordinary way has.
             key += cand.node_limit == kBooleanCutLimit ? "B" : "";
+            key += cand.comparison_free_only ? "F" : "";
             key += ':';
             key += std::to_string(StableHash(options.z3_settings.llvm_passes));
             key += '|';
@@ -1357,12 +1395,17 @@ namespace cobra {
             tag = mix(tag, options.boolean_variables ? 1 : 0);
             tag = mix(tag, options.read_conditions ? 1 : 0);
             tag = mix(tag, options.cut_wide_roots ? 1 : 0);
+            tag = mix(tag, options.subterm_reading ? 1 : 0);
+            tag = mix(tag, options.affine_reading ? 1 : 0);
+            tag = mix(tag, options.read_narrow_roots_wide ? 1 : 0);
+            tag = mix(tag, options.two_valued_selects ? 1 : 0);
+            tag = mix(tag, options.unblock_shared_values ? 1 : 0);
             // What the records mean changes with the pass itself as well as
             // with its settings: a host that keeps `!cobra.mba` on IR it saves
             // and loads again must not read a verdict an older build wrote
             // under another fingerprint or another set of techniques. Bumped
             // whenever either changes.
-            constexpr uint64_t kRecordVersion = 4;
+            constexpr uint64_t kRecordVersion = 5;
             tag = mix(tag, kRecordVersion);
             return tag;
         }
@@ -1893,7 +1936,8 @@ namespace cobra {
                           .spot_check       = true,
                           .enabled_families = options.enabled_families,
                           .evaluator        = Evaluator::FromExpr(*abstracted, bw),
-                          .demanded_mask    = cand.demanded_mask };
+                          .demanded_mask    = cand.demanded_mask,
+                          .read_shifted_operand = options.unblock_shared_values };
             const auto sig = EvaluateBooleanSignature(*abstracted, variables, bw);
             // A tree that reads nothing but conditions is its table of values;
             // one that reads words as well goes to the search.
@@ -1980,7 +2024,8 @@ namespace cobra {
                           .spot_check       = true,
                           .enabled_families = options.enabled_families,
                           .evaluator        = cand.evaluator,
-                          .demanded_mask    = cand.demanded_mask };
+                          .demanded_mask    = cand.demanded_mask,
+                          .read_shifted_operand = options.unblock_shared_values };
 
             // Pass AST when available — unlocks semilinear,
             // MixedRewrite, and decomposition pipelines.
@@ -2256,7 +2301,8 @@ namespace cobra {
                           .spot_check       = true,
                           .enabled_families = options.enabled_families,
                           .evaluator        = Evaluator::FromExpr(*read, bw),
-                          .demanded_mask    = cand.demanded_mask };
+                          .demanded_mask    = cand.demanded_mask,
+                          .read_shifted_operand = options.unblock_shared_values };
             const auto sig = EvaluateBooleanSignature(*read, variables, bw);
             auto result    = Simplify(sig, cand.var_names, read.get(), opts);
             if (!result.has_value() || result.value().kind != SimplifyOutcome::Kind::kSimplified) {
@@ -2546,6 +2592,81 @@ namespace cobra {
             return nullptr;
         }
 
+        // The tree as a bitwise function of one or two of its own subterms
+        // (`CobraPassOptions::subterm_reading`, `ReadAsBitwiseOfSubterms`), when
+        // that is cheaper than the tree. Unproved: `VerifyCandidate` proves it.
+        OutcomeCache::Entry ProposeSubtermRewrite(const MBACandidate &cand, CobraStatistics &stats) {
+            if (cand.expr == nullptr) {
+                return nullptr;
+            }
+            ++stats.subterm_trees;
+            Options opts{ .bitwidth = cand.bitwidth, .max_vars = 2, .spot_check = true };
+            auto answer = ReadAsBitwiseOfSubterms(
+                *cand.expr, static_cast< uint32_t >(cand.var_names.size()), cand.bitwidth, opts
+            );
+            if (answer == nullptr) {
+                RejectReason() = "subterm reading: no subterm whose bits decide the root's";
+                return nullptr;
+            }
+            if (!IsBetter(ComputeCost(*answer).cost, ComputeCost(*cand.expr).cost)) {
+                RejectReason() = "subterm reading: not cheaper: " + RenderSSA(*answer, cand.var_names);
+                return nullptr;
+            }
+            ++stats.subterm_found;
+            return std::make_shared< const CandidateOutcome >(CandidateOutcome{
+                .expr               = std::move(answer),
+                .real_vars          = {},
+                .real_var_positions = {},
+                .accepted_unknown   = false,
+                .verified           = false });
+        }
+
+        // Whether the affine reading has a cheaper answer for the group of a
+        // root's sum `group` (`SumGroupSliceMbaCandidates`).
+        bool AffineGroup(const MBACandidate &group) {
+            if (group.expr == nullptr || group.var_names.size() != group.leaf_widths.size()) {
+                return false;
+            }
+            std::vector< std::unique_ptr< Expr > > leaves;
+            for (uint32_t index = 0; index < group.var_names.size(); ++index) {
+                leaves.push_back(LeafExpr(group, index));
+            }
+            const auto answer = ReadAsAffineOfLeaves(*group.expr, leaves, group.bitwidth, group.demanded_mask);
+            return answer != nullptr && IsBetter(ComputeCost(*answer).cost, ComputeCost(*group.expr).cost);
+        }
+
+        // The tree as an affine function of its leaves xored with a constant
+        // (`CobraPassOptions::affine_reading`, `ReadAsAffineOfLeaves`), when that
+        // is cheaper than the tree. Unproved: `VerifyCandidate` proves it.
+        OutcomeCache::Entry ProposeAffineRewrite(const MBACandidate &cand, CobraStatistics &stats) {
+            if (cand.expr == nullptr || cand.var_names.size() != cand.leaf_widths.size()) {
+                return nullptr;
+            }
+            ++stats.affine_trees;
+            std::vector< std::unique_ptr< Expr > > leaves;
+            leaves.reserve(cand.var_names.size());
+            for (uint32_t index = 0; index < cand.var_names.size(); ++index) {
+                leaves.push_back(LeafExpr(cand, index));
+            }
+            auto answer = ReadAsAffineOfLeaves(*cand.expr, leaves, cand.bitwidth, cand.demanded_mask);
+            if (answer == nullptr) {
+                RejectReason() = "affine reading: no affine function of the leaves";
+                return nullptr;
+            }
+            if (!IsBetter(ComputeCost(*answer).cost, ComputeCost(*cand.expr).cost)) {
+                RejectReason() = "affine reading: not cheaper: " + RenderSSA(*answer, cand.var_names);
+                return nullptr;
+            }
+            ++stats.affine_found;
+            return std::make_shared< const CandidateOutcome >(CandidateOutcome{
+                .expr               = std::move(answer),
+                .real_vars          = {},
+                .real_var_positions = {},
+                .accepted_unknown   = false,
+                .verified           = false,
+                .affine_reading     = true });
+        }
+
         // `ProposeRewriteAsRead`, and where it finds nothing at all, the tree with
         // its masked leaves free (`ProposeFreeLeafRewrite`) and over the keyed
         // values of its leaves (`ProposeKeyedLeafRewrite`). A rewrite found but
@@ -2556,30 +2677,87 @@ namespace cobra {
             CobraStatistics &stats
         ) {
             RestedOnUnknown() = false;
-            auto outcome = ProposeRewriteAsRead(cand, options, verdict, stats);
-            if (outcome != nullptr || verdict != SolveVerdict::kUnsolved
-                || cand.node_limit == kBooleanCutLimit)
-            {
-                return outcome;
+            const bool cut = cand.node_limit == kBooleanCutLimit;
+            // A rewrite of a cut taken for a `select` on a narrow comparison is
+            // taken only when it compares nothing (`comparison_free_only`).
+            const auto compares_nothing = [&](OutcomeCache::Entry entry) -> OutcomeCache::Entry {
+                if (!cand.comparison_free_only || entry == nullptr || entry->expr == nullptr
+                    || !ContainsComparison(*entry->expr))
+                {
+                    return entry;
+                }
+                RejectReason() = "the rewrite of a narrow comparison's cut compares";
+                return nullptr;
+            };
+            // The affine reading is a probe of the leaves, cheap next to any
+            // search. What it finds stands beside what the search finds, and the
+            // cheaper of the two is the rewrite; where the search finds nothing,
+            // it is the rewrite, and the readings after the search are not asked.
+            const OutcomeCache::Entry affine =
+                options.affine_reading ? ProposeAffineRewrite(cand, stats) : nullptr;
+            // On a tie the sum: `lo + 1` and not `-(~lo)`, the form the rest of
+            // LLVM reads and folds further.
+            const auto or_affine = [&](OutcomeCache::Entry found) -> OutcomeCache::Entry {
+                if (affine == nullptr
+                    || (found != nullptr
+                        && IsBetter(ComputeCost(*found->expr).cost, ComputeCost(*affine->expr).cost)))
+                {
+                    return found;
+                }
+                verdict = SolveVerdict::kSolved;
+                return affine;
+            };
+            auto outcome = compares_nothing(ProposeRewriteAsRead(cand, options, verdict, stats));
+            if (outcome != nullptr) {
+                return or_affine(outcome);
             }
+            if (cand.comparison_free_only) {
+                verdict = SolveVerdict::kUnsolved;
+            }
+            if (affine != nullptr || verdict != SolveVerdict::kUnsolved || (cut && !cand.comparison_free_only)) {
+                return or_affine(outcome);
+            }
+            // The cut taken for a `select` on a narrow comparison was read with its
+            // conditions as variables only, and its tree holds the comparison
+            // exactly - held zero-extended, as a comparison at the tree width is.
+            // So the readings every other candidate is given read it as they read
+            // that one: a carry picked by `x == 0` on the narrow `x` and added into
+            // halvings of `zext x` is `zext x` once the comparison is read with the
+            // value it compares.
             const std::string reason = RejectReason();
             const auto append = [&] {
                 RejectReason() = reason
                     + (RejectReason().empty() || RejectReason() == reason ? "" : "; " + RejectReason());
             };
-            if (auto freed = ProposeFreeLeafRewrite(cand, options, stats)) {
+            if (cut && cand.comparison_free_only) {
+                if (auto ordinary = compares_nothing(ProposeOrdinaryRewrite(cand, options, verdict, stats))) {
+                    return ordinary;
+                }
+                verdict = SolveVerdict::kUnsolved;
+                append();
+            }
+            if (auto freed = compares_nothing(ProposeFreeLeafRewrite(cand, options, stats))) {
                 verdict = SolveVerdict::kSolved;
                 return freed;
             }
             append();
             const std::string so_far = RejectReason();
-            if (auto keyed = ProposeKeyedLeafRewrite(cand, options, stats)) {
+            if (auto keyed = compares_nothing(ProposeKeyedLeafRewrite(cand, options, stats))) {
                 verdict = SolveVerdict::kSolved;
                 return keyed;
             }
             RejectReason() = so_far
                 + (RejectReason().empty() || RejectReason() == so_far ? ""
                                                                       : "; " + RejectReason());
+            if (options.subterm_reading) {
+                const std::string before = RejectReason();
+                if (auto subterms = compares_nothing(ProposeSubtermRewrite(cand, stats))) {
+                    verdict = SolveVerdict::kSolved;
+                    return subterms;
+                }
+                RejectReason() = before
+                    + (RejectReason().empty() || RejectReason() == before ? "" : "; " + RejectReason());
+            }
             return nullptr;
         }
 
@@ -2859,6 +3037,46 @@ namespace cobra {
         // How many times `z3_settings.timeout_ms` the proof of `cand` is given: one per
         // `kNodesPerBudget` instructions of its IR tree, at least one and at most
         // `max_budget_scale`. See `VerifyCandidate` for why the budget grows with the tree.
+        // Whether `cand` reads its root wider than the root's type
+        // (`read_narrow_roots_wide`).
+        bool ReadWiderThanItsRoot(const MBACandidate &cand) {
+            const auto *type = cand.root != nullptr ? cand.root->getType() : nullptr;
+            return type != nullptr && type->isIntegerTy() && !type->isIntegerTy(1)
+                && cand.slice_extension == SliceExtension::kNone
+                && cand.bitwidth > type->getIntegerBitWidth();
+        }
+
+        // Whether a rewrite of `cand` is measured against a whole tree, shared
+        // values and all, rather than against what it removes
+        // (`MbaCostModel::kDyingInstructions`, the host's choice).
+        bool PricedByTree(const MBACandidate &cand, const CobraPassOptions &options) {
+            (void) cand;
+            return options.cost_model == MbaCostModel::kTreeInstructions;
+        }
+
+        // The instructions a rewrite of `cand` has to come in under: the tree the
+        // root reads, as if nothing else read it - at the root's own width for a
+        // root read wider than its type (`own_width_tree_size`) - or what the
+        // rewrite removes under `MbaCostModel::kDyingInstructions`.
+        uint32_t Budget(const MBACandidate &cand, const CobraPassOptions &options) {
+            if (!PricedByTree(cand, options)) {
+                return cand.dying_count;
+            }
+            return ReadWiderThanItsRoot(cand) && cand.own_width_tree_size != 0 ? cand.own_width_tree_size
+                                                                               : cand.tree_size;
+        }
+
+        // Whether `expr` reads only the low bits of what it reads below any bit
+        // it computes: sums, products and bitwise operations, no right shift and
+        // no comparison. Its low `n` bits are then the same expression computed
+        // at `n` bits over the low `n` bits of its leaves.
+        bool ReadsLowBitsOnly(const Expr &expr) {
+            if (expr.kind == Expr::Kind::kShr || IsComparison(expr.kind)) {
+                return false;
+            }
+            return llvm::all_of(expr.children, [](const auto &child) { return ReadsLowBitsOnly(*child); });
+        }
+
         uint32_t ProofBudgetScale(uint32_t tree_size, const CobraPassOptions &options) {
             constexpr uint32_t kNodesPerBudget = 8;
             return std::min(std::max(1U, options.max_budget_scale), std::max(1U, tree_size / kNodesPerBudget));
@@ -3132,7 +3350,8 @@ namespace cobra {
                 .real_var_positions = proposal.real_var_positions,
                 .accepted_unknown   = accepted_unknown,
                 .verified           = true,
-                .boolean_reading    = proposal.boolean_reading });
+                .boolean_reading    = proposal.boolean_reading,
+                .affine_reading     = proposal.affine_reading });
         }
 
         // `VerifyCandidate`, and when the rewrite it was asked about came from the
@@ -3159,6 +3378,19 @@ namespace cobra {
             const CobraPassOptions &options, CobraStatistics &stats, bool *unknown = nullptr
         ) {
             auto verified = VerifyCandidate(cand, proposal, options, stats, unknown);
+            // An affine reading the proof turned down was the probes' guess: the
+            // tree goes to the readings it was read ahead of, and what they
+            // propose is proved in its place.
+            if (verified == nullptr && proposal.affine_reading && !(unknown != nullptr && *unknown)) {
+                CobraPassOptions without = options;
+                without.affine_reading   = false;
+                auto verdict             = SolveVerdict::kUnsolved;
+                auto other               = ProposeRewrite(cand, without, verdict, stats);
+                if (other == nullptr) {
+                    return nullptr;
+                }
+                return other->verified ? other : VerifyCandidateOrOrdinary(cand, *other, without, stats, unknown);
+            }
             if (verified != nullptr || !proposal.boolean_reading || cand.node_limit == kBooleanCutLimit) {
                 return verified;
             }
@@ -3552,6 +3784,7 @@ namespace cobra {
                 task->input.leaf_bits     = cand.leaf_bits;
                 task->input.leaf_widths   = cand.leaf_widths;
                 task->input.holds_comparison = cand.holds_comparison;
+                task->input.comparison_free_only = cand.comparison_free_only;
                 // The proof's budget is scaled by it (`ProofBudgetScale`). Without it a
                 // worker proved every rewrite at the unscaled budget, ran out of time on
                 // the larger trees, and left the loop to ask the same question again at
@@ -3814,9 +4047,9 @@ namespace cobra {
             int64_t multiplier  = 0;
         };
 
-        std::optional< ConstantProduct > ConstantProductOf(llvm::Value *v) {
+        std::optional< ConstantProduct > ConstantProductOf(llvm::Value *v, bool shared = false) {
             auto *inst = llvm::dyn_cast< llvm::BinaryOperator >(v);
-            if (inst == nullptr || !inst->hasOneUse() || !inst->getType()->isIntegerTy()
+            if (inst == nullptr || (!shared && !inst->hasOneUse()) || !inst->getType()->isIntegerTy()
                 || inst->getType()->getIntegerBitWidth() > 64)
             {
                 return std::nullopt;
@@ -3832,7 +4065,7 @@ namespace cobra {
             if (inst->getOpcode() == llvm::Instruction::Sub) {
                 const auto *zero = llvm::dyn_cast< llvm::ConstantInt >(inst->getOperand(0));
                 if (zero != nullptr && zero->isZero()) {
-                    if (auto inner = ConstantProductOf(inst->getOperand(1));
+                    if (auto inner = ConstantProductOf(inst->getOperand(1), shared);
                         inner && inner->multiplier != std::numeric_limits< int64_t >::min())
                     {
                         return ConstantProduct{ inner->factor, -inner->multiplier };
@@ -3891,7 +4124,12 @@ namespace cobra {
         // twice, and only for a factor the multipliers share as integers, with
         // small quotients: the rewrite trades two products by large constants for
         // one. No flag survives it.
-        bool HoistConstantFactors(llvm::Function &f) {
+        //
+        // `shared` (`unblock_shared_values`): also where a product has other
+        // readers. They keep it, and the sum reads the factor taken out all the
+        // same: the tree it roots is the one that has to be proved, and the
+        // products another reader holds make it no easier.
+        bool HoistConstantFactors(llvm::Function &f, bool shared) {
             bool changed = false;
             for (unsigned round = 0; round < 4; ++round) {
                 bool moved = false;
@@ -3912,8 +4150,8 @@ namespace cobra {
                         if (left == right) {
                             continue;
                         }
-                        const auto a = ConstantProductOf(left);
-                        const auto b = ConstantProductOf(right);
+                        const auto a = ConstantProductOf(left, shared);
+                        const auto b = ConstantProductOf(right, shared);
                         if (!a || !b) {
                             continue;
                         }
@@ -3959,7 +4197,11 @@ namespace cobra {
         // Only over an extension that dominates the one rewritten, so nothing is
         // computed that was not; the rewrite trades an extension for the bitwise
         // operation it had under it.
-        bool WidenExtendedBitwise(llvm::Function &f) {
+        //
+        // `shared` (`unblock_shared_values`): also where the bitwise operation
+        // has other readers. It stays for them, and the extension is still traded
+        // for the operation over the one the function holds - no instruction more.
+        bool WidenExtendedBitwise(llvm::Function &f, bool shared) {
             bool changed = false;
             llvm::DominatorTree dominators(f);
             for (auto &block : f) {
@@ -3972,7 +4214,7 @@ namespace cobra {
                         continue;
                     }
                     auto *op = llvm::dyn_cast< llvm::BinaryOperator >(ext->getOperand(0));
-                    if (op == nullptr || !op->hasOneUse()
+                    if (op == nullptr || (!shared && !op->hasOneUse())
                         || (op->getOpcode() != llvm::Instruction::Xor
                             && op->getOpcode() != llvm::Instruction::And
                             && op->getOpcode() != llvm::Instruction::Or))
@@ -4202,6 +4444,18 @@ namespace cobra {
                 return result;
             }
 
+            // The instructions read as something else: what the arm, as the
+            // `select` reads it, no longer needs once it reads the new value.
+            void Rewritten(llvm::SmallPtrSetImpl< const llvm::Instruction * > &into) const {
+                for (const auto &[value, read] : read_) {
+                    if (read != value) {
+                        if (const auto *inst = llvm::dyn_cast< llvm::Instruction >(value)) {
+                            into.insert(inst);
+                        }
+                    }
+                }
+            }
+
           private:
             // The sign of `value` where it is read, when that is known.
             std::optional< bool > KnownSign(const llvm::Value *value) const {
@@ -4420,8 +4674,10 @@ namespace cobra {
         // holds, so the `select` computes what it did; nothing undefined is taken
         // for the same value twice: the condition and the values whose signs it
         // fixes must never be `undef`. What is read replaces what was only when
-        // that does not add instructions.
-        bool ReadArmsUnderTheirCondition(llvm::Function &f) {
+        // that does not add instructions - with `shared`
+        // (`unblock_shared_values`), no more than the arms read as the `select`
+        // reads them, what other readers keep counted as if they did not.
+        bool ReadArmsUnderTheirCondition(llvm::Function &f, bool shared) {
             llvm::SmallVector< llvm::WeakVH, 32 > roots;
             for (auto &inst : llvm::instructions(f)) {
                 if (!inst.getType()->isIntegerTy() || inst.getType()->getIntegerBitWidth() == 1) {
@@ -4529,7 +4785,14 @@ namespace cobra {
                 }
                 CollectDead(old_true, dead);
                 CollectDead(old_false, dead);
-                if (built.size() > dead.size()) {
+                size_t at_stake = dead.size();
+                if (shared) {
+                    llvm::SmallPtrSet< const llvm::Instruction *, 16 > rewritten_insts;
+                    read_true.Rewritten(rewritten_insts);
+                    read_false.Rewritten(rewritten_insts);
+                    at_stake = std::max(at_stake, static_cast< size_t >(rewritten_insts.size()));
+                }
+                if (built.size() > at_stake) {
                     for (auto it = rewritten.rbegin(); it != rewritten.rend(); ++it) {
                         it->first->set(it->second);
                     }
@@ -5340,9 +5603,17 @@ namespace cobra {
                             }
                         }
                     }
+                    // With `unblock_shared_values`, against the tree as the comparison
+                    // reads it, what other readers keep counted as if it read it alone.
+                    size_t at_stake = dying.size();
+                    if (options.unblock_shared_values) {
+                        at_stake = static_cast< size_t >(llvm::count_if(reading->tree, [&](const llvm::Instruction *ti) {
+                            return ti != difference && ti != yielded;
+                        }));
+                    }
                     const auto masked = ReadMaskedEquality(*condition, points, bw, random);
                     if (masked.has_value() && masked->mask != 0
-                        && dying.size() > (masked->mask == mask ? 0U : 1U))
+                        && at_stake > (masked->mask == mask ? 0U : 1U))
                     {
                         auto test = Expr::CmpEq(
                             masked->mask == mask ? Expr::Variable(0)
@@ -5500,7 +5771,32 @@ namespace cobra {
                 }
                 const uint32_t bw   = select->getType()->getIntegerBitWidth();
                 const uint64_t mask = Bitmask(bw);
-                const uint64_t bits = demanded->getDemandedBits(select).getZExtValue() & mask;
+                uint64_t bits       = demanded->getDemandedBits(select).getZExtValue() & mask;
+                // With `unblock_shared_values`, a `select` some readers read whole
+                // is read again for the others: under the bits they demand, and
+                // replaced in their uses alone.
+                llvm::SmallVector< llvm::Use *, 8 > partial;
+                if (bits == mask && options.unblock_shared_values) {
+                    uint64_t narrow = 0;
+                    for (llvm::Use &use : select->uses()) {
+                        const auto *user = llvm::dyn_cast< llvm::Instruction >(use.getUser());
+                        if (user == nullptr || !user->getType()->isIntegerTy()
+                            || user->getType()->getIntegerBitWidth() > 64)
+                        {
+                            continue;
+                        }
+                        const uint64_t read = demanded->getDemandedBits(&use).getZExtValue() & mask;
+                        if (read != mask && read != 0) {
+                            narrow |= read;
+                            partial.push_back(&use);
+                        }
+                    }
+                    if (!partial.empty() && narrow != mask) {
+                        bits = narrow;
+                    } else {
+                        partial.clear();
+                    }
+                }
                 if (bits == mask || bits == 0) {
                     continue;
                 }
@@ -5651,8 +5947,14 @@ namespace cobra {
                                  << llvm::utohexstr(bits) << ", kept the " << (keep_true ? "true" : "false")
                                  << " arm)\n";
                 }
-                select->replaceAllUsesWith(keep);
-                select->eraseFromParent();
+                if (partial.empty()) {
+                    select->replaceAllUsesWith(keep);
+                    select->eraseFromParent();
+                } else {
+                    for (llvm::Use *use : partial) {
+                        use->set(keep);
+                    }
+                }
                 llvm::RecursivelyDeleteTriviallyDeadInstructions(other, nullptr, nullptr, [&](llvm::Value *gone) {
                     never_undef.erase(gone);
                 });
@@ -5686,11 +5988,13 @@ namespace cobra {
         };
 
         const uint64_t options_tag = OptionsTag(options_);
+        const NarrowRootsReadWide narrow_roots(options_.read_narrow_roots_wide);
+        const SharedValuesRead shared_values(options_.unblock_shared_values);
 
         // Before anything reads the function: the rewrite changes no block.
-        const bool armed   = ReadArmsUnderTheirCondition(f);
-        const bool widened = WidenExtendedBitwise(f);
-        const bool hoisted = HoistConstantFactors(f);
+        const bool armed   = ReadArmsUnderTheirCondition(f, options_.unblock_shared_values);
+        const bool widened = WidenExtendedBitwise(f, options_.unblock_shared_values);
+        const bool hoisted = HoistConstantFactors(f, options_.unblock_shared_values);
         if (armed || widened || hoisted) {
             changed = true;
             llvm::PreservedAnalyses kept;
@@ -5732,9 +6036,7 @@ namespace cobra {
         const auto queue_key = [&](const MBACandidate &queued) {
             keys.push_back(CandidateKey(queued, options_));
             if (speculation.Enabled() && queued.expr != nullptr && !cache.Find(keys.back()).has_value()) {
-                const uint32_t budget = options_.cost_model == MbaCostModel::kTreeInstructions
-                    ? queued.tree_size
-                    : queued.dying_count;
+                const uint32_t budget = Budget(queued, options_);
                 if (speculation.Submit(keys.back(), queued, options_, budget, run_id)) {
                     ++stats.background_submitted;
                 }
@@ -5780,6 +6082,9 @@ namespace cobra {
         // the roots queued again and not yet reached.
         llvm::DenseSet< const llvm::Value * > constant_values;
         llvm::DenseSet< const llvm::Instruction * > requeued_roots;
+        // `unblock_shared_values`: how often each root was read again this run
+        // because a value its tree shares was rewritten under it.
+        llvm::DenseMap< const llvm::Instruction *, unsigned > shared_rereads;
         // `root` collected afresh from the function as it now stands.
         const auto collect_again = [&](llvm::Instruction *root) -> std::optional< MBACandidate > {
             llvm::Instruction *roots[] = { root };
@@ -5905,10 +6210,20 @@ namespace cobra {
                         pass_by();
                         continue;
                     }
-                    const bool rereadable = propagated && cand.sum_residual.empty() && !cand.boundary_cut
-                        && (origins[index] == CandidateOrigin::kDetected
-                            || origins[index] == CandidateOrigin::kInnerRoot
-                            || origins[index] == CandidateOrigin::kRecollected);
+                    // With `unblock_shared_values`, any reading of a root whose tree a
+                    // rewrite of a value it shares changed is read again from the
+                    // function as it now stands, once or twice a run: the root gets the
+                    // simpler form now, not after another run.
+                    const bool shared_reread = options_.unblock_shared_values
+                        && !replaced_roots.contains(cand.root) && shared_rereads[cand.root] < 2;
+                    const bool rereadable = (propagated && cand.sum_residual.empty() && !cand.boundary_cut
+                                             && (origins[index] == CandidateOrigin::kDetected
+                                                 || origins[index] == CandidateOrigin::kInnerRoot
+                                                 || origins[index] == CandidateOrigin::kRecollected))
+                        || shared_reread;
+                    if (shared_reread) {
+                        ++shared_rereads[cand.root];
+                    }
                     auto fresh = rereadable ? collect_again(cand.root) : std::nullopt;
                     pass_by();
                     if (!fresh) {
@@ -5935,9 +6250,16 @@ namespace cobra {
             if (rewrites_this_run != 0 && cand.root->getType()->isIntegerTy()
                 && cand.root->getType()->getIntegerBitWidth() <= 64)
             {
+                // A reading for some readers answers to what those still demand.
+                uint64_t asked = 0;
+                if (!cand.reader_uses.empty()) {
+                    for (llvm::Use *use : cand.reader_uses) {
+                        asked |= use->get() == cand.root ? demanded_bits.MaskOfUse(*use) : 0;
+                    }
+                }
                 const uint64_t now = CandidateDemand(
-                    demanded_bits.MaskOf(cand.root), cand.bitwidth, cand.slice_extension,
-                    !cand.sum_residual.empty()
+                    cand.reader_uses.empty() ? demanded_bits.MaskOf(cand.root) : asked, cand.bitwidth,
+                    cand.slice_extension, !cand.sum_residual.empty()
                 );
                 if ((now & ~cand.demanded_mask) != 0) {
                     ++stats.demanded_grew;
@@ -6036,12 +6358,29 @@ namespace cobra {
                 // the same identity with a residual to add back.
                 const auto sum_begin = std::chrono::steady_clock::now();
                 std::vector< MBACandidate > groups;
-                if (slices.empty()) {
+                // And of the boolean cut's sum, with the affine reading: there a
+                // carry picked by a narrow comparison joins the group of the value
+                // it tests (`SumGroupSliceMbaCandidates`).
+                const bool boolean_groups = cand.node_limit == kBooleanCutLimit && options_.affine_reading;
+                if (slices.empty() && (cand.node_limit == 0 || boolean_groups)) {
                     ++stats.sum_group_roots;
                     groups = SumGroupSliceMbaCandidates(
                         cand, options_.min_ast_size, options_.max_vars, options_tag,
-                        [&](const MBACandidate &group) {
-                            return SliceToRead(group, options_, stats);
+                        [&](const MBACandidate &group) -> std::optional< std::pair< uint32_t, SliceExtension > > {
+                            if (!boolean_groups) {
+                                if (auto read = SliceToRead(group, options_, stats)) {
+                                    return read;
+                                }
+                            }
+                            // With the affine reading, a group that is an affine
+                            // function of its own leaves is read whole: a sum the
+                            // obfuscator wrote through halvings and a carry, added
+                            // to summands over other leaves that are no such
+                            // function, is one only on its own.
+                            if (options_.affine_reading && AffineGroup(group)) {
+                                return std::make_pair(group.bitwidth, SliceExtension::kNone);
+                            }
+                            return std::nullopt;
                         },
                         options_.cost_model, options_.max_tree_nodes, demanded
                     );
@@ -6058,11 +6397,23 @@ namespace cobra {
                 // sign computed from the values it compares.
                 std::vector< MBACandidate > boolean;
 #ifdef COBRA_HAS_Z3
-                if (options_.boolean_variables && options_.z3_verify && ReadsConditions(cand)) {
-                    boolean = BooleanCutMbaCandidate(
-                        cand, options_.min_ast_size, options_.max_vars, options_tag,
-                        options_.cost_model, options_.max_tree_nodes, demanded
-                    );
+                if (options_.boolean_variables && options_.z3_verify) {
+                    // Also for a `select` leaf on a narrow comparison: a carry the
+                    // obfuscator picks by comparing a narrow value and adds into
+                    // halvings of its extension is a free bit to every other
+                    // reading of the root. Its cut takes only a rewrite that
+                    // compares nothing (`comparison_free_only`).
+                    const bool reads   = ReadsConditions(cand);
+                    const bool selects = !reads && HoldsComparisonLeaf(cand);
+                    if (reads || selects) {
+                        boolean = BooleanCutMbaCandidate(
+                            cand, options_.min_ast_size, options_.max_vars, options_tag,
+                            options_.cost_model, options_.max_tree_nodes, demanded
+                        );
+                        for (auto &reading : boolean) {
+                            reading.comparison_free_only = selects;
+                        }
+                    }
                 }
 #endif
 
@@ -6088,6 +6439,50 @@ namespace cobra {
                     cand, options_.min_ast_size, options_.max_vars, options_tag,
                     options_.cost_model, options_.max_tree_nodes, demanded
                 );
+                // And, with `unblock_shared_values`, the root read under the bits
+                // each of its readers demands that demand less than all of them do
+                // (`ReaderMbaCandidates`): a value another reader reads whole is no
+                // reason for this one not to get its simpler form.
+                std::vector< MBACandidate > readers;
+                if (options_.unblock_shared_values && cand.node_limit == 0 && cand.reader_uses.empty()
+                    && cand.root->getType()->isIntegerTy() && cand.root->getType()->getIntegerBitWidth() <= 64
+                    && !cand.root->hasOneUse())
+                {
+                    const uint64_t whole = demanded_bits.MaskOf(cand.root);
+                    std::vector< std::pair< uint64_t, std::vector< llvm::Use * > > > masks;
+                    for (llvm::Use &use : cand.root->uses()) {
+                        const uint64_t mask = demanded_bits.MaskOfUse(use) & whole;
+                        if (mask == 0 || mask == whole) {
+                            continue;
+                        }
+                        auto found = llvm::find_if(masks, [&](const auto &entry) { return entry.first == mask; });
+                        if (found == masks.end()) {
+                            masks.push_back({ mask, { &use } });
+                        } else {
+                            found->second.push_back(&use);
+                        }
+                    }
+                    // A use demanding a subset of another mask's bits is served by
+                    // that reading too.
+                    for (auto &[mask, uses] : masks) {
+                        for (llvm::Use &use : cand.root->uses()) {
+                            const uint64_t other = demanded_bits.MaskOfUse(use) & whole;
+                            if (other != 0 && other != mask && (other & ~mask) == 0
+                                && !llvm::is_contained(uses, &use))
+                            {
+                                uses.push_back(&use);
+                            }
+                        }
+                    }
+                    readers = ReaderMbaCandidates(
+                        cand, masks, options_.min_ast_size, options_.max_vars, options_tag,
+                        options_.cost_model, options_.max_tree_nodes, demanded
+                    );
+                    if (DetectDebug()) {
+                        llvm::errs() << "cobra: readers of" << *cand.root << ": " << masks.size() << " mask(s), "
+                                     << readers.size() << " reading(s)\n";
+                    }
+                }
                 // And the one that holds a leaf's own shift whole
                 // (`ShiftedLeafCutMbaCandidate`): a mixing step reads a value
                 // and that value shifted, which is two variables and not one.
@@ -6179,6 +6574,17 @@ namespace cobra {
                     }
                 }
                 for (auto &cut : shifted) {
+                    if (attempted.insert({ cut.root, cut.node_limit }).second) {
+                        queue_key(cut);
+                        candidates.push_back(std::move(cut));
+                        origins.push_back(CandidateOrigin::kBoundaryCut);
+                        if (options_.retry_undecided_roots) {
+                            deferred.Queue(candidates.size() - 1, index);
+                        }
+                        ++stats.requeued;
+                    }
+                }
+                for (auto &cut : readers) {
                     if (attempted.insert({ cut.root, cut.node_limit }).second) {
                         queue_key(cut);
                         candidates.push_back(std::move(cut));
@@ -6620,59 +7026,15 @@ namespace cobra {
                 reuse.poisons_root = &poisons_root;
             }
 
-            auto *new_val = ReconstructIr(
-                *outcome->expr, cand, builder, var_map, freeze_leaves ? &leaf_supply : nullptr,
-                &reuse, outcome->boolean_reading
-            );
-
-            // A slice was searched and proved on the low bits of its root, so
-            // what replaces the root is the extension the claim named
-            // (`SliceToRead`): the rewrite of the bits read, widened back to
-            // the root's type. Built here, before the emitted instructions are
-            // gathered, so the cast is priced with the rest of the rewrite -
-            // and it is the one instruction the whole reading costs, against a
-            // tree the other width could not fold at all.
-            if (new_val != nullptr && cand.slice_extension != SliceExtension::kNone) {
-                new_val = builder.CreateCast(
-                    cand.slice_extension == SliceExtension::kZero ? llvm::Instruction::ZExt
-                                                                  : llvm::Instruction::SExt,
-                    new_val, cand.root->getType(), "cobra.slice"
-                );
-            }
-
-            // And the summands the candidate left out of the root's sum
-            // (`SumGroupSliceMbaCandidates`): the group is what the search
-            // answered, the residual is the rest of the root's value, and the
-            // root is the two added. The summands are read from the IR that
-            // already computes them - they are operands of the sum chain, so
-            // they dominate the root - and no flag is carried over: the sum is
-            // re-associated, so the intermediate values are not the ones the
-            // old chain's `nsw` and `nuw` were asserted of. Built here, before
-            // the emitted instructions are gathered, so every one of them is
-            // priced with the rest of the rewrite.
-            if (new_val != nullptr) {
-                for (const auto &[term, negated] : cand.sum_residual) {
-                    new_val = negated ? builder.CreateSub(new_val, term, "cobra.sum")
-                                      : builder.CreateAdd(new_val, term, "cobra.sum");
-                }
-            }
-
-            llvm::SmallVector< llvm::Instruction *, 16 > emitted;
-            for (auto it = kAtFront ? block->begin() : std::next(kMark); &*it != cand.root;
-                 ++it)
-            {
-                emitted.push_back(&*it);
-            }
-
             // CoBRA measures its own output against the candidate's Expr, which
             // has already lost the sharing the IR had. Held to that yardstick a
             // single add reading two values computed elsewhere looks like the
             // whole cone beneath it, and expanding it into a polynomial reads as
             // progress. Pricing it in instructions is what the rewrite is really
             // worth; which instructions count is the caller's call.
-            const uint32_t budget = options_.cost_model == MbaCostModel::kTreeInstructions
-                ? cand.tree_size
-                : cand.dying_count;
+            const bool by_tree    = PricedByTree(cand, options_);
+            const uint32_t budget = Budget(cand, options_);
+            llvm::SmallVector< llvm::Instruction *, 16 > emitted;
             const auto discard_rewrite = [&] {
                 for (auto *dead : llvm::reverse(emitted)) {
                     if (dead->use_empty()) {
@@ -6680,29 +7042,134 @@ namespace cobra {
                     }
                 }
             };
+            const LeafSupply leaves_as_given = leaf_supply;
+            llvm::Value *new_val = nullptr;
+            size_t charged       = 0;
+            size_t cost          = 0;
+            // With `two_valued_selects` the rewrite is built with its two-valued
+            // terms as `select`s first, and where that is over the budget - the
+            // arithmetic was there to read, and the `select` is not - built again
+            // as the expression spells it.
+            for (unsigned attempt = 0; attempt < 2; ++attempt) {
+                const bool two_valued = options_.two_valued_selects && attempt == 0;
+                if (attempt != 0) {
+                    discard_rewrite();
+                    emitted.clear();
+                    reuse.reused.clear();
+                    reuse.created.clear();
+                    reuse.seen.clear();
+                    reuse.found = 0;
+                    leaf_supply = leaves_as_given;
+                }
+                // A root read wider than its type, rewritten into what computes
+                // its low bits from the low bits of its leaves, is built at its own
+                // width: `lo + 1` and not `trunc (zext lo + 1)`.
+                const uint32_t own_width = cand.root->getType()->isIntegerTy()
+                    ? cand.root->getType()->getIntegerBitWidth()
+                    : 0;
+                const bool narrow = ReadWiderThanItsRoot(cand) && ReadsLowBitsOnly(*outcome->expr);
+                new_val = ReconstructIr(
+                    *outcome->expr, cand, builder, var_map, freeze_leaves ? &leaf_supply : nullptr,
+                    &reuse, outcome->boolean_reading, two_valued, narrow ? own_width : 0
+                );
 
-            // An instruction the rewrite reads is priced like one it builds
-            // wherever the cost model would have counted it gone. Measured on
-            // the whole expression that is every one of them: the expression
-            // after the rewrite is what it built and what it read, whoever
-            // computed the latter first. Measured on what the rewrite removes,
-            // it is the ones that were going to disappear - with this root, or
-            // with one an earlier rewrite replaced - and now stay; one the rest
-            // of the function keeps alive regardless costs nothing to read.
-            size_t charged = 0;
-            if (options_.cost_model == MbaCostModel::kTreeInstructions) {
-                charged = reuse.reused.size();
-            } else if (!reuse.reused.empty()) {
-                const llvm::SmallPtrSet< const llvm::Instruction *, 32 > dying(
-                    cand.dying.begin(), cand.dying.end()
-                );
-                charged = static_cast< size_t >(
-                    llvm::count_if(reuse.reused, [&](const llvm::Instruction *read) {
-                        return dying.contains(read) || retired.contains(read);
-                    })
-                );
+                // A root read wider than its type (`read_narrow_roots_wide`) was proved
+                // on its own bits, held zero-extended at the width of what it reads:
+                // what replaces it is the rewrite truncated back. An extension of a
+                // value no wider than the root is the extension of that value, which
+                // costs nothing more. Built here, so it is priced with the rest.
+                if (new_val != nullptr && cand.slice_extension == SliceExtension::kNone
+                    && !cand.root->getType()->isIntegerTy(1) && cand.root->getType()->isIntegerTy()
+                    && new_val->getType()->isIntegerTy()
+                    && new_val->getType()->getIntegerBitWidth() > cand.root->getType()->getIntegerBitWidth())
+                {
+                    auto *root_type = cand.root->getType();
+                    auto *cast      = llvm::dyn_cast< llvm::CastInst >(new_val);
+                    if (cast != nullptr
+                        && (cast->getOpcode() == llvm::Instruction::ZExt
+                            || cast->getOpcode() == llvm::Instruction::SExt)
+                        && cast->getOperand(0)->getType()->getIntegerBitWidth()
+                            <= root_type->getIntegerBitWidth())
+                    {
+                        auto *source = cast->getOperand(0);
+                        new_val      = source->getType() == root_type ? source
+                                 : cast->getOpcode() == llvm::Instruction::ZExt
+                                 ? builder.CreateZExt(source, root_type, "cobra.narrow")
+                                 : builder.CreateSExt(source, root_type, "cobra.narrow");
+                        // The wide extension, built for this rewrite alone, goes.
+                        if (cast->use_empty() && reuse.created.contains(cast)) {
+                            reuse.created.erase(cast);
+                            cast->eraseFromParent();
+                        }
+                    } else {
+                        new_val = builder.CreateTrunc(new_val, root_type, "cobra.narrow");
+                    }
+                }
+
+                // A slice was searched and proved on the low bits of its root, so
+                // what replaces the root is the extension the claim named
+                // (`SliceToRead`): the rewrite of the bits read, widened back to
+                // the root's type. Built here, before the emitted instructions are
+                // gathered, so the cast is priced with the rest of the rewrite -
+                // and it is the one instruction the whole reading costs, against a
+                // tree the other width could not fold at all.
+                if (new_val != nullptr && cand.slice_extension != SliceExtension::kNone) {
+                    new_val = builder.CreateCast(
+                        cand.slice_extension == SliceExtension::kZero ? llvm::Instruction::ZExt
+                                                                      : llvm::Instruction::SExt,
+                        new_val, cand.root->getType(), "cobra.slice"
+                    );
+                }
+
+                // And the summands the candidate left out of the root's sum
+                // (`SumGroupSliceMbaCandidates`): the group is what the search
+                // answered, the residual is the rest of the root's value, and the
+                // root is the two added. The summands are read from the IR that
+                // already computes them - they are operands of the sum chain, so
+                // they dominate the root - and no flag is carried over: the sum is
+                // re-associated, so the intermediate values are not the ones the
+                // old chain's `nsw` and `nuw` were asserted of. Built here, before
+                // the emitted instructions are gathered, so every one of them is
+                // priced with the rest of the rewrite.
+                if (new_val != nullptr) {
+                    for (const auto &[term, negated] : cand.sum_residual) {
+                        new_val = negated ? builder.CreateSub(new_val, term, "cobra.sum")
+                                          : builder.CreateAdd(new_val, term, "cobra.sum");
+                    }
+                }
+
+                for (auto it = kAtFront ? block->begin() : std::next(kMark); &*it != cand.root;
+                     ++it)
+                {
+                    emitted.push_back(&*it);
+                }
+
+                // An instruction the rewrite reads is priced like one it builds
+                // wherever the cost model would have counted it gone. Measured on
+                // the whole expression that is every one of them: the expression
+                // after the rewrite is what it built and what it read, whoever
+                // computed the latter first. Measured on what the rewrite removes,
+                // it is the ones that were going to disappear - with this root, or
+                // with one an earlier rewrite replaced - and now stay; one the rest
+                // of the function keeps alive regardless costs nothing to read.
+                charged = 0;
+                if (by_tree) {
+                    charged = reuse.reused.size();
+                } else if (!reuse.reused.empty()) {
+                    const llvm::SmallPtrSet< const llvm::Instruction *, 32 > dying(
+                        cand.dying.begin(), cand.dying.end()
+                    );
+                    charged = static_cast< size_t >(
+                        llvm::count_if(reuse.reused, [&](const llvm::Instruction *read) {
+                            return dying.contains(read) || retired.contains(read);
+                        })
+                    );
+                }
+                cost = emitted.size() + charged;
+                if (cost < budget || !two_valued) {
+                    break;
+                }
             }
-            const size_t cost = emitted.size() + charged;
 
             if (cost >= budget) {
                 if (DetectDebug() && std::getenv("COBRA_BOOLEAN_DEBUG") != nullptr) {
@@ -6852,6 +7319,7 @@ namespace cobra {
                         llvm::errs() << "cobra: proof " << (proof_unknown ? "unknown" : "refuted")
                                      << *cand.root << "  [cut " << cand.node_limit << "]"
                                      << (outcome->boolean_reading ? " (boolean reading)" : "")
+                                     << (outcome->affine_reading ? " (affine reading)" : "")
                                      << " after " << verifying / 1000000 << " ms\n";
                     }
                     discard_rewrite();
@@ -6873,7 +7341,9 @@ namespace cobra {
                 // conditions (`VerifyCandidateOrOrdinary`), so what was built is
                 // the other rewrite. The candidate is taken again, and served the
                 // proved one from the cache.
-                if (verified->boolean_reading != outcome->boolean_reading) {
+                if (verified->boolean_reading != outcome->boolean_reading
+                    || verified->affine_reading != outcome->affine_reading)
+                {
                     if (DetectDebug()) {
                         llvm::errs() << "cobra: proof of the reading unknown or refuted, ordinary rewrite proved"
                                      << *cand.root << "  [cut " << cand.node_limit << "]\n";
@@ -6950,17 +7420,34 @@ namespace cobra {
             // Proved on the demanded bits only: the root's readers whose flags
             // read the rest must lose them (see `DropAssumptionsOfReaders`).
             llvm::SmallVector< llvm::Instruction *, 8 > root_readers;
+            // A reading for some readers replaces the root in their uses alone
+            // (`ReaderMbaCandidates`), the ones that still read it.
+            llvm::SmallVector< llvm::Use *, 8 > reader_uses;
+            for (llvm::Use *use : cand.reader_uses) {
+                if (use->get() == cand.root) {
+                    reader_uses.push_back(use);
+                }
+            }
+            const bool for_readers = !cand.reader_uses.empty();
             if (cand.demanded_mask != Bitmask(cand.bitwidth)) {
-                for (llvm::User *user : cand.root->users()) {
-                    if (auto *reader = llvm::dyn_cast< llvm::Instruction >(user)) {
-                        root_readers.push_back(reader);
+                if (for_readers) {
+                    for (llvm::Use *use : reader_uses) {
+                        if (auto *reader = llvm::dyn_cast< llvm::Instruction >(use->getUser())) {
+                            root_readers.push_back(reader);
+                        }
+                    }
+                } else {
+                    for (llvm::User *user : cand.root->users()) {
+                        if (auto *reader = llvm::dyn_cast< llvm::Instruction >(user)) {
+                            root_readers.push_back(reader);
+                        }
                     }
                 }
             }
             // `propagate_constant_roots`: what reads a root rewritten to a
             // constant, before the replacement takes its readers.
             const bool to_constant =
-                options_.propagate_constant_roots && llvm::isa< llvm::ConstantInt >(new_val);
+                options_.propagate_constant_roots && llvm::isa< llvm::ConstantInt >(new_val) && !for_readers;
             llvm::SmallVector< llvm::Instruction *, 8 > constant_readers;
             if (to_constant) {
                 for (llvm::User *user : cand.root->users()) {
@@ -6969,8 +7456,14 @@ namespace cobra {
                     }
                 }
             }
-            cand.root->replaceAllUsesWith(new_val);
-            replaced_roots.insert(cand.root);
+            if (for_readers) {
+                for (llvm::Use *use : reader_uses) {
+                    use->set(new_val);
+                }
+            } else {
+                cand.root->replaceAllUsesWith(new_val);
+                replaced_roots.insert(cand.root);
+            }
             // The readers whose operands are all constants now are constants
             // themselves, and so on down the chain. Each is replaced like a
             // root: left in the function, unread, until the run ends, so the
@@ -7022,7 +7515,7 @@ namespace cobra {
             // What this rewrite takes out of the function, for the rewrites
             // after it: an instruction of the tree goes once everything that
             // reads it has gone, starting with the root.
-            if (options_.cost_model == MbaCostModel::kDyingInstructions) {
+            if (options_.cost_model == MbaCostModel::kDyingInstructions && !for_readers) {
                 retired.insert(cand.root);
                 for (bool growing = true; growing;) {
                     growing = false;
@@ -7394,6 +7887,14 @@ namespace cobra {
         if (stats.keyed_leaf_trees != 0) {
             part("    trees read again over the keyed values of their leaves", stats.keyed_leaf_trees);
             part("      rewrites found", stats.keyed_leaf_found);
+        }
+        if (stats.subterm_trees != 0) {
+            part("    trees read as a bitwise function of their own subterms", stats.subterm_trees);
+            part("      rewrites found", stats.subterm_found);
+        }
+        if (stats.affine_trees != 0) {
+            part("    trees read as an affine function of their leaves", stats.affine_trees);
+            part("      rewrites found", stats.affine_found);
         }
         cost("  proving by running every input", stats.enumeration_nanoseconds);
         line("  proving in a ring normal form (attempts)", stats.ring_attempted, stats.ring_nanoseconds);

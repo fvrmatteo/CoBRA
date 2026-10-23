@@ -167,6 +167,84 @@ namespace cobra {
         // than its speed.
         bool read_conditions = false;
 
+        // Read a root the other readings turned down as a bitwise function of
+        // one or two of its own arithmetic subterms (`ReadAsBitwiseOfSubterms`):
+        // the root and the subterms evaluated on the same inputs, every bit of
+        // the root a function of the same bit of the subterms. An obfuscator
+        // writes `(a - b - 32) ^ k` through halvings and a carry picked by a
+        // comparison; the semilinear reading holds those pieces as independent
+        // atoms and finds nothing, while read together they are `d ^ k` over
+        // the subterm `d` the tree already computes. The probes only propose:
+        // the rewrite is proved like any other. Off by default.
+        bool subterm_reading = false;
+
+        // Read every root also as an affine function of its leaves xored with a
+        // constant (`ReadAsAffineOfLeaves`): `(K + sum(a_i * L_i)) ^ C` over the
+        // leaves as the tree reads them, the top bit of a narrow leaf included,
+        // on the bits the root's readers look at. An obfuscator writes such a
+        // sum through halvings, carries picked by comparisons and words taken
+        // apart and put back, each piece an independent atom to the semilinear
+        // reading; evaluated on the leaves, the root is the sum on every input.
+        // The probes are cheap and only propose: the cheaper of their answer and
+        // the search's is the rewrite, proved like any other, and one the proof
+        // turns down hands the tree back to the other readings
+        // (`VerifyCandidateOrOrdinary`). Off by default.
+        bool affine_reading = false;
+
+        // Read a root narrower than the values it reads at the width of those
+        // values (`NarrowRootsReadWide`): a byte flag computed from the top bit
+        // of a 64-bit sum, or a comparison of 64-bit values widened to a byte,
+        // is read as a 64-bit tree demanding the root's own bits, and the
+        // rewrite truncated back. Read at its own width such a root stops at the
+        // wide values - a shift that brings high bits down, a comparison - and
+        // whatever the obfuscator wrote into them is a free leaf: a flag that
+        // is constant on every input is no function of a free leaf. The narrow
+        // nodes of the tree are held zero-extended and masked, as in any wider
+        // tree, so the reading sees everything the narrow one did. Off by
+        // default.
+        bool read_narrow_roots_wide = false;
+
+        // Build a part of a rewrite that is one of two constants, picked by one
+        // bit of another value, as the `select` of the two on that bit
+        // (`ReadTwoValued` in the reconstruction), where that costs no more
+        // instructions than the arithmetic the rewrite holds. The search writes
+        // such a term in operators - `((t | -2) + 1) & -194` is `-194` or `0` by
+        // the low bit of `t` - and what LLVM's known bits and value ranges make
+        // of that is nothing; of `select (trunc t), 0, -194` they read the two
+        // values, and a comparison or a sum over them folds downstream. The value
+        // is the same either way. Off by default.
+        bool two_valued_selects = false;
+
+        // Never let a value other trees read stop a root from being read and
+        // rewritten. A tree is collected through values the rest of the function
+        // also reads, and a rewrite of the root leaves them for their other
+        // readers; profit is the rewrite against the whole tree as the root reads
+        // it, the shared values counted as if the root alone read them. Each of
+        // these used to refuse where an intermediate had a second reader:
+        //
+        // - a truncation was no root (`SharedValuesRead`): `trunc ((hi << 16 | lo)
+        //   ^ K) + 1` to sixteen bits is `lo + 1`, while the 32-bit sum another
+        //   reader keeps needs `hi`;
+        // - a value read whole by one reader and narrowly by another was read
+        //   whole only: it is read again under each narrower reader's bits, and
+        //   rewritten in those readers' uses (`ReaderMbaCandidates`); and a right
+        //   shift at the top of a tree read narrowly reads its operand under the
+        //   bits it brings down (`Options::read_shifted_operand`);
+        // - a right shift a narrow tree reads the low bits of was a leaf when a
+        //   store, a call or a comparison also read it whole;
+        // - a comparison read by a branch and by a tree was no root of its own;
+        // - an extension of a bitwise operation was not read over the extension
+        //   the function holds, a sum of products by a shared factor did not have
+        //   it taken out, and a `select` whose arms agree on what some readers
+        //   read was replaced only when every reader read that little;
+        // - a masked equality and a reading of arms under their condition were
+        //   priced against what died with them, not against what they read;
+        // - a tree a rewrite of a value it shares changed was left for the next
+        //   run; it is read again in this one.
+        //
+        // Off by default.
+        bool unblock_shared_values = false;
+
         // Read a root whose tree ends in more leaves than `max_vars` with its
         // tree cut short, instead of turning it down.
         //
