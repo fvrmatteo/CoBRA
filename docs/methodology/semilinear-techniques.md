@@ -29,6 +29,8 @@ For example, in `3*(x & 0xFF) + 5*(y | 0xF0)`, the atoms are `x & 0xFF` (coeffic
 
 The normalizer walks the expression tree recursively via `CollectTerms`, threading a running coefficient through arithmetic nodes. Addition distributes the coefficient to both children. Negation flips the coefficient sign (mod 2^w). Multiplication by a constant folds into the running coefficient. Purely bitwise subtrees with variables are registered as atoms.
 
+A bitwise operation with a constant over a value shifted up is read as the shifted bitwise value. Below the shift there are only constants, so `(v << k) ^ c` is `2^k * (v ^ (c >> k))` with `c`'s low `k` bits added beneath it, and likewise for `&`, `|` and `~`, for two values shifted by the same distance, and for a shift of a shifted value; `CollectTerms` collects `v op (c >> k)` with the coefficient scaled by `2^k` and adds the low bits to the constant, exact in the ring. An optimizer moves a mask or a flip outward past a doubling - `2 * (x ^ c)` is printed `(x << 1) ^ (c << 1)` - and read as a bitwise operation over a product that shape turns the whole sum down. Two values shifted by different distances have no one shift to take out and are still declined.
+
 After collection, terms with the same atom ID have their coefficients summed (mod 2^w), and zero-coefficient terms are discarded.
 
 ### Constant Lowering
@@ -188,6 +190,8 @@ The partition solve answers each class separately, so a sum whose constants move
 `SolvePartitionsByTranslation` looks for the function the classes share. Each class's bit-slice function is compared with a reference class's through every way of reading each variable - kept, complemented, cleared or set, `4^n` maps over `2^n` points. When every class matches the reference `g` through some map `sigma_j`, bit `j` of the sum is `2^j * g(sigma_j(v_j))`, so the sum is the linear MBA with slice `g` - found by the same interpolation and CoB builder as a class - applied to `(v & keep) ^ flip` for each variable, where `keep` holds the bits on which the variable is read and `flip` those on which it is complemented or set. A masked operand `b & m` is the same thing, cleared above `m`.
 
 The slices are matched up to an additive constant per class. The sum's constant is one word in which the constants lowered out of the atoms have already carried into each other, so its bits are not what any class contributes; instead, with the reference slice `t_r` carrying `c_r`, a class matched through `sigma` carries `c_r + (t_r(sigma(0)) - t(0))`, and since the class masks cover the word, which is `-1` in the ring, requiring the classes to add up to the sum's constant fixes `c_r`.
+
+A class is also read modulo what it can hold. With its lowest bit at `j` its slice is added in at `2^j` and above, so it counts only modulo `2^(w - j)`, and the slices are compared - and the variables each one reads decided - at that width. On the top bit alone `3 * x`, `x` and `-x` are the same contribution: in `2 * ((x & -2) ^ c1) + (x ^ c2) + 3`, which is `-(x ^ c)`, the top bit is a class of its own with slice `3 * x`, and compared at the full width it matched no reference and the sum stayed as it was.
 
 The translated form competes with the other two readings on reconstruction cost and takes the same post-rewrite probe. It declines a sum with a single class (the plain solve already covers it), more than four variables, or classes with no common slice.
 
