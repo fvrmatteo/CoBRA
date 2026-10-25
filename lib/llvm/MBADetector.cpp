@@ -3195,12 +3195,14 @@ namespace cobra {
                 // The tree the root reads at its own width, what a rewrite of the
                 // wide reading is measured against.
                 uint32_t own_width_tree_size = 0;
+                std::vector< llvm::Instruction * > own_width_tree;
                 if (widened && bw > own) {
                     llvm::SmallVector< llvm::Instruction *, 16 > own_insts;
                     std::vector< llvm::Value * > own_leaves;
                     llvm::DenseMap< llvm::Value *, llvm::Value * > own_redirects;
                     CollectTree(&inst, own, own_insts, own_leaves, own_redirects, /*try_phi_transparency=*/false);
                     own_width_tree_size = static_cast< uint32_t >(std::max< size_t >(own_insts.size(), 1));
+                    own_width_tree.assign(own_insts.begin(), own_insts.end());
                 }
                 // A `ptradd`'s readers are pointers: every bit of the index is
                 // live, so there is no narrower mask to read it under. A
@@ -3543,11 +3545,14 @@ namespace cobra {
                 // one instruction cheaper than itself: the rewrite was taken,
                 // undone by the clean-up, and taken again on every run. A
                 // freeze that dies with the root is one the rewrite removes.
-                const auto kept_freezes = static_cast< uint32_t >(
-                    llvm::count_if(tree_insts, [&](llvm::Instruction *ti) {
-                        return IsTransparentFreeze(ti) && !dying.contains(ti);
-                    })
-                );
+                const auto kept_freeze = [&](const llvm::Instruction *ti) {
+                    return IsTransparentFreeze(ti) && !dying.contains(ti);
+                };
+                const auto kept_freezes = static_cast< uint32_t >(llvm::count_if(tree_insts, kept_freeze));
+                std::vector< llvm::Instruction * > priced_tree;
+                llvm::copy_if(tree_insts, std::back_inserter(priced_tree), [&](const llvm::Instruction *ti) {
+                    return !kept_freeze(ti);
+                });
                 const bool poison_reaches_root = !has_phi_redirect() && !spans_freeze
                     && llvm::none_of(tree_insts, [](const llvm::Instruction *ti) {
                            return llvm::isa< llvm::SelectInst >(ti);
@@ -3581,7 +3586,9 @@ namespace cobra {
                                       : boolean_cut             ? kBooleanCutLimit
                                                                 : max_nodes,
                                   .tree_size    = static_cast< uint32_t >(tree_insts.size()) - kept_freezes,
+                                  .priced_tree  = std::move(priced_tree),
                                   .own_width_tree_size = own_width_tree_size,
+                                  .own_width_tree      = std::move(own_width_tree),
                                   .boundary_cut  = cut_arith_under_bitwise,
                                   .demanded_mask = demanded_mask,
                                   .spans_freeze  = spans_freeze,

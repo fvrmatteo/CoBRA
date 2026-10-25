@@ -180,6 +180,10 @@ namespace cobra {
         // against under `MbaCostModel::kTreeInstructions`.
         uint32_t tree_size = 0;
 
+        // The instructions `tree_size` counts: `tree` without the `freeze`s the
+        // rest of the function keeps.
+        std::vector< llvm::Instruction * > priced_tree;
+
         // For a root read wider than its type (`NarrowRootsReadWide`): the
         // instructions of its tree read at its own width, sharing and all. The
         // wide reading reaches into the wide values the root reads, which the
@@ -187,6 +191,11 @@ namespace cobra {
         // simpler form, and that form is measured against the tree the root
         // reads at its own width. Zero for any other candidate.
         uint32_t own_width_tree_size = 0;
+
+        // And those instructions. A rewrite of the wide reading is charged for
+        // the ones among them it keeps, which can be what the wide reading
+        // took for leaves: the `trunc` under a narrow `and` it reads back.
+        std::vector< llvm::Instruction * > own_width_tree;
 
         // Collected with every arithmetic value under a bitwise reader kept
         // as a leaf (see `BoundaryCutMbaCandidate`). Like a re-cut it is a

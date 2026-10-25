@@ -783,9 +783,12 @@ namespace cobra {
         // `COBRA_REWRITE_LOG=<file>`: every rewrite the pass applies, one line
         // each - the root it replaces, the expression in and out, what the
         // rewrite emitted against its budget, and whether it was proved - so two
-        // runs can be compared rewrite by rewrite.
+        // runs can be compared rewrite by rewrite. Below it, the IR: the tree
+        // the root was read from, the instructions the rewrite built and the
+        // ones it read in place of building them, which is what it was priced on.
         void LogRewrite(
-            const MBACandidate &cand, const CandidateOutcome &outcome, size_t emitted, uint32_t budget
+            const MBACandidate &cand, const CandidateOutcome &outcome, size_t emitted, uint32_t budget,
+            size_t cost, llvm::ArrayRef< llvm::Instruction * > built, llvm::ArrayRef< llvm::Instruction * > read
         ) {
             static const std::string path = [] {
                 const char *where = std::getenv("COBRA_REWRITE_LOG");
@@ -816,9 +819,25 @@ namespace cobra {
                 }
             }
             log << cand.root->getFunction()->getName() << " | emitted " << emitted << " of " << budget
-                << (outcome.accepted_unknown ? " | unknown accepted" : "") << " | in "
-                << (cand.expr ? RenderSSA(*cand.expr, cand.var_names) : std::string("?")) << " | out "
-                << (outcome.expr ? RenderSSA(*outcome.expr, names) : std::string("?")) << "\n";
+                << " (priced " << cost << ")" << (outcome.accepted_unknown ? " | unknown accepted" : "")
+                << " | in " << (cand.expr ? RenderSSA(*cand.expr, cand.var_names) : std::string("?"))
+                << " | out " << (outcome.expr ? RenderSSA(*outcome.expr, names) : std::string("?")) << "\n";
+            const auto print = [&](const char *title, llvm::ArrayRef< llvm::Instruction * > instructions) {
+                log << "  " << title << ":\n";
+                for (const auto *inst : instructions) {
+                    log << "  " << *inst << "\n";
+                }
+            };
+            log << "  tree " << cand.tree_size << ", at its own width " << cand.own_width_tree_size << ", dying "
+                << cand.dying_count << ", read at " << cand.bitwidth << " bits\n";
+            print("ir", cand.tree);
+            log << "  leaves:\n";
+            for (size_t i = 0; i < cand.leaf_values.size(); ++i) {
+                log << "    " << (i < cand.var_names.size() ? cand.var_names[i] : "?") << " =" << *cand.leaf_values[i]
+                    << "\n";
+            }
+            print("built", built);
+            print("read", read);
         }
 
         std::mutex &SlowReportMutex() {
@@ -7155,20 +7174,76 @@ namespace cobra {
                 // it is the ones that were going to disappear - with this root, or
                 // with one an earlier rewrite replaced - and now stay; one the rest
                 // of the function keeps alive regardless costs nothing to read.
+                //
+                // And the budget and the price count the same instructions. What
+                // a rewrite reads keeps alive what is under it, and the budget
+                // counted those too: reading `and (trunc x), 1` keeps the `trunc`.
+                // For a root read wider than its type the budget is the tree read
+                // at the root's own width, whose instructions the wide reading
+                // can take for leaves - the `trunc` again, a leaf to it. Priced on
+                // the instructions read alone, a rewrite that read a narrow
+                // `xor`'s own `and` back and put the same `xor` around it, its
+                // operands swapped, came in at two against three; InstCombine
+                // swapped them back and the next run rewrote it again, and so did
+                // an `or disjoint` rebuilt as the `add` InstCombine turns back
+                // into it, and an `xor` rebuilt as itself against an own-width
+                // tree of eleven. So the price is what the rewrite builds, and
+                // every instruction the budget counted that the rewrite keeps:
+                // what it reads, what it builds on, and below those, down to what
+                // the budget does not count.
                 charged = 0;
-                if (by_tree) {
-                    charged = reuse.reused.size();
-                } else if (!reuse.reused.empty()) {
-                    const llvm::SmallPtrSet< const llvm::Instruction *, 32 > dying(
-                        cand.dying.begin(), cand.dying.end()
+                {
+                    const auto &budgeted = !by_tree ? cand.dying
+                        : ReadWiderThanItsRoot(cand) && cand.own_width_tree_size != 0
+                        ? cand.own_width_tree
+                        : cand.priced_tree;
+                    const llvm::SmallPtrSet< const llvm::Instruction *, 32 > counted(
+                        budgeted.begin(), budgeted.end()
                     );
-                    charged = static_cast< size_t >(
-                        llvm::count_if(reuse.reused, [&](const llvm::Instruction *read) {
-                            return dying.contains(read) || retired.contains(read);
-                        })
+                    const llvm::SmallPtrSet< const llvm::Instruction *, 16 > built(
+                        emitted.begin(), emitted.end()
                     );
+                    llvm::SmallPtrSet< const llvm::Instruction *, 32 > kept;
+                    llvm::SmallVector< const llvm::Instruction *, 16 > work;
+                    // The root itself goes, whatever reads it back round a loop.
+                    const auto keep = [&](const llvm::Value *value, bool always) {
+                        const auto *inst = llvm::dyn_cast< llvm::Instruction >(value);
+                        if (inst == nullptr || inst == cand.root || built.contains(inst)
+                            || reuse.created.contains(inst))
+                        {
+                            return;
+                        }
+                        const bool priced = always || counted.contains(inst)
+                            || (!by_tree && retired.contains(inst));
+                        if (priced && kept.insert(inst).second) {
+                            work.push_back(inst);
+                        }
+                    };
+                    // In the whole expression every instruction read is part of
+                    // it, wherever it was computed.
+                    for (const auto *read : reuse.reused) {
+                        keep(read, by_tree);
+                    }
+                    for (const auto *inst : emitted) {
+                        for (const llvm::Value *operand : inst->operands()) {
+                            keep(operand, false);
+                        }
+                    }
+                    while (!work.empty()) {
+                        for (const llvm::Value *operand : work.pop_back_val()->operands()) {
+                            keep(operand, false);
+                        }
+                    }
+                    charged = kept.size();
                 }
-                cost = emitted.size() + charged;
+                // A `ptradd` root is rebuilt below as one `getelementptr` over the
+                // sum proved, and the chain it replaces was counted with its
+                // `getelementptr`s: that one is part of the rewrite too. Left out,
+                // a chain `gep (gep p, 2*i), 2 + v` came in at three against four
+                // as `gep p, -2*~i + v` - the same four instructions - and
+                // InstCombine split it back into the chain the next run read again.
+                const size_t rebuilt_gep = ByteGepOf(cand.root) != nullptr ? 1 : 0;
+                cost = emitted.size() + charged + rebuilt_gep;
                 if (cost < budget || !two_valued) {
                     break;
                 }
@@ -7379,7 +7454,7 @@ namespace cobra {
                 }
             }
 
-            LogRewrite(cand, *outcome, emitted.size(), budget);
+            LogRewrite(cand, *outcome, emitted.size(), budget, cost, emitted, reuse.reused);
             // A `ptradd` root was read as the addition of its indices, so what
             // was proved is the sum the chain walks by. The pointer it walks
             // from goes back on here, which makes the replacement a
