@@ -95,10 +95,14 @@ namespace cobra {
     // - a 128-bit product of an input outside it as much as a sum - and
     // collected as any tree is (`options_tag`, `cost_model`). Only when that
     // tree still ends in something other than the support is the root searched
-    // for on its values alone.
+    // for on its values alone. With `affine_reading`, a tree over the support
+    // the search turns down is also read as an affine function of its leaves
+    // xored with a constant (`ReadAsAffineOfLeaves`), which reads a leaf
+    // narrower than the tree under its own width where the search on values
+    // reads every variable whole.
     RealInputReading ReadOverRealInputs(
         const RealInputSlice &slice, const Options &options, uint64_t seed, uint64_t options_tag,
-        MbaCostModel cost_model
+        MbaCostModel cost_model, bool affine_reading = false
     );
 
 } // namespace cobra

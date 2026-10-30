@@ -1,8 +1,10 @@
 #include "RealInputReading.h"
 #include "MBADetector.h"
 
+#include "cobra/core/AffineReading.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/Evaluator.h"
+#include "cobra/core/ExprCost.h"
 #include "cobra/core/SignatureEval.h"
 
 #include "llvm/ADT/APInt.h"
@@ -459,7 +461,7 @@ namespace cobra {
 
     RealInputReading ReadOverRealInputs(
         const RealInputSlice &slice, const Options &options, uint64_t seed, uint64_t options_tag,
-        MbaCostModel cost_model
+        MbaCostModel cost_model, bool affine_reading
     ) {
         RealInputReading reading;
         const unsigned root_width = slice.root->getType()->getIntegerBitWidth();
@@ -592,6 +594,14 @@ namespace cobra {
                     reading.reason = "the tree over the support ends in values it was not built from";
                     break;
                 }
+                // A collection that stops at the root itself - a `select` of
+                // constants it cannot spell - read nothing: its answer is the
+                // root over itself, which proves and, put in the root's place,
+                // reads its own result.
+                if (llvm::is_contained(originals, slice.root)) {
+                    reading.reason = "the tree over the support ends in its own root";
+                    break;
+                }
                 Options search{ .bitwidth         = candidate.bitwidth,
                                 .max_vars         = options.max_vars,
                                 .spot_check       = true,
@@ -599,6 +609,29 @@ namespace cobra {
                                 .evaluator        = candidate.evaluator,
                                 .demanded_mask    = candidate.demanded_mask };
                 auto result = Simplify(candidate.sig, candidate.var_names, candidate.expr.get(), search);
+                if (affine_reading
+                    && (!result.has_value() || result.value().kind != SimplifyOutcome::Kind::kSimplified
+                        || result.value().expr == nullptr)
+                    && candidate.var_names.size() == candidate.leaf_widths.size())
+                {
+                    // Each leaf as the tree reads it, under its own width: a word
+                    // packed from narrow loads is affine in them, and the search on
+                    // values below reads every variable at the full width.
+                    std::vector< std::unique_ptr< Expr > > leaves;
+                    for (uint32_t index = 0; index < candidate.var_names.size(); ++index) {
+                        leaves.push_back(LeafExpr(candidate, index));
+                    }
+                    if (auto affine = ReadAsAffineOfLeaves(
+                            *candidate.expr, leaves, candidate.bitwidth, candidate.demanded_mask
+                        );
+                        affine != nullptr && IsBetter(ComputeCost(*affine).cost, ComputeCost(*candidate.expr).cost))
+                    {
+                        reading.leaves   = std::move(originals);
+                        reading.bitwidth = candidate.bitwidth;
+                        reading.expr     = std::move(affine);
+                        return reading;
+                    }
+                }
                 if (!result.has_value() || result.value().kind != SimplifyOutcome::Kind::kSimplified
                     || result.value().expr == nullptr)
                 {

@@ -5534,7 +5534,9 @@ namespace cobra {
                                 .max_vars         = options.max_vars,
                                 .spot_check       = true,
                                 .enabled_families = options.enabled_families };
-                auto reading = ReadOverRealInputs(*slice, search, key, options_tag, options.cost_model);
+                auto reading = ReadOverRealInputs(
+                    *slice, search, key, options_tag, options.cost_model, options.affine_reading
+                );
                 if (reading.expr == nullptr) {
                     say(*root, llvm::Twine(slice->nodes.size()) + " operations over " + llvm::Twine(slice->inputs.size())
                                    + " inputs: " + reading.reason);
