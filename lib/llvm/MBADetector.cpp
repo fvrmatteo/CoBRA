@@ -1,4 +1,5 @@
 #include "MBADetector.h"
+#include "RealInputReading.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/BitWidth.h"
 #include "cobra/core/Expr.h"
@@ -272,6 +273,97 @@ namespace cobra {
 
         // Set by `NarrowRootsReadWide`.
         thread_local bool narrow_roots_read_wide = false;
+        // Set by `SharedCutOfWideRoots`.
+        thread_local bool shared_cut_of_wide_roots = false;
+        // Set by `DominatingCutOfWideRoots`.
+        thread_local bool dominating_cut_of_wide_roots = false;
+
+        // The value of `tree` nearest the leaves that every path from `root` to them
+        // passes through - an instruction of the tree other than the root - or null. A
+        // leaf the walk over operands does not reach (a phi read through to an arm) leaves
+        // the answer to nothing.
+        llvm::Instruction *DominatingValue(
+            llvm::Instruction *root, llvm::ArrayRef< llvm::Instruction * > tree, llvm::ArrayRef< llvm::Value * > leaves
+        ) {
+            if (leaves.empty()) {
+                return nullptr;
+            }
+            const llvm::DenseSet< const llvm::Value * > inside(tree.begin(), tree.end());
+            const llvm::DenseSet< const llvm::Value * > ends(leaves.begin(), leaves.end());
+            // Reverse post-order from the root over the tree's operand edges: every value
+            // after each of its readers.
+            std::vector< const llvm::Value * > post;
+            llvm::DenseSet< const llvm::Value * > seen{ root };
+            llvm::DenseMap< const llvm::Value *, std::vector< const llvm::Value * > > readers;
+            std::vector< std::pair< const llvm::Instruction *, unsigned > > stack{ { root, 0 } };
+            while (!stack.empty()) {
+                auto &[node, next] = stack.back();
+                if (next == node->getNumOperands()) {
+                    post.push_back(node);
+                    stack.pop_back();
+                    continue;
+                }
+                const llvm::Value *operand = node->getOperand(next++);
+                if (!inside.contains(operand) && !ends.contains(operand)) {
+                    continue;
+                }
+                auto &list = readers[operand];
+                if (list.empty() || list.back() != node) {
+                    list.push_back(node);
+                }
+                if (!seen.insert(operand).second) {
+                    continue;
+                }
+                if (const auto *inner = llvm::dyn_cast< llvm::Instruction >(operand);
+                    inner != nullptr && inside.contains(operand))
+                {
+                    stack.emplace_back(inner, 0);
+                } else {
+                    post.push_back(operand);
+                }
+            }
+            std::reverse(post.begin(), post.end());
+            llvm::DenseMap< const llvm::Value *, int > number;
+            for (size_t index = 0; index < post.size(); ++index) {
+                number[post[index]] = static_cast< int >(index);
+            }
+            std::vector< int > dominator(post.size(), -1);
+            dominator[0]           = 0;
+            const auto intersect = [&](int a, int b) {
+                while (a != b) {
+                    while (a > b) {
+                        a = dominator[static_cast< size_t >(a)];
+                    }
+                    while (b > a) {
+                        b = dominator[static_cast< size_t >(b)];
+                    }
+                }
+                return a;
+            };
+            for (size_t index = 1; index < post.size(); ++index) {
+                int idom = -1;
+                for (const auto *reader : readers.lookup(post[index])) {
+                    const int at = number.lookup(reader);
+                    idom         = idom < 0 ? at : intersect(idom, at);
+                }
+                dominator[index] = idom < 0 ? 0 : idom;
+            }
+            int common = -1;
+            for (const auto *leaf : leaves) {
+                const auto found = number.find(leaf);
+                if (found == number.end()) {
+                    return nullptr;
+                }
+                const int idom = dominator[static_cast< size_t >(found->second)];
+                common         = common < 0 ? idom : intersect(common, idom);
+            }
+            if (common <= 0) {
+                return nullptr;
+            }
+            const auto *cut = post[static_cast< size_t >(common)];
+            return inside.contains(cut) ? const_cast< llvm::Instruction * >(llvm::cast< llvm::Instruction >(cut))
+                                        : nullptr;
+        }
         // Set by `SharedValuesRead`.
         thread_local bool shared_values_read = false;
         // Set by `BitIntrinsicsRead`.
@@ -1930,6 +2022,11 @@ namespace cobra {
         // examined and left alone, and it never reaches the re-cut ladder
         // either, because that is driven from a rejection. Naming the gate is
         // what turns "CoBRA did not simplify this" into something to act on.
+        std::vector< llvm::WeakTrackingVH > *&WideRootSink() {
+            static thread_local std::vector< llvm::WeakTrackingVH > *sink = nullptr;
+            return sink;
+        }
+
         void DeclinedRoot(
             const llvm::Instruction &root, llvm::StringRef gate, size_t tree, size_t leaves
         ) {
@@ -3317,6 +3414,9 @@ namespace cobra {
                 }
                 if (over_cap()) {
                     DeclinedRoot(inst, "more leaves than max_vars", tree_insts.size(), leaves.size());
+                    if (WideRootSink() != nullptr) {
+                        WideRootSink()->emplace_back(&inst);
+                    }
                     // `COBRA_DETECT_LEAVES=1`: what those leaves are, and how many phis the
                     // collection read through as the computation of their arms.
                     static const bool leaf_kinds = std::getenv("COBRA_DETECT_LEAVES") != nullptr;
@@ -3338,13 +3438,27 @@ namespace cobra {
                         }
                         llvm::errs() << ", phis read through " << phi_redirects.size() << '\n';
                     }
-                    if (wide_cut_nodes != 0 && max_nodes == 0 && !cut_arith_under_bitwise
-                        && shared_cut == nullptr && slice == nullptr && sum_group == nullptr && !boolean_cut
-                        && narrow == NarrowReading::kNone)
+                    if ((wide_cut_nodes != 0 || shared_cut_of_wide_roots || dominating_cut_of_wide_roots) && max_nodes == 0
+                        && !cut_arith_under_bitwise && shared_cut == nullptr && slice == nullptr
+                        && sum_group == nullptr && !boolean_cut && narrow == NarrowReading::kNone)
                     {
                         wide.push_back({ &inst, bw });
                     }
                     continue;
+                }
+
+                // A whole collection that stopped at an operation rather than at a
+                // value nothing computes - its node budget, a 128-bit product, a
+                // value held aside - is over variables that are not independent:
+                // read again over the values it really reads once the run is over.
+                if (WideRootSink() != nullptr && max_nodes == 0 && !cut_arith_under_bitwise && shared_cut == nullptr
+                    && slice == nullptr && sum_group == nullptr && !boolean_cut && narrow == NarrowReading::kNone
+                    && llvm::any_of(leaves, [](const llvm::Value *leaf) {
+                           const auto *operation = llvm::dyn_cast< llvm::Instruction >(leaf);
+                           return operation != nullptr && IsRealInputOperation(*operation);
+                       }))
+                {
+                    WideRootSink()->emplace_back(&inst);
                 }
 
                 // What is known of the leaves' bits is read into the tree as a
@@ -3636,6 +3750,20 @@ namespace cobra {
                     CollectTree(
                         root, width, full_insts, full_leaves, full_redirects, true, 0, false, max_tree_nodes
                     );
+                    // The value every path to the leaves passes through: the root over it.
+                    if (dominating_cut_of_wide_roots && full_redirects.empty()) {
+                        if (auto *dominating = DominatingValue(root, full_insts, full_leaves)) {
+                            SharedCut over;
+                            over.opaque.insert(dominating);
+                            BuildCandidates(
+                                { root }, min_ast_size, max_vars, cost_model, options_tag, candidates, 0, false,
+                                max_tree_nodes, demanded, &over
+                            );
+                        }
+                    }
+                    if (!shared_cut_of_wide_roots && wide_cut_nodes == 0) {
+                        continue;
+                    }
                     const llvm::DenseSet< const llvm::Value * > full_set(full_insts.begin(), full_insts.end());
                     SharedCut cut;
                     for (auto *ti : full_insts) {
@@ -3652,6 +3780,10 @@ namespace cobra {
                             max_tree_nodes, demanded, &cut
                         );
                     }
+                }
+                // `SharedCutOfWideRoots` alone: that cut and no ladder.
+                if (wide_cut_nodes == 0) {
+                    continue;
                 }
                 uint32_t first  = 0;
                 size_t fewest   = 0;
@@ -3690,6 +3822,18 @@ namespace cobra {
     BitIntrinsicsRead::~BitIntrinsicsRead() { bit_intrinsics_read = previous_; }
 
     SharedValuesRead::~SharedValuesRead() { shared_values_read = previous_; }
+
+    DominatingCutOfWideRoots::DominatingCutOfWideRoots(bool on) : previous_(dominating_cut_of_wide_roots) {
+        dominating_cut_of_wide_roots = on;
+    }
+
+    DominatingCutOfWideRoots::~DominatingCutOfWideRoots() { dominating_cut_of_wide_roots = previous_; }
+
+    SharedCutOfWideRoots::SharedCutOfWideRoots(bool on) : previous_(shared_cut_of_wide_roots) {
+        shared_cut_of_wide_roots = on;
+    }
+
+    SharedCutOfWideRoots::~SharedCutOfWideRoots() { shared_cut_of_wide_roots = previous_; }
 
     NarrowRootsReadWide::NarrowRootsReadWide(bool on) : previous_(narrow_roots_read_wide) {
         narrow_roots_read_wide = on;
@@ -3747,6 +3891,8 @@ namespace cobra {
         }
         return widest;
     }
+
+    void SetWideRootSink(std::vector< llvm::WeakTrackingVH > *sink) { WideRootSink() = sink; }
 
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,

@@ -12,6 +12,16 @@ namespace cobra {
     }
 
     SmtStrategyCounters SmtStrategyStatistics() { return {}; }
+
+    Z3VerifyResult VerifyRootOverInputs(
+        const llvm::Instruction &, llvm::ArrayRef< llvm::Value * >, llvm::ArrayRef< llvm::Value * >, const Expr &,
+        uint32_t, const Z3VerificationSettings &, const llvm::Value *
+    ) {
+        Z3VerifyResult result;
+        result.unknown        = true;
+        result.counterexample = "the instructions are read by the Bitwuzla translation alone";
+        return result;
+    }
 } // namespace cobra
 
 #else
@@ -24,6 +34,7 @@ namespace cobra {
 #include "cobra/verify/ConstantProduct.h"
 #include "../verify/VerifyCache.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -347,6 +358,9 @@ namespace cobra {
                 bitwuzla::TermManager &terms, const std::unordered_map< const llvm::Value *, Term > &arguments
             )
                 : terms_(terms), values_(arguments) {}
+
+            // `value` is `term` wherever it is read.
+            void Bind(const llvm::Value *value, Term term) { values_.insert_or_assign(value, std::move(term)); }
 
             Term Translate(const llvm::Value *value) {
                 auto found = values_.find(value);
@@ -1068,6 +1082,210 @@ namespace cobra {
         return Result(Answer::kUnknown, timed_out || theirs_timed_out, settings);
     }
     } // namespace
+
+    namespace {
+        // `value`, an operation of the slice a root is read on, built again in
+        // `builder`'s context over `built` - the free values already there - with
+        // every operation total, as the translation reads it. Untranslatable when
+        // the slice holds an operation it does not read.
+        llvm::Value *Rebuild(
+            const llvm::Value *value, llvm::IRBuilder<> &builder,
+            llvm::DenseMap< const llvm::Value *, llvm::Value * > &built
+        ) {
+            auto &context = builder.getContext();
+            std::vector< std::pair< const llvm::Value *, bool > > work{ { value, false } };
+            while (!work.empty()) {
+                auto [current, expanded] = work.back();
+                work.pop_back();
+                if (built.contains(current)) {
+                    continue;
+                }
+                if (const auto *constant = llvm::dyn_cast< llvm::ConstantInt >(current)) {
+                    built[current] = llvm::ConstantInt::get(context, constant->getValue());
+                    continue;
+                }
+                const auto *inst = llvm::dyn_cast< llvm::Instruction >(current);
+                if (inst == nullptr || !inst->getType()->isIntegerTy()) {
+                    throw Untranslatable{};
+                }
+                const auto *call    = llvm::dyn_cast< llvm::CallBase >(inst);
+                const unsigned count = call != nullptr ? call->arg_size() : inst->getNumOperands();
+                if (!expanded) {
+                    work.emplace_back(current, true);
+                    for (unsigned index = 0; index < count; ++index) {
+                        work.emplace_back(inst->getOperand(index), false);
+                    }
+                    continue;
+                }
+                std::vector< llvm::Value * > operands;
+                for (unsigned index = 0; index < count; ++index) {
+                    operands.push_back(built.lookup(inst->getOperand(index)));
+                }
+                auto *type          = llvm::IntegerType::get(context, inst->getType()->getIntegerBitWidth());
+                llvm::Value *result = nullptr;
+                if (const auto *binary = llvm::dyn_cast< llvm::BinaryOperator >(inst)) {
+                    result = builder.CreateBinOp(binary->getOpcode(), operands[0], operands[1]);
+                } else if (const auto *cast = llvm::dyn_cast< llvm::CastInst >(inst)) {
+                    result = builder.CreateCast(cast->getOpcode(), operands[0], type);
+                } else if (const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(inst)) {
+                    result = builder.CreateICmp(cmp->getPredicate(), operands[0], operands[1]);
+                } else if (llvm::isa< llvm::SelectInst >(inst)) {
+                    result = builder.CreateSelect(operands[0], operands[1], operands[2]);
+                } else if (llvm::isa< llvm::FreezeInst >(inst)) {
+                    result = operands[0];
+                } else if (const auto *intrinsic = llvm::dyn_cast< llvm::IntrinsicInst >(inst)) {
+                    result = builder.CreateIntrinsic(intrinsic->getIntrinsicID(), { type }, operands);
+                } else {
+                    throw Untranslatable{};
+                }
+                built[current] = result;
+            }
+            return built.lookup(value);
+        }
+    } // namespace
+
+    Z3VerifyResult VerifyRootOverInputs(
+        const llvm::Instruction &root, llvm::ArrayRef< llvm::Value * > inputs, llvm::ArrayRef< llvm::Value * > leaves,
+        const Expr &expr, uint32_t bitwidth, const Z3VerificationSettings &settings, const llvm::Value *cut
+    ) {
+        if (cut != nullptr && (!leaves.empty() || !cut->getType()->isIntegerTy())) {
+            return Result(Answer::kUntranslatable, false, settings);
+        }
+        using Clock         = std::chrono::steady_clock;
+        const auto deadline = settings.timeout_ms > 0
+            ? Clock::now() + std::chrono::milliseconds(settings.timeout_ms)
+            : Clock::time_point::max();
+        const unsigned root_width = root.getType()->getIntegerBitWidth();
+        if (bitwidth == 0 || bitwidth > 64 || root_width > bitwidth) {
+            return Result(Answer::kUntranslatable, false, settings);
+        }
+
+        // The question as a function of the free values - the cut, or every input -
+        // in the context the compiled questions are built in: the root's operations
+        // built again over them, the answer lowered over its leaves, and the two
+        // compared. It is optimized like any compiled question before the solver
+        // reads it: two products of one value by one constant, `(o - 1) * c` and
+        // `o * c`, are two multipliers to bit-blast and one product once InstCombine
+        // has distributed the first.
+        auto &compiler      = ThreadCompiler();
+        const bool optimize = !settings.llvm_passes.empty() && compiler.Configure(settings.llvm_passes);
+        auto &context       = compiler.context;
+        std::vector< const llvm::Value * > free;
+        if (cut != nullptr) {
+            free.push_back(cut);
+        } else {
+            free.assign(inputs.begin(), inputs.end());
+        }
+        std::vector< llvm::Type * > parameters;
+        for (const auto *value : free) {
+            const auto *type = llvm::dyn_cast< llvm::IntegerType >(value->getType());
+            if (type == nullptr) {
+                return Result(Answer::kUntranslatable, false, settings);
+            }
+            parameters.push_back(llvm::IntegerType::get(context, type->getBitWidth()));
+        }
+        auto *function = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getInt1Ty(context), parameters, false),
+            llvm::GlobalValue::ExternalLinkage, "root.question", compiler.module.get()
+        );
+        struct Erase
+        {
+            llvm::Function *function;
+            ~Erase() { function->eraseFromParent(); }
+        } erase{ function };
+        llvm::DenseMap< const llvm::Value *, llvm::Value * > built;
+        for (size_t index = 0; index < free.size(); ++index) {
+            auto *argument = function->getArg(static_cast< unsigned >(index));
+            argument->addAttr(llvm::Attribute::NoUndef);
+            built[free[index]] = argument;
+        }
+        llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context, "entry", function));
+        try {
+            llvm::Value *computed = Rebuild(&root, builder, built);
+            std::vector< llvm::Value * > variables;
+            for (const auto *leaf : leaves) {
+                llvm::Value *value = Rebuild(leaf, builder, built);
+                const unsigned own = value->getType()->getIntegerBitWidth();
+                if (own > bitwidth) {
+                    return Result(Answer::kUntranslatable, false, settings);
+                }
+                variables.push_back(own == bitwidth ? value : builder.CreateZExt(value, builder.getIntNTy(bitwidth)));
+            }
+            Lowering lowering(builder, variables, bitwidth);
+            llvm::Value *claimed = lowering.Lower(expr);
+            if (root_width < bitwidth) {
+                claimed = builder.CreateTrunc(claimed, builder.getIntNTy(root_width));
+            }
+            builder.CreateRet(builder.CreateICmpNE(computed, claimed));
+        } catch (const Untranslatable &) {
+            return Result(Answer::kUntranslatable, false, settings);
+        }
+        if (optimize) {
+            compiler.Optimize(*function);
+        }
+        const auto *ret = llvm::dyn_cast< llvm::ReturnInst >(function->getEntryBlock().getTerminator());
+        if (ret == nullptr || ret->getReturnValue() == nullptr) {
+            return Result(Answer::kUntranslatable, false, settings);
+        }
+        const auto *returned = ret->getReturnValue();
+        if (const auto *constant = llvm::dyn_cast< llvm::ConstantInt >(returned)) {
+            return Result(constant->isZero() ? Answer::kEqual : Answer::kDiffer, false, settings);
+        }
+
+        bitwuzla::TermManager terms;
+        std::unordered_map< const llvm::Value *, Term > arguments;
+        for (auto &argument : function->args()) {
+            arguments.emplace(
+                &argument,
+                terms.mk_const(terms.mk_bv_sort(argument.getType()->getIntegerBitWidth()), "v" + std::to_string(argument.getArgNo()))
+            );
+        }
+        Term question;
+        try {
+            Translation translation(terms, arguments);
+            question = terms.mk_term(Kind::EQUAL, { translation.Translate(returned), terms.mk_bv_one(terms.mk_bv_sort(1)) });
+        } catch (const Untranslatable &) {
+            return Result(Answer::kUntranslatable, false, settings);
+        }
+
+        const std::atomic< bool > never{ false };
+        const auto ask = [&](const Term &formula, Clock::time_point until) {
+            bitwuzla::Options options;
+            if (settings.timeout_ms > 0) {
+                const auto left = std::chrono::duration_cast< std::chrono::milliseconds >(until - Clock::now());
+                options.set(
+                    bitwuzla::Option::TIME_LIMIT_PER, static_cast< uint64_t >(std::max< int64_t >(1, left.count()))
+                );
+            }
+            options.set(bitwuzla::Option::REWRITE_LEVEL, static_cast< uint64_t >(settings.rewrite_level));
+            bitwuzla::Bitwuzla solver(terms, options);
+            FlagTerminator terminator(never, until);
+            solver.configure_terminator(&terminator);
+            solver.assert_formula(formula);
+            const auto answered = solver.check_sat();
+            solver.configure_terminator(nullptr);
+            return answered;
+        };
+        auto result = bitwuzla::Result::UNKNOWN;
+        if (settings.sweep) {
+            result = ask(
+                question, std::min(deadline, Clock::now() + std::chrono::milliseconds(settings.sweep_head_start_ms))
+            );
+            if (result == bitwuzla::Result::UNKNOWN && Clock::now() < deadline) {
+                SweepSettings sweep{ .deadline = deadline, .stop = &never, .rewrite_level = settings.rewrite_level };
+                result = ask(SweepFormula(terms, { question }, sweep, nullptr).front(), deadline);
+            }
+        } else {
+            result = ask(question, deadline);
+        }
+        if (result == bitwuzla::Result::UNSAT) {
+            return Result(Answer::kEqual, false, settings);
+        }
+        if (result == bitwuzla::Result::SAT) {
+            return Result(Answer::kDiffer, false, settings);
+        }
+        return Result(Answer::kUnknown, settings.timeout_ms > 0 && Clock::now() >= deadline, settings);
+    }
 
     SmtStrategyCounters SmtStrategyStatistics() {
         auto &stats = Stats();

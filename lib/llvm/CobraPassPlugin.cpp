@@ -50,6 +50,11 @@ namespace {
     //   shared-values            unblock_shared_values
     //   bit-intrinsics           read_bit_intrinsics
     //   wide-roots               cut_wide_roots
+    //   wide-roots-shared        shared_cut_wide_roots
+    //   wide-roots-dominating    dominating_cut_wide_roots
+    //   real-inputs              real_input_reading
+    //   real-inputs-only         real_inputs_only
+    //   narrow-products          narrow_wide_products
     //   dying-cost               cost_model = kDyingInstructions
     //   skip-loop-carried-phis   skip_loop_carried_phis
     //   across-freeze            leaf_freezing = kAcrossFreeze
@@ -101,6 +106,16 @@ namespace {
                     options.read_bit_intrinsics = true;
                 } else if (name == "wide-roots") {
                     options.cut_wide_roots = true;
+                } else if (name == "wide-roots-shared") {
+                    options.shared_cut_wide_roots = true;
+                } else if (name == "wide-roots-dominating") {
+                    options.dominating_cut_wide_roots = true;
+                } else if (name == "real-inputs") {
+                    options.real_input_reading = true;
+                } else if (name == "real-inputs-only") {
+                    options.real_inputs_only = true;
+                } else if (name == "narrow-products") {
+                    options.narrow_wide_products = true;
                 } else if (name == "verified-conditions") {
                     options.z3_verify       = true;
                     options.read_conditions = true;

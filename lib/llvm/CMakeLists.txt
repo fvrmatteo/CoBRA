@@ -8,6 +8,7 @@ set(cobra_llvm_sources
     IRReconstructor.cpp
     LocalDemandedBits.cpp
     SmtStrategy.cpp
+    RealInputReading.cpp
 )
 
 set(cobra_llvm_compile_definitions)

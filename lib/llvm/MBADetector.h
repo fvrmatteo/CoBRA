@@ -15,6 +15,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Value.h"
+#include "llvm/IR/ValueHandle.h"
 
 namespace cobra {
 
@@ -349,6 +350,41 @@ namespace cobra {
     // truncated back to the root's type. Every collection of a root - the
     // detection, the descent into inner roots and every cut of it - asks the
     // same question of the same IR, so all of them read it at one width.
+    // While one is alive on this thread, a root the collections turn down for
+    // more leaves than `max_vars` is read again at the values its tree reads more
+    // than once, held whole - the first cut of `cut_wide_roots`, without the ladder
+    // of breadth-first cuts after it (`CobraPassOptions::shared_cut_wide_roots`).
+    // While one is alive on this thread, a root the collections turn down for
+    // more leaves than `max_vars` is read again over the one value every path from
+    // it to its leaves passes through, when there is such a value: the root is a
+    // function of it alone, whatever lies below it
+    // (`CobraPassOptions::dominating_cut_wide_roots`).
+    class DominatingCutOfWideRoots
+    {
+      public:
+        explicit DominatingCutOfWideRoots(bool on);
+        ~DominatingCutOfWideRoots();
+
+        DominatingCutOfWideRoots(const DominatingCutOfWideRoots &)            = delete;
+        DominatingCutOfWideRoots &operator=(const DominatingCutOfWideRoots &) = delete;
+
+      private:
+        bool previous_;
+    };
+
+    class SharedCutOfWideRoots
+    {
+      public:
+        explicit SharedCutOfWideRoots(bool on);
+        ~SharedCutOfWideRoots();
+
+        SharedCutOfWideRoots(const SharedCutOfWideRoots &)            = delete;
+        SharedCutOfWideRoots &operator=(const SharedCutOfWideRoots &) = delete;
+
+      private:
+        bool previous_;
+    };
+
     class NarrowRootsReadWide
     {
       public:
@@ -450,6 +486,13 @@ namespace cobra {
     // reads a root whose tree has more leaves than `max_vars` with its tree cut
     // short instead: the smallest cut of at most that many nodes that is a
     // candidate.
+    // While set on this thread, every root the collections below turn down for
+    // more leaves than `max_vars`, or collect whole into a tree that ends in an
+    // operation rather than in a value nothing computes, is appended to `sink`,
+    // for a reading over the values the root really reads
+    // (`CobraPassOptions::real_input_reading`). Null stops it.
+    void SetWideRootSink(std::vector< llvm::WeakTrackingVH > *sink);
+
     std::vector< MBACandidate > DetectMbaCandidates(
         llvm::Function &f, uint32_t min_ast_size, uint32_t max_vars, uint64_t options_tag,
         MbaCostModel cost_model = MbaCostModel::kTreeInstructions, uint32_t max_tree_nodes = 0,

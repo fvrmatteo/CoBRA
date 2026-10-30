@@ -276,6 +276,66 @@ namespace cobra {
         // default, for a consumer that reads its output rather than its speed.
         bool cut_wide_roots = false;
 
+        // Read a root whose tree ends in more leaves than `max_vars` once more,
+        // at the values its tree reads more than once, held whole - the first cut
+        // `cut_wide_roots` makes - and stop there: one more collection and one
+        // search per such root, no ladder. Where an identity over one value is
+        // written so that the value is read twice - `(o - 1) * c` and `o * c` over
+        // a word `o` hashed from what the function loads - the tree cut at `o` is
+        // the identity, whatever the hash below it. Off by default.
+        bool shared_cut_wide_roots = false;
+
+        // Read a root whose tree ends in more leaves than `max_vars` once more,
+        // over the one value every path from it to its leaves passes through, when
+        // there is one: the root is a function of that value alone, whatever lies
+        // below it, so the tree above it is a search over one variable. One more
+        // collection per such root, and none when no value dominates the leaves.
+        // Off by default.
+        bool dominating_cut_wide_roots = false;
+
+        // Read a root whose tree ends in more leaves than `max_vars`, or in an
+        // operation the collection stopped at, over the values it really reads
+        // (`RealInputReading.h`), once the run is over.
+        //
+        // The ends of a collection are not the root's variables. The node budget
+        // ends it at intermediate sums, an operation the expression language has
+        // no word for (a 128-bit product, a population count) ends it at that
+        // operation, and every end is then a variable of its own, although all
+        // of them are computed from the same few loads, phis and arguments. A
+        // tree written so that its terms cancel reads fewer of those than it has
+        // ends, often one, and is turned down for the count of its ends - or
+        // searched over ends that are free where the values they are computed
+        // from are not: two quotients of 64-bit values by a large constant are
+        // below 2^33, which no search over two free words knows. Here the
+        // root is followed through every integer operation, at any width, to
+        // those values; probes find the ones it depends on; the search runs over
+        // those alone, on the root's values; and the answer is proved against the
+        // root's own instructions with every value free before it replaces them.
+        //
+        // Off by default.
+        bool real_input_reading = false;
+
+        // Read every root over the values it really reads, and nothing else: no
+        // collection at the node budget, no re-cut, slice, sum group or ladder.
+        // The roots are the values the function's integer arithmetic hands to
+        // something else - a store, an address, a call, a phi, a comparison - and
+        // a root read without a rewrite hands its operations on, so a value over
+        // few inputs below one over many is still read. The readings of `select`s
+        // and comparisons after the run are kept. Off by default.
+        bool real_inputs_only = false;
+
+        // Write every 128-bit product of two 64-bit values that is read through
+        // a truncation in 64-bit operations before anything is collected: its low
+        // word as the 64-bit product; its high part over a constant that is an
+        // exact reciprocal as the quotient it computes - how a compiler divides by
+        // a constant, a `udiv` whose range the known bits of the division state;
+        // any other high part as the high word in 64-bit operations. The
+        // expression language has no 128-bit word, so each such product was a
+        // leaf of its own and every reading of it a variable independent of the
+        // value it multiplies. Each rewrite is the value it replaces on every
+        // input. Off by default.
+        bool narrow_wide_products = false;
+
         // Hold a turned-down root's fingerprint until every slice, sum group
         // and cut queued from it has decided.
         //

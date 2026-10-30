@@ -3,6 +3,10 @@
 #include "cobra/core/Expr.h"
 #include "cobra/verify/Z3Verifier.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/Value.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -33,6 +37,25 @@ namespace cobra {
     Z3VerifyResult VerifyExprsWithStrategy(
         const Expr &lhs, const Expr &rhs, const std::vector< std::string > &var_names,
         uint32_t bitwidth, const Z3VerificationSettings &settings
+    );
+
+    // Whether `root`, as its own instructions compute it from `inputs`, is `expr`
+    // on every bit of the root: variable `i` of `expr` is `leaves[i]` - an input,
+    // or an instruction between the inputs and the root - zero-extended to
+    // `bitwidth`, and every input is free. Asked of the instructions as they
+    // are, at whatever widths they compute, by the translation the compiled
+    // questions are read back with; an instruction it does not read leaves the
+    // question unanswered.
+    //
+    // `cut`, when set, is an instruction between the inputs and the root that every
+    // path from the root to them passes through, asked free: the root is then the
+    // function of it its instructions above it compute, and what holds for every
+    // value of the cut holds of the root. `leaves` is then empty - an answer that
+    // reads no input.
+    Z3VerifyResult VerifyRootOverInputs(
+        const llvm::Instruction &root, llvm::ArrayRef< llvm::Value * > inputs,
+        llvm::ArrayRef< llvm::Value * > leaves, const Expr &expr, uint32_t bitwidth,
+        const Z3VerificationSettings &settings, const llvm::Value *cut = nullptr
     );
 
     struct SmtStrategyCounters

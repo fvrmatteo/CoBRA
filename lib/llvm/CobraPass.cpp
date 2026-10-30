@@ -1,5 +1,6 @@
 #include "cobra/llvm/CobraPass.h"
 #include "IRReconstructor.h"
+#include "RealInputReading.h"
 #include "LocalDemandedBits.h"
 #include "SmtStrategy.h"
 #include "DeferredFingerprints.h"
@@ -1122,6 +1123,11 @@ namespace cobra {
             key += options.boolean_variables ? "|b" : "|";
             key += options.read_conditions ? "c" : "";
             key += options.cut_wide_roots ? "w" : "";
+            key += options.shared_cut_wide_roots ? "W" : "";
+            key += options.dominating_cut_wide_roots ? "D" : "";
+            key += options.real_input_reading ? "r" : "";
+            key += options.real_inputs_only ? "R" : "";
+            key += options.narrow_wide_products ? "p" : "";
             key += options.subterm_reading ? "t" : "";
             key += options.affine_reading ? "a" : "";
             key += options.read_narrow_roots_wide ? "n" : "";
@@ -1415,6 +1421,11 @@ namespace cobra {
             tag = mix(tag, options.boolean_variables ? 1 : 0);
             tag = mix(tag, options.read_conditions ? 1 : 0);
             tag = mix(tag, options.cut_wide_roots ? 1 : 0);
+            tag = mix(tag, options.shared_cut_wide_roots ? 1 : 0);
+            tag = mix(tag, options.dominating_cut_wide_roots ? 1 : 0);
+            tag = mix(tag, options.real_input_reading ? 1 : 0);
+            tag = mix(tag, options.real_inputs_only ? 1 : 0);
+            tag = mix(tag, options.narrow_wide_products ? 1 : 0);
             tag = mix(tag, options.subterm_reading ? 1 : 0);
             tag = mix(tag, options.affine_reading ? 1 : 0);
             tag = mix(tag, options.read_narrow_roots_wide ? 1 : 0);
@@ -4127,6 +4138,163 @@ namespace cobra {
             return builder.CreateMul(x, llvm::ConstantInt::getSigned(x->getType(), q), "cobra.factor");
         }
 
+        // A 64-bit value a 128-bit product reads: the operand of a zero extension
+        // from at most 64 bits, extended to 64, or a constant below 2^64.
+        llvm::Value *WordOfProduct(llvm::Value *operand, llvm::IRBuilder<> &builder) {
+            auto *word = builder.getInt64Ty();
+            if (const auto *constant = llvm::dyn_cast< llvm::ConstantInt >(operand)) {
+                return constant->getValue().getActiveBits() <= 64
+                    ? llvm::ConstantInt::get(word, constant->getValue().trunc(64))
+                    : nullptr;
+            }
+            if (auto *extension = llvm::dyn_cast< llvm::ZExtInst >(operand)) {
+                auto *source = extension->getOperand(0);
+                if (source->getType()->isIntegerTy() && source->getType()->getIntegerBitWidth() <= 64) {
+                    return builder.CreateZExt(source, word);
+                }
+            }
+            return nullptr;
+        }
+
+        // The divisor `(x * m) >> s` is the quotient by, for every 64-bit `x`: the
+        // `d` with `m = ceil(2^s / d)` whose error `m * d - 2^s` is at most
+        // `2^(s - 64)`, the bound under which the product's rounding never reaches
+        // the integer part (Granlund and Montgomery, "Division by invariant
+        // integers using multiplication"). Nothing when there is none.
+        std::optional< uint64_t > ExactDivisor(const llvm::APInt &multiplier, unsigned shift) {
+            if (multiplier.isZero() || multiplier.getActiveBits() > 64 || shift < 64 || shift > 127) {
+                return std::nullopt;
+            }
+            const llvm::APInt power = llvm::APInt::getOneBitSet(256, shift);
+            const llvm::APInt m     = multiplier.zext(256);
+            const llvm::APInt d     = llvm::APIntOps::RoundingUDiv(power, m, llvm::APInt::Rounding::UP);
+            if (d.isZero() || d.getActiveBits() > 64) {
+                return std::nullopt;
+            }
+            if (llvm::APIntOps::RoundingUDiv(power, d, llvm::APInt::Rounding::UP) != m) {
+                return std::nullopt;
+            }
+            const llvm::APInt error = m * d - power;
+            if (error.ugt(llvm::APInt::getOneBitSet(256, shift - 64))) {
+                return std::nullopt;
+            }
+            return d.getZExtValue();
+        }
+
+        // The high word of the 128-bit product of two 64-bit values, in 64-bit
+        // operations: each operand split into 32-bit halves, the four partial
+        // products summed with their carries. Exact on every input.
+        llvm::Value *HighWord(llvm::Value *a, llvm::Value *b, llvm::IRBuilder<> &builder) {
+            auto *low_mask = builder.getInt64(0xFFFFFFFFULL);
+            auto *a_low    = builder.CreateAnd(a, low_mask, "cobra.mulh.al");
+            auto *a_high   = builder.CreateLShr(a, 32, "cobra.mulh.ah");
+            auto *b_low    = builder.CreateAnd(b, low_mask, "cobra.mulh.bl");
+            auto *b_high   = builder.CreateLShr(b, 32, "cobra.mulh.bh");
+            auto *ll       = builder.CreateMul(a_low, b_low, "cobra.mulh.ll");
+            auto *lh       = builder.CreateMul(a_low, b_high, "cobra.mulh.lh");
+            auto *hl       = builder.CreateMul(a_high, b_low, "cobra.mulh.hl");
+            auto *hh       = builder.CreateMul(a_high, b_high, "cobra.mulh.hh");
+            // Below 3 * 2^32: the three 32-bit pieces of the middle column.
+            auto *middle = builder.CreateAdd(
+                builder.CreateAdd(builder.CreateLShr(ll, 32), builder.CreateAnd(lh, low_mask)),
+                builder.CreateAnd(hl, low_mask), "cobra.mulh.mid"
+            );
+            return builder.CreateAdd(
+                builder.CreateAdd(hh, builder.CreateLShr(lh, 32)),
+                builder.CreateAdd(builder.CreateLShr(hl, 32), builder.CreateLShr(middle, 32)), "cobra.mulh"
+            );
+        }
+
+        // 128-bit products of two 64-bit values written in 64-bit operations
+        // (`CobraPassOptions::narrow_wide_products`). The expression language has
+        // no 128-bit word, so every such product - which is how a lifter spells a
+        // full-width `mul` - is a leaf of its own, and every reading of it a
+        // variable independent of the value it multiplies. Where the product is
+        // read through a truncation to at most 64 bits:
+        //
+        //   its low word is the 64-bit product;
+        //   its high part shifted by `s >= 64` against a constant that is an
+        //   exact reciprocal (`ExactDivisor`) is the quotient by that divisor -
+        //   how a compiler divides by a constant - whose range the known bits of
+        //   the division state;
+        //   any other high part is the high word in 64-bit operations
+        //   (`HighWord`), shifted by what is left of `s`.
+        //
+        // Each is the value it replaces on every input. A product read otherwise
+        // stays, for those readers.
+        bool NarrowWideProducts(llvm::Function &f, bool enabled) {
+            if (!enabled) {
+                return false;
+            }
+            bool changed = false;
+            // The readers replaced, deleted with what only they read once the
+            // products are done.
+            llvm::SmallVector< llvm::WeakTrackingVH, 16 > replaced;
+            llvm::SmallVector< llvm::Instruction *, 16 > products;
+            for (auto &inst : llvm::instructions(f)) {
+                if (inst.getOpcode() == llvm::Instruction::Mul && inst.getType()->isIntegerTy(128)) {
+                    products.push_back(&inst);
+                }
+            }
+            for (auto *product : products) {
+                llvm::SmallVector< std::pair< llvm::TruncInst *, unsigned >, 4 > readers;
+                for (llvm::User *user : product->users()) {
+                    if (auto *trunc = llvm::dyn_cast< llvm::TruncInst >(user);
+                        trunc != nullptr && trunc->getType()->getIntegerBitWidth() <= 64)
+                    {
+                        readers.emplace_back(trunc, 0);
+                        continue;
+                    }
+                    auto *shift = llvm::dyn_cast< llvm::BinaryOperator >(user);
+                    const auto *amount = shift != nullptr && shift->getOpcode() == llvm::Instruction::LShr
+                        ? llvm::dyn_cast< llvm::ConstantInt >(shift->getOperand(1))
+                        : nullptr;
+                    if (amount == nullptr || shift->getOperand(0) != product || amount->getZExtValue() < 64
+                        || amount->getZExtValue() > 127)
+                    {
+                        continue;
+                    }
+                    for (llvm::User *shifted : shift->users()) {
+                        if (auto *trunc = llvm::dyn_cast< llvm::TruncInst >(shifted);
+                            trunc != nullptr && trunc->getType()->getIntegerBitWidth() <= 64)
+                        {
+                            readers.emplace_back(trunc, static_cast< unsigned >(amount->getZExtValue()));
+                        }
+                    }
+                }
+                for (auto &[trunc, shift] : readers) {
+                    llvm::IRBuilder<> builder(trunc);
+                    llvm::Value *a = WordOfProduct(product->getOperand(0), builder);
+                    llvm::Value *b = WordOfProduct(product->getOperand(1), builder);
+                    if (a == nullptr || b == nullptr) {
+                        continue;
+                    }
+                    if (llvm::isa< llvm::ConstantInt >(a)) {
+                        std::swap(a, b);
+                    }
+                    llvm::Value *word = nullptr;
+                    if (shift == 0) {
+                        word = builder.CreateMul(a, b, "cobra.mull");
+                    } else if (const auto *factor = llvm::dyn_cast< llvm::ConstantInt >(b);
+                               factor != nullptr && ExactDivisor(factor->getValue(), shift).has_value())
+                    {
+                        word = builder.CreateUDiv(a, builder.getInt64(*ExactDivisor(factor->getValue(), shift)), "cobra.quotient");
+                    } else {
+                        word = HighWord(a, b, builder);
+                        if (shift > 64) {
+                            word = builder.CreateLShr(word, shift - 64);
+                        }
+                    }
+                    llvm::Value *narrowed = builder.CreateZExtOrTrunc(word, trunc->getType());
+                    trunc->replaceAllUsesWith(narrowed);
+                    replaced.emplace_back(trunc);
+                    changed = true;
+                }
+            }
+            llvm::RecursivelyDeleteTriviallyDeadInstructions(replaced);
+            return changed;
+        }
+
         // Products of the same odd constant taken out of a sum and out of the arms
         // of a select, the way they were put in: `x * (g * p) + y * (g * q)` is
         // `(x * p + y * q) * g`, and `c ? x * (g * p) : y * (g * q)` is
@@ -5232,6 +5400,263 @@ namespace cobra {
             return false;
         }
 
+        // `CobraPassOptions::real_input_reading`: where a root read over its real
+        // inputs keeps the key of the slice it was read on, so that a later run
+        // reads it again only when the slice changed. A proof the solver could not
+        // decide leaves no key: an unknown is no refutation.
+        constexpr const char *kRealInputReadMD = "cobra.real-inputs";
+
+        // A value the reading roots at: an operation a slice is followed through,
+        // of more than one bit and no more than the search's 64.
+        bool IsRealInputRoot(const llvm::Instruction &inst) {
+            const auto *type = llvm::dyn_cast< llvm::IntegerType >(inst.getType());
+            return type != nullptr && type->getBitWidth() > 1 && type->getBitWidth() <= 64 && IsRealInputOperation(inst);
+        }
+
+        // How much a slice may hold: the operations followed and the values they
+        // stop at. A root past either is not read. And how much its probes may
+        // cost: every input is moved from every base point and the slice run
+        // again each time, so the price is the operations times the inputs - on a
+        // hash chain every link is a root whose slice is the whole chain before it.
+        constexpr uint32_t kMaxRealInputNodes = 4096;
+        constexpr uint32_t kMaxRealInputs     = 64;
+        constexpr uint64_t kMaxRealInputProbeCost = 16384;
+
+        // The slice as the question it poses: every operation with its operands
+        // by position in the slice, every input by its width.
+        uint64_t RealInputSliceKey(const RealInputSlice &slice, uint64_t tag) {
+            llvm::DenseMap< const llvm::Value *, uint64_t > position;
+            uint64_t key = tag ^ 0x5245414C494E5055ULL;
+            const auto mix = [&](uint64_t value) {
+                key = static_cast< uint64_t >(llvm::hash_combine(key, value));
+            };
+            for (auto *input : slice.inputs) {
+                position[input] = position.size();
+                mix(input->getType()->getIntegerBitWidth());
+            }
+            for (auto *node : slice.nodes) {
+                mix(node->getOpcode());
+                mix(node->getType()->getIntegerBitWidth());
+                if (const auto *cmp = llvm::dyn_cast< llvm::ICmpInst >(node)) {
+                    mix(cmp->getPredicate());
+                }
+                if (const auto *call = llvm::dyn_cast< llvm::IntrinsicInst >(node)) {
+                    mix(call->getIntrinsicID());
+                }
+                for (const llvm::Use &operand : node->operands()) {
+                    if (const auto *constant = llvm::dyn_cast< llvm::ConstantInt >(operand.get())) {
+                        mix(static_cast< uint64_t >(llvm::hash_value(constant->getValue())));
+                    } else if (const auto found = position.find(operand.get()); found != position.end()) {
+                        mix(found->second);
+                    }
+                }
+                position[node] = position.size();
+            }
+            return key;
+        }
+
+        uint64_t ExprNodes(const Expr &expr) {
+            uint64_t nodes = 1;
+            for (const auto &child : expr.children) {
+                nodes += ExprNodes(*child);
+            }
+            return nodes;
+        }
+
+        // The roots the run turned down for more leaves than `max_vars`, or whose
+        // trees ended in an operation, read over the values they really read
+        // (`RealInputReading.h`), latest first: a root
+        // rewritten this way takes the roots inside its slice with it. Each answer
+        // is proved against the root's own instructions, every input free, and
+        // taken only when it holds fewer operations than the slice.
+        bool ReadRootsOverRealInputs(
+            llvm::Function &f, const std::vector< llvm::WeakTrackingVH > &wide, const CobraPassOptions &options,
+            uint64_t options_tag, bool descend
+        ) {
+            if (!options.z3_verify || wide.empty()) {
+                return false;
+            }
+            llvm::DenseMap< const llvm::Instruction *, size_t > position;
+            for (auto &inst : llvm::instructions(f)) {
+                position[&inst] = position.size();
+            }
+            std::vector< std::pair< size_t, llvm::Instruction * > > ordered;
+            for (const auto &handle : wide) {
+                auto *root = llvm::dyn_cast_or_null< llvm::Instruction >(static_cast< llvm::Value * >(handle));
+                if (const auto found = root != nullptr ? position.find(root) : position.end(); found != position.end()) {
+                    ordered.emplace_back(found->second, root);
+                }
+            }
+            std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+            ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+            std::vector< llvm::WeakTrackingVH > roots;
+            for (const auto &[at, root] : ordered) {
+                roots.emplace_back(root);
+            }
+
+            const auto say = [&](const llvm::Instruction &root, const llvm::Twine &what) {
+                if (DetectDebug()) {
+                    llvm::errs() << "cobra: real inputs" << root << ": " << what << "\n";
+                }
+            };
+            // One root: rewritten, or not.
+            const auto read_root = [&](llvm::Instruction *root) -> bool {
+                const auto slice = SliceToRealInputs(*root, kMaxRealInputNodes, kMaxRealInputs);
+                if (!slice.has_value()) {
+                    say(*root, "no slice within the bounds");
+                    return false;
+                }
+                if (static_cast< uint64_t >(slice->nodes.size()) * slice->inputs.size() > kMaxRealInputProbeCost) {
+                    say(*root, llvm::Twine(slice->nodes.size()) + " operations over " + llvm::Twine(slice->inputs.size())
+                                   + " inputs: too costly to probe");
+                    return false;
+                }
+                const uint64_t key = RealInputSliceKey(*slice, options_tag);
+                if (auto *node = root->getMetadata(kRealInputReadMD); node != nullptr && node->getNumOperands() == 1) {
+                    if (auto *seen = llvm::mdconst::dyn_extract< llvm::ConstantInt >(node->getOperand(0));
+                        seen != nullptr && seen->getZExtValue() == key)
+                    {
+                        return false;
+                    }
+                }
+                const auto read = [&] {
+                    root->setMetadata(
+                        kRealInputReadMD,
+                        llvm::MDNode::get(
+                            root->getContext(),
+                            { llvm::ConstantAsMetadata::get(
+                                llvm::ConstantInt::get(llvm::Type::getInt64Ty(root->getContext()), key)
+                            ) }
+                        )
+                    );
+                };
+                Options search{ .bitwidth         = 64,
+                                .max_vars         = options.max_vars,
+                                .spot_check       = true,
+                                .enabled_families = options.enabled_families };
+                auto reading = ReadOverRealInputs(*slice, search, key, options_tag, options.cost_model);
+                if (reading.expr == nullptr) {
+                    say(*root, llvm::Twine(slice->nodes.size()) + " operations over " + llvm::Twine(slice->inputs.size())
+                                   + " inputs: " + reading.reason);
+                    read();
+                    return false;
+                }
+                if (ExprNodes(*reading.expr) >= slice->nodes.size()) {
+                    say(*root, "the answer is no smaller than the slice");
+                    read();
+                    return false;
+                }
+                auto settings = options.z3_settings;
+                settings.timeout_ms *= std::max< uint32_t >(
+                    1, std::min< uint32_t >(options.max_budget_scale, static_cast< uint32_t >(slice->nodes.size() / 64))
+                );
+                settings.unknown_result_mode = Z3UnknownResultMode::kFail;
+                const auto proof = VerifyRootOverInputs(
+                    *root, slice->inputs, reading.leaves, *reading.expr, reading.bitwidth, settings
+                );
+                // A constant the proof over the inputs could not decide is asked again over
+                // the value every path to them passes through, free: a constant for every
+                // value of it is one for the value the inputs give it, and the question
+                // above the cut is a fraction of the one through it - the quotients and
+                // products a word is hashed with stay below it.
+                auto decided = proof;
+                if (proof.unknown && reading.leaves.empty()) {
+                    if (const auto *cut = DominatingCut(*slice)) {
+                        decided = VerifyRootOverInputs(
+                            *root, slice->inputs, {}, *reading.expr, reading.bitwidth, settings, cut
+                        );
+                        say(*root, llvm::Twine("over the inputs undecided; over its cut ") + cut->getName() + ": "
+                                       + (decided.unknown ? "undecided" : decided.equivalent ? "proved" : "refuted"));
+                        if (!decided.unknown && !decided.equivalent) {
+                            // Refuted for some value of the cut, which says nothing of the
+                            // values the inputs give it: no refutation of the answer.
+                            return false;
+                        }
+                    }
+                }
+                if (decided.unknown) {
+                    say(*root, "the proof is undecided");
+                    return false;
+                }
+                if (!decided.equivalent) {
+                    say(*root, "the proof refutes the answer");
+                    read();
+                    return false;
+                }
+                MBACandidate rebuilt;
+                rebuilt.root     = root;
+                rebuilt.bitwidth = reading.bitwidth;
+                for (auto *leaf : reading.leaves) {
+                    const unsigned own = leaf->getType()->getIntegerBitWidth();
+                    rebuilt.leaf_values.push_back(leaf);
+                    rebuilt.leaf_widths.push_back(own < reading.bitwidth ? own : 0);
+                }
+                llvm::IRBuilder<> builder(root);
+                llvm::Value *built = ReconstructIr(*reading.expr, rebuilt, builder);
+                if (built == nullptr) {
+                    say(*root, "the answer could not be built");
+                    return false;
+                }
+                if (built->getType() != root->getType()) {
+                    built = builder.CreateTrunc(built, root->getType(), "cobra.real");
+                }
+                say(*root, llvm::Twine("rewritten over ") + llvm::Twine(reading.leaves.size()) + " of "
+                               + llvm::Twine(slice->inputs.size()) + " inputs, " + llvm::Twine(slice->nodes.size())
+                               + " operations");
+                root->replaceAllUsesWith(built);
+                llvm::RecursivelyDeleteTriviallyDeadInstructions(root);
+                return true;
+            };
+            // A root read and not rewritten hands its operations on, when the caller
+            // descends: a root over more inputs than `max_vars` may compute, below
+            // it, values over few.
+            llvm::DenseSet< const llvm::Value * > queued;
+            for (const auto &handle : roots) {
+                queued.insert(handle);
+            }
+            bool changed = false;
+            for (size_t next = 0; next < roots.size(); ++next) {
+                auto *root = llvm::dyn_cast_or_null< llvm::Instruction >(static_cast< llvm::Value * >(roots[next]));
+                if (root == nullptr || root->use_empty()) {
+                    continue;
+                }
+                if (read_root(root)) {
+                    changed = true;
+                    continue;
+                }
+                if (!descend) {
+                    continue;
+                }
+                for (llvm::Value *operand : root->operands()) {
+                    auto *inner = llvm::dyn_cast< llvm::Instruction >(operand);
+                    if (inner != nullptr && IsRealInputRoot(*inner) && queued.insert(inner).second) {
+                        roots.emplace_back(inner);
+                    }
+                }
+            }
+            return changed;
+        }
+
+        // `CobraPassOptions::real_inputs_only`: the roots of the function's integer
+        // arithmetic - each value something other than that arithmetic reads, and
+        // each a comparison reads - in program order.
+        std::vector< llvm::WeakTrackingVH > BoundaryRoots(llvm::Function &f) {
+            std::vector< llvm::WeakTrackingVH > roots;
+            for (auto &inst : llvm::instructions(f)) {
+                if (!IsRealInputRoot(inst)) {
+                    continue;
+                }
+                const bool boundary = llvm::any_of(inst.users(), [](const llvm::User *user) {
+                    const auto *reader = llvm::dyn_cast< llvm::Instruction >(user);
+                    return reader == nullptr || llvm::isa< llvm::ICmpInst >(reader) || !IsRealInputRoot(*reader);
+                });
+                if (boundary) {
+                    roots.emplace_back(&inst);
+                }
+            }
+            return roots;
+        }
+
         // A comparison of a tree over one value with a constant, true for exactly
         // one value of it, is the equality with that value; false for exactly one,
         // the inequality. Protectors compare a value with a constant this way so
@@ -6010,6 +6435,8 @@ namespace cobra {
 
         const uint64_t options_tag = OptionsTag(options_);
         const NarrowRootsReadWide narrow_roots(options_.read_narrow_roots_wide);
+        const SharedCutOfWideRoots shared_cut_of_wide_roots(options_.shared_cut_wide_roots);
+        const DominatingCutOfWideRoots dominating_cut_of_wide_roots(options_.dominating_cut_wide_roots);
         const SharedValuesRead shared_values(options_.unblock_shared_values);
         const BitIntrinsicsRead bit_intrinsics(options_.read_bit_intrinsics);
 
@@ -6017,17 +6444,52 @@ namespace cobra {
         const bool armed   = ReadArmsUnderTheirCondition(f, options_.unblock_shared_values);
         const bool widened = WidenExtendedBitwise(f, options_.unblock_shared_values);
         const bool hoisted = HoistConstantFactors(f, options_.unblock_shared_values);
-        if (armed || widened || hoisted) {
+        const bool narrowed = NarrowWideProducts(f, options_.narrow_wide_products);
+        if (armed || widened || hoisted || narrowed) {
             changed = true;
             llvm::PreservedAnalyses kept;
             kept.preserveSet< llvm::CFGAnalyses >();
             AM.invalidate(f, kept);
         }
 
+        // `real_inputs_only`: every root read over its real inputs, then the
+        // readings of what the rewrites left, as at the end of a run below.
+        if (options_.real_inputs_only && options_.z3_verify) {
+            changed |= ReadRootsOverRealInputs(f, BoundaryRoots(f), options_, options_tag, /*descend=*/true);
+            for (auto &inst : llvm::make_early_inc_range(llvm::instructions(f))) {
+                if (auto *select = llvm::dyn_cast< llvm::SelectInst >(&inst);
+                    select != nullptr && select->getTrueValue() == select->getFalseValue())
+                {
+                    select->replaceAllUsesWith(select->getTrueValue());
+                    select->eraseFromParent();
+                    changed = true;
+                }
+            }
+#ifdef COBRA_HAS_Z3
+            changed |= ReadSelectsUnderTheirDemandedBits(f, options_, options_tag);
+            changed |= ReadComparisonsAsEqualities(f, options_, options_tag, {});
+#endif
+            stats.nanoseconds = since(run_begin);
+            MergeStatistics(stats);
+            if (!changed) {
+                return llvm::PreservedAnalyses::all();
+            }
+            llvm::PreservedAnalyses preserved;
+            preserved.preserveSet< llvm::CFGAnalyses >();
+            return preserved;
+        }
+
         DemandedBitsOracle demanded_bits(f, stats, AM, options_.check_demanded_bits);
         const DemandedMaskFn demanded = [&](llvm::Instruction *inst) {
             return demanded_bits.MaskOf(inst);
         };
+
+        // `real_input_reading`: the roots the collections below turn down for
+        // the count of their leaves, read over their real inputs once the run
+        // is over.
+        std::vector< llvm::WeakTrackingVH > wide_roots;
+        SetWideRootSink(options_.real_input_reading ? &wide_roots : nullptr);
+        const auto stop_sinking = llvm::make_scope_exit([] { SetWideRootSink(nullptr); });
 
         const auto detect_begin = std::chrono::steady_clock::now();
         auto candidates = DetectMbaCandidates(
@@ -7741,6 +8203,11 @@ namespace cobra {
                 llvm::errs() << "\n";
             }
             llvm::RecursivelyDeleteTriviallyDeadInstructions(dead);
+        }
+
+        SetWideRootSink(nullptr);
+        if (options_.real_input_reading && ReadRootsOverRealInputs(f, wide_roots, options_, options_tag, false)) {
+            changed = true;
         }
 
         // A `select` the rewrites left with one value on both arms is that value:
